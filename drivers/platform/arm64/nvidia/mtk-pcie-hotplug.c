@@ -1277,7 +1277,7 @@ MODULE_DEVICE_TABLE(acpi, pcie_hp_acpi_match);
 
 static struct platform_driver pcie_hp_driver = {
     .probe = pcie_hp_probe,
-    .remove_new = pcie_hp_remove,
+    .remove = pcie_hp_remove,
     .driver = {
         .name = "mtk-pcie-hotplug",
         .acpi_match_table = ACPI_PTR(pcie_hp_acpi_match),
