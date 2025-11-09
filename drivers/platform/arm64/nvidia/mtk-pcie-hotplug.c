@@ -153,6 +153,9 @@ struct gpio_acpi_context {
     char vendor_data[MAX_VENDOR_DATA_LEN + 1];
 };
 
+/* Forward declaration */
+struct pcie_hp_dev;
+
 struct pcie_hp_plat_data {
     int port_nums;
     struct pcie_port_info ports[HP_PORT_MAX];
@@ -175,6 +178,14 @@ struct pcie_hp_gpio_ctx {
     struct pcie_hp_dev *hp_dev;
 };
 
+enum pcie_hp_debug_val {
+    PCIE_HP_DEBUG_PLUG_OUT = 0,
+    PCIE_HP_DEBUG_PLUG_IN,
+    PCIE_HP_DEBUG_REMOVE_DEVICES,
+    PCIE_HP_DEBUG_RESCAN_DEVICES,
+    PCIE_HP_DEBUG_MAX_VAL
+};
+
 struct pcie_hp_dev {
     struct pcie_hp_gpio_ctx *pins;
     struct pcie_hp_plat_data *pd;
@@ -185,14 +196,6 @@ struct pcie_hp_dev {
     int prsnt_pin;
     enum pcie_hp_debug_val debug_state;
     struct mutex lock; /* Protect state changes */
-};
-
-enum pcie_hp_debug_val {
-    PCIE_HP_DEBUG_PLUG_OUT = 0,
-    PCIE_HP_DEBUG_PLUG_IN,
-    PCIE_HP_DEBUG_REMOVE_DEVICES,
-    PCIE_HP_DEBUG_RESCAN_DEVICES,
-    PCIE_HP_DEBUG_MAX_VAL
 };
  
 static int pcie_hp_pinctrl_init(struct pcie_hp_dev *hp_dev)
@@ -522,7 +525,7 @@ get_port_root_port(struct pcie_hp_dev *hp_dev, int port_idx)
 static void remove_devices_on_bus(struct pcie_hp_dev *hp_dev, int port_idx)
 {
     struct pcie_port_info *port;
-    struct pci_dev *dev, *temp;
+    struct pci_bus *bus;
 
     if (port_idx >= hp_dev->pd->port_nums)
         return;
@@ -530,11 +533,12 @@ static void remove_devices_on_bus(struct pcie_hp_dev *hp_dev, int port_idx)
     port = &hp_dev->pd->ports[port_idx];
 
     /* Remove all devices on this port's secondary bus */
-    list_for_each_entry_safe(dev, temp, &pci_devices, global_list) {
-        if (pci_domain_nr(dev->bus) == port->domain &&
-            dev->bus->number >= port->bus) {
-            pci_stop_and_remove_bus_device_locked(dev);
-        }
+    if (port->root_port && port->root_port->subordinate) {
+        bus = port->root_port->subordinate;
+        pci_lock_rescan_remove();
+        pci_stop_root_bus(bus);
+        pci_remove_root_bus(bus);
+        pci_unlock_rescan_remove();
     }
 }
  
