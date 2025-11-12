@@ -181,8 +181,6 @@ struct pcie_hp_gpio_ctx {
 enum pcie_hp_debug_val {
     PCIE_HP_DEBUG_PLUG_OUT = 0,
     PCIE_HP_DEBUG_PLUG_IN,
-    PCIE_HP_DEBUG_REMOVE_DEVICES,
-    PCIE_HP_DEBUG_RESCAN_DEVICES,
     PCIE_HP_DEBUG_MAX_VAL
 };
 
@@ -522,51 +520,6 @@ get_port_root_port(struct pcie_hp_dev *hp_dev, int port_idx)
     return port->root_port;
 }
 
-static void remove_devices_on_bus(struct pcie_hp_dev *hp_dev, int port_idx)
-{
-    struct pcie_port_info *port;
-    struct pci_bus *bus;
-    struct pci_dev *dev, *temp;
-    int dev_count = 0;
-
-    if (port_idx >= hp_dev->pd->port_nums)
-        return;
-
-    port = &hp_dev->pd->ports[port_idx];
-
-    /* Remove all devices on this port's secondary bus */
-    if (!port->root_port || !port->root_port->subordinate) {
-        dev_dbg(&hp_dev->pdev->dev, "Port %d: No root port or subordinate bus\n", 
-                port_idx);
-        return;
-    }
-
-    bus = port->root_port->subordinate;
-
-    /* Check if bus has any devices to remove */
-    if (list_empty(&bus->devices)) {
-        dev_dbg(&hp_dev->pdev->dev, "Port %d: No devices to remove\n", port_idx);
-        return;
-    }
-
-    pci_lock_rescan_remove();
-    
-    /* Iterate through all devices on the bus and remove them */
-    list_for_each_entry_safe(dev, temp, &bus->devices, bus_list) {
-        dev_info(&hp_dev->pdev->dev, "Port %d: Removing device %s\n", 
-                 port_idx, pci_name(dev));
-        pci_dev_get(dev);
-        pci_stop_and_remove_bus_device(dev);
-        pci_dev_put(dev);
-        dev_count++;
-    }
-    
-    pci_unlock_rescan_remove();
-    
-    dev_info(&hp_dev->pdev->dev, "Port %d: Removed %d device(s)\n", 
-             port_idx, dev_count);
-}
- 
 static void remove_device(struct pcie_hp_dev *dev)
 {
     int i;
@@ -894,11 +847,10 @@ static ssize_t debug_state_store(struct device *dev,
     switch (val) {
     case PCIE_HP_DEBUG_PLUG_OUT:
         dev_info(dev, "Debug: simulating cable removal\n");
-        
-        /* Remove PCI devices from kernel BEFORE hardware shutdown */
-        for (i = 0; i < hp_dev->pd->port_nums; i++)
-            remove_devices_on_bus(hp_dev, i);
-        
+        /* NOTE: Userspace must remove PCI devices BEFORE writing to debug_state.
+         * This avoids kernel locking issues and follows the proven approach
+         * from the legacy implementation. The kernel driver only manages
+         * hardware (GPIO, power, PCIe link). */
         hp_dev->state = STATE_PLUG_OUT;
         remove_device(hp_dev);
         break;
@@ -907,25 +859,6 @@ static ssize_t debug_state_store(struct device *dev,
         dev_info(dev, "Debug: simulating cable plug-in\n");
         hp_dev->state = STATE_PLUG_IN;
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
-        break;
-
-    case PCIE_HP_DEBUG_REMOVE_DEVICES:
-        dev_info(dev, "Debug: removing all devices\n");
-        for (i = 0; i < hp_dev->pd->port_nums; i++)
-            remove_devices_on_bus(hp_dev, i);
-        break;
-
-    case PCIE_HP_DEBUG_RESCAN_DEVICES:
-        dev_info(dev, "Debug: rescanning all buses\n");
-        for (i = 0; i < hp_dev->pd->port_nums; i++) {
-            bus = pci_find_bus(hp_dev->pd->ports[i].domain,
-                               hp_dev->pd->ports[i].bus);
-            if (bus) {
-                pci_lock_rescan_remove();
-                pci_rescan_bus(bus);
-                pci_unlock_rescan_remove();
-            }
-        }
         break;
 
     default:
