@@ -736,15 +736,15 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
     if (gpio_ctx->pin == hp_dev->prsnt_pin) {
         if (value) {
             dev_dbg(gpio_ctx->dev, "Presence pin: cable removal detected\n");
-            hp_dev->state = STATE_PLUG_OUT;
             pcie_hp_send_uevent(hp_dev, REMOVAL_EVT);
         } else {
             dev_dbg(gpio_ctx->dev, "Presence pin: cable plug-in detected\n");
-            hp_dev->state = STATE_PLUG_IN;
             pcie_hp_send_uevent(hp_dev, PLUG_IN_EVT);
         }
         mutex_unlock(&hp_dev->lock);
-        return IRQ_WAKE_THREAD;
+        /* For physical hotplug, let userspace handle device management
+         * to avoid potential deadlocks when hardware is in transition */
+        return IRQ_HANDLED;
     }
 
     /* Handle boot status pin events */
@@ -869,6 +869,11 @@ static ssize_t debug_state_store(struct device *dev,
     switch (val) {
     case PCIE_HP_DEBUG_PLUG_OUT:
         dev_info(dev, "Debug: simulating cable removal\n");
+        
+        /* Remove PCI devices from kernel BEFORE hardware shutdown */
+        for (i = 0; i < hp_dev->pd->port_nums; i++)
+            remove_devices_on_bus(hp_dev, i);
+        
         hp_dev->state = STATE_PLUG_OUT;
         remove_device(hp_dev);
         break;
