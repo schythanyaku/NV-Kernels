@@ -526,6 +526,8 @@ static void remove_devices_on_bus(struct pcie_hp_dev *hp_dev, int port_idx)
 {
     struct pcie_port_info *port;
     struct pci_bus *bus;
+    struct pci_dev *dev, *temp;
+    int dev_count = 0;
 
     if (port_idx >= hp_dev->pd->port_nums)
         return;
@@ -533,13 +535,36 @@ static void remove_devices_on_bus(struct pcie_hp_dev *hp_dev, int port_idx)
     port = &hp_dev->pd->ports[port_idx];
 
     /* Remove all devices on this port's secondary bus */
-    if (port->root_port && port->root_port->subordinate) {
-        bus = port->root_port->subordinate;
-        pci_lock_rescan_remove();
-        pci_stop_root_bus(bus);
-        pci_remove_root_bus(bus);
-        pci_unlock_rescan_remove();
+    if (!port->root_port || !port->root_port->subordinate) {
+        dev_dbg(&hp_dev->pdev->dev, "Port %d: No root port or subordinate bus\n", 
+                port_idx);
+        return;
     }
+
+    bus = port->root_port->subordinate;
+
+    /* Check if bus has any devices to remove */
+    if (list_empty(&bus->devices)) {
+        dev_dbg(&hp_dev->pdev->dev, "Port %d: No devices to remove\n", port_idx);
+        return;
+    }
+
+    pci_lock_rescan_remove();
+    
+    /* Iterate through all devices on the bus and remove them */
+    list_for_each_entry_safe(dev, temp, &bus->devices, bus_list) {
+        dev_info(&hp_dev->pdev->dev, "Port %d: Removing device %s\n", 
+                 port_idx, pci_name(dev));
+        pci_dev_get(dev);
+        pci_stop_and_remove_bus_device(dev);
+        pci_dev_put(dev);
+        dev_count++;
+    }
+    
+    pci_unlock_rescan_remove();
+    
+    dev_info(&hp_dev->pdev->dev, "Port %d: Removed %d device(s)\n", 
+             port_idx, dev_count);
 }
  
 static void remove_device(struct pcie_hp_dev *dev)
