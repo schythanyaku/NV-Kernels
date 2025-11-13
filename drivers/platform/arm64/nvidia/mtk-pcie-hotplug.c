@@ -195,6 +195,7 @@ struct pcie_hp_dev {
     bool manual_control; /* True when debug_state is being used (ignore IRQs) */
     struct mutex lock; /* Protect state changes */
     struct work_struct retrain_work; /* Background link retraining work */
+    struct work_struct plugin_work; /* Background hardware initialization work */
     struct pci_dev *cached_root_ports[HP_PORT_MAX]; /* Cached root port pointers */
 };
  
@@ -642,6 +643,34 @@ static void retrain_work_fn(struct work_struct *work)
     dev_info(&hp_dev->pdev->dev, "PCIe link retraining completed\n");
 }
 
+/*
+ * plugin_work_fn - Background worker for PCIe hardware initialization
+ *
+ * Performs the complete PCIe hardware initialization sequence including
+ * clocks, PERST, link training. Runs in workqueue context so it can
+ * safely perform blocking operations without holding locks.
+ */
+static void plugin_work_fn(struct work_struct *work)
+{
+    struct pcie_hp_dev *hp_dev = container_of(work, struct pcie_hp_dev, plugin_work);
+    int err;
+
+    dev_info(&hp_dev->pdev->dev, "Starting PCIe hardware initialization\n");
+
+    /* Perform complete hardware initialization */
+    err = init_pcie_hardware(hp_dev);
+    if (err) {
+        dev_err(&hp_dev->pdev->dev, "PCIe hardware initialization failed: %d\n", err);
+        /* Power off on failure */
+        gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 0);
+        hp_dev->state = STATE_PLUG_OUT;
+        return;
+    }
+
+    hp_dev->state = STATE_READY;
+    dev_info(&hp_dev->pdev->dev, "PCIe hardware initialized, ready for PCI rescan\n");
+}
+
 static int polling_link_to_l0(struct pcie_hp_dev *dev)
 {
     struct pci_dev *pci_dev;
@@ -970,18 +999,8 @@ static ssize_t debug_state_store(struct device *dev,
         /* Enable device power */
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
         
-        /* Initialize PCIe hardware (PERST, clocks, link training) */
-        err = init_pcie_hardware(hp_dev);
-        if (err) {
-            dev_err(dev, "PCIe hardware initialization failed: %d\n", err);
-            hp_dev->state = STATE_PLUG_OUT;
-            gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 0);
-            mutex_unlock(&hp_dev->lock);
-            return err;
-        }
-        
-        hp_dev->state = STATE_READY;
-        dev_info(dev, "PCIe hardware initialized, ready for PCI rescan\n");
+        /* Schedule hardware initialization in background (non-blocking) */
+        schedule_work(&hp_dev->plugin_work);
         break;
 
     default:
@@ -1201,6 +1220,7 @@ static int pcie_hp_probe(struct platform_device *pdev)
     hp_dev->manual_control = false;  /* Start in automatic/physical hotplug mode */
     mutex_init(&hp_dev->lock);
     INIT_WORK(&hp_dev->retrain_work, retrain_work_fn);
+    INIT_WORK(&hp_dev->plugin_work, plugin_work_fn);
     
     /* Initialize cached root port pointers */
     for (i = 0; i < HP_PORT_MAX; i++)
@@ -1323,6 +1343,7 @@ static void pcie_hp_remove(struct platform_device *pdev)
 
     /* Cancel any pending workqueue operations */
     cancel_work_sync(&hp_dev->retrain_work);
+    cancel_work_sync(&hp_dev->plugin_work);
 
     /* Remove sysfs interface */
     sysfs_remove_group(&pdev->dev.kobj, &pcie_hp_attr_group);
