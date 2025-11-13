@@ -193,6 +193,7 @@ struct pcie_hp_dev {
     int boot_pin;
     int prsnt_pin;
     enum pcie_hp_debug_val debug_state;
+    bool manual_control; /* True when debug_state is being used (ignore IRQs) */
     struct mutex lock; /* Protect state changes */
 };
  
@@ -519,7 +520,7 @@ get_port_root_port(struct pcie_hp_dev *hp_dev, int port_idx)
 
     return port->root_port;
 }
-
+ 
 static void remove_device(struct pcie_hp_dev *dev)
 {
     int i;
@@ -708,6 +709,14 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
     value = gpiod_get_value(app_ctx->desc);
 
     mutex_lock(&hp_dev->lock);
+
+    /* Ignore physical GPIO events when in manual/debug control mode */
+    if (hp_dev->manual_control) {
+        dev_dbg(gpio_ctx->dev, "IRQ ignored: manual control active (pin=%d, irq=%d)\n",
+                gpio_ctx->pin, irq);
+        mutex_unlock(&hp_dev->lock);
+        return IRQ_HANDLED;
+    }
     state = hp_dev->state;
 
     /* Handle presence pin events */
@@ -844,6 +853,9 @@ static ssize_t debug_state_store(struct device *dev,
 
     mutex_lock(&hp_dev->lock);
 
+    /* Enable manual control mode to prevent IRQ handler interference */
+    hp_dev->manual_control = true;
+
     switch (val) {
     case PCIE_HP_DEBUG_PLUG_OUT:
         dev_info(dev, "Debug: simulating cable removal\n");
@@ -865,6 +877,7 @@ static ssize_t debug_state_store(struct device *dev,
         err = rescan_device(hp_dev);
         if (err) {
             dev_err(dev, "Rescan failed: %d\n", err);
+            hp_dev->manual_control = false;
             mutex_unlock(&hp_dev->lock);
             return err;
         }
@@ -872,6 +885,7 @@ static ssize_t debug_state_store(struct device *dev,
         break;
 
     default:
+        hp_dev->manual_control = false;
         mutex_unlock(&hp_dev->lock);
         return -EINVAL;
     }
@@ -1040,6 +1054,7 @@ static int pcie_hp_probe(struct platform_device *pdev)
     hp_dev->boot_pin = -1;
     hp_dev->prsnt_pin = -1;
     hp_dev->state = STATE_READY;
+    hp_dev->manual_control = false;  /* Start in automatic/physical hotplug mode */
     mutex_init(&hp_dev->lock);
 
     /* Discover GPIO pins */
