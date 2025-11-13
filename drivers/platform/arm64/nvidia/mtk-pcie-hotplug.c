@@ -858,7 +858,17 @@ static ssize_t debug_state_store(struct device *dev,
     case PCIE_HP_DEBUG_PLUG_IN:
         dev_info(dev, "Debug: simulating cable plug-in\n");
         hp_dev->state = STATE_PLUG_IN;
+        /* Enable device power */
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+        /* Perform full hardware initialization and device rescan */
+        hp_dev->state = STATE_RESCAN;
+        err = rescan_device(hp_dev);
+        if (err) {
+            dev_err(dev, "Rescan failed: %d\n", err);
+            mutex_unlock(&hp_dev->lock);
+            return err;
+        }
+        hp_dev->state = STATE_READY;
         break;
 
     default:
