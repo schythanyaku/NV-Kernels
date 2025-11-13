@@ -195,6 +195,7 @@ struct pcie_hp_dev {
     enum pcie_hp_debug_val debug_state;
     bool manual_control; /* True when debug_state is being used (ignore IRQs) */
     struct mutex lock; /* Protect state changes */
+    struct work_struct retrain_work; /* Background link retraining work */
 };
  
 static int pcie_hp_pinctrl_init(struct pcie_hp_dev *hp_dev)
@@ -544,6 +545,37 @@ static void remove_device(struct pcie_hp_dev *dev)
     gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
 }
 
+/*
+ * retrain_work_fn - Background worker for PCIe link retraining
+ *
+ * Workaround for hardware limitation: After hotplug, devices initially
+ * enumerate at Gen1 speed (2.5GT/s). Hardware cannot automatically
+ * retrain to maximum speed. This worker explicitly triggers link
+ * retraining to reach Gen4/Gen5 speeds.
+ *
+ * Runs in workqueue context (can block safely without affecting userspace).
+ */
+static void retrain_work_fn(struct work_struct *work)
+{
+    struct pcie_hp_dev *hp_dev = container_of(work, struct pcie_hp_dev, retrain_work);
+    struct pci_dev *pci_dev;
+    int i;
+
+    dev_info(&hp_dev->pdev->dev, "Starting PCIe link retraining\n");
+
+    /* Retrain all configured PCIe ports */
+    for (i = 0; i < hp_dev->pd->port_nums; i++) {
+        pci_dev = get_port_root_port(hp_dev, i);
+        if (pci_dev) {
+            retrain_pcie_link(pci_dev);
+            dev_info(&hp_dev->pdev->dev, "Retrained link for domain %d\n",
+                     hp_dev->pd->ports[i].domain);
+        }
+    }
+
+    dev_info(&hp_dev->pdev->dev, "PCIe link retraining completed\n");
+}
+
 static int polling_link_to_l0(struct pcie_hp_dev *dev)
 {
     struct pci_dev *pci_dev;
@@ -869,18 +901,15 @@ static ssize_t debug_state_store(struct device *dev,
 
     case PCIE_HP_DEBUG_PLUG_IN:
         dev_info(dev, "Debug: simulating cable plug-in\n");
+        /* NOTE: Kernel only powers on hardware. Userspace must perform
+         * PCI bus rescan after this operation. This matches the legacy
+         * driver behavior and avoids blocking operations in sysfs write.
+         * The kernel driver only manages hardware (GPIO, power, clock).
+         * Complex hardware initialization (link training, enumeration)
+         * is triggered by userspace PCI rescan. */
         hp_dev->state = STATE_PLUG_IN;
         /* Enable device power */
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
-        /* Perform full hardware initialization and device rescan */
-        hp_dev->state = STATE_RESCAN;
-        err = rescan_device(hp_dev);
-        if (err) {
-            dev_err(dev, "Rescan failed: %d\n", err);
-            hp_dev->manual_control = false;
-            mutex_unlock(&hp_dev->lock);
-            return err;
-        }
         hp_dev->state = STATE_READY;
         break;
 
@@ -898,8 +927,52 @@ static ssize_t debug_state_store(struct device *dev,
 
 DEVICE_ATTR_RW(debug_state);
 
+/*
+ * retrain_link_store - Trigger PCIe link retraining
+ *
+ * Workaround for hardware limitation where devices enumerate at Gen1
+ * speed after hotplug. Writing 1 triggers background link retraining
+ * to reach maximum supported speed (Gen4/Gen5).
+ *
+ * Usage: echo 1 > /sys/devices/.../pcie_hotplug/retrain_link
+ */
+static ssize_t retrain_link_store(struct device *dev,
+                                   struct device_attribute *attr,
+                                   const char *buf, size_t count)
+{
+    struct pcie_hp_dev *hp_dev = dev_get_drvdata(dev);
+    unsigned long val;
+    int err;
+
+    if (!hp_dev)
+        return -EINVAL;
+
+    err = kstrtoul(buf, 10, &val);
+    if (err)
+        return err;
+
+    if (val != 1)
+        return -EINVAL;
+
+    /* Schedule link retraining in background workqueue */
+    schedule_work(&hp_dev->retrain_work);
+
+    return count;
+}
+
+static ssize_t retrain_link_show(struct device *dev,
+                                  struct device_attribute *attr,
+                                  char *buf)
+{
+    return scnprintf(buf, PAGE_SIZE,
+                     "Write 1 to trigger PCIe link retraining\n");
+}
+
+DEVICE_ATTR_RW(retrain_link);
+
 static struct attribute *pcie_hp_attrs[] = {
     &dev_attr_debug_state.attr,
+    &dev_attr_retrain_link.attr,
     NULL
 };
 
@@ -1056,6 +1129,7 @@ static int pcie_hp_probe(struct platform_device *pdev)
     hp_dev->state = STATE_READY;
     hp_dev->manual_control = false;  /* Start in automatic/physical hotplug mode */
     mutex_init(&hp_dev->lock);
+    INIT_WORK(&hp_dev->retrain_work, retrain_work_fn);
 
     /* Discover GPIO pins */
     hp_dev->gpio_count = pcie_hp_probe_io_info(pdev);
@@ -1171,6 +1245,9 @@ static void pcie_hp_remove(struct platform_device *pdev)
 
     if (!hp_dev)
         return;
+
+    /* Cancel any pending workqueue operations */
+    cancel_work_sync(&hp_dev->retrain_work);
 
     /* Remove sysfs interface */
     sysfs_remove_group(&pdev->dev.kobj, &pcie_hp_attr_group);
