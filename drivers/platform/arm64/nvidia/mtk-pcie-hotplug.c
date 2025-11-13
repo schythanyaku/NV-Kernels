@@ -556,6 +556,78 @@ static void remove_device(struct pcie_hp_dev *dev)
  *
  * Runs in workqueue context (can block safely without affecting userspace).
  */
+/*
+ * init_pcie_hardware - Initialize PCIe hardware for hotplug
+ *
+ * Performs the complete hardware initialization sequence needed for hotplug:
+ * - Enable clocks and configure pinctrl
+ * - Assert PERST to reset PCIe
+ * - Apply bus protection
+ * - Wait for links to reach L0
+ * - Retrain links to Gen4/Gen5
+ *
+ * This does NOT do PCI enumeration - userspace must call pci rescan after.
+ */
+static int init_pcie_hardware(struct pcie_hp_dev *dev)
+{
+    struct pci_dev *pci_dev;
+    int i, err;
+
+    /* Change pinctrl state */
+    err = pcie_hp_change_state(dev, "clkreqn");
+    if (err)
+        return err;
+
+    /* Enable clock */
+    pcie_hp_ckm_control(dev, false);
+    usleep_range(PCIE_HP_DELAY_STANDARD_US, PCIE_HP_DELAY_STANDARD_US + 1000);
+
+    /* Resume root ports if they exist (may not exist during initial plug-in) */
+    for (i = 0; i < dev->pd->port_nums; i++) {
+        pci_dev = get_port_root_port(dev, i);
+        if (!pci_dev)
+            continue;
+
+        err = pm_runtime_resume_and_get(&pci_dev->dev);
+        if (err < 0) {
+            dev_warn(&dev->pdev->dev,
+                    "Runtime resume failed for %s: %d\n",
+                    pci_name(pci_dev), err);
+        }
+    }
+
+    /* Assert PCIe reset */
+    gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
+
+    /* Apply bus protection */
+    if (dev->pd->rp_bus_protect) {
+        for (i = 0; i < dev->pd->port_nums; i++)
+            dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
+    }
+
+    /* Wait for links to reach L0 */
+    err = polling_link_to_l0(dev);
+    if (err) {
+        dev_err(&dev->pdev->dev, "Links failed to reach L0\n");
+        return err;
+    }
+
+    /* Retrain PCIe links to Gen4/Gen5 */
+    for (i = 0; i < dev->pd->port_nums; i++) {
+        pci_dev = get_port_root_port(dev, i);
+        if (pci_dev) {
+            retrain_pcie_link(pci_dev);
+            dev_info(&dev->pdev->dev, "Retrained link for domain %d\n",
+                     dev->pd->ports[i].domain);
+        }
+    }
+
+    /* Wait for link stability */
+    msleep(PCIE_HP_DELAY_LINK_STABLE_MS);
+
+    return 0;
+}
+
 static void retrain_work_fn(struct work_struct *work)
 {
     struct pcie_hp_dev *hp_dev = container_of(work, struct pcie_hp_dev, retrain_work);
@@ -902,16 +974,22 @@ static ssize_t debug_state_store(struct device *dev,
 
     case PCIE_HP_DEBUG_PLUG_IN:
         dev_info(dev, "Debug: simulating cable plug-in\n");
-        /* NOTE: Kernel only powers on hardware. Userspace must perform
-         * PCI bus rescan after this operation. This matches the legacy
-         * driver behavior and avoids blocking operations in sysfs write.
-         * The kernel driver only manages hardware (GPIO, power, clock).
-         * Complex hardware initialization (link training, enumeration)
-         * is triggered by userspace PCI rescan. */
         hp_dev->state = STATE_PLUG_IN;
         /* Enable device power */
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+        
+        /* Initialize PCIe hardware (PERST, clocks, link training) */
+        err = init_pcie_hardware(hp_dev);
+        if (err) {
+            dev_err(dev, "PCIe hardware initialization failed: %d\n", err);
+            hp_dev->state = STATE_PLUG_OUT;
+            gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 0);
+            mutex_unlock(&hp_dev->lock);
+            return err;
+        }
+        
         hp_dev->state = STATE_READY;
+        dev_info(dev, "PCIe hardware initialized, ready for PCI rescan\n");
         break;
 
     default:
