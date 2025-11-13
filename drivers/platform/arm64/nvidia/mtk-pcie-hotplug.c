@@ -192,7 +192,7 @@ struct pcie_hp_dev {
     int boot_pin;
     int prsnt_pin;
     enum pcie_hp_debug_val debug_state;
-    bool manual_control; /* True when debug_state is being used (ignore IRQs) */
+    bool suppress_gpio_irq; /* Suppress GPIO IRQs during sysfs operations */
     struct mutex lock; /* Protect state changes */
     struct work_struct retrain_work; /* Background link retraining work */
     struct work_struct plugin_work; /* Background hardware initialization work */
@@ -664,12 +664,12 @@ static void plugin_work_fn(struct work_struct *work)
         /* Power off on failure */
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 0);
         hp_dev->state = STATE_PLUG_OUT;
-        hp_dev->manual_control = false;  /* Re-enable automatic detection */
+        hp_dev->suppress_gpio_irq = false;  /* Re-enable GPIO interrupt handling */
         return;
     }
 
     hp_dev->state = STATE_READY;
-    hp_dev->manual_control = false;  /* Re-enable automatic/physical hotplug detection */
+    hp_dev->suppress_gpio_irq = false;  /* Re-enable GPIO interrupt handling */
     dev_info(&hp_dev->pdev->dev, "PCIe hardware initialized, ready for PCI rescan\n");
 }
 
@@ -839,9 +839,9 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
 
     mutex_lock(&hp_dev->lock);
 
-    /* Ignore physical GPIO events when in manual/debug control mode */
-    if (hp_dev->manual_control) {
-        dev_dbg(gpio_ctx->dev, "IRQ ignored: manual control active (pin=%d, irq=%d)\n",
+    /* Ignore GPIO events during sysfs operations to prevent conflicts */
+    if (hp_dev->suppress_gpio_irq) {
+        dev_dbg(gpio_ctx->dev, "IRQ ignored: GPIO suppression active (pin=%d, irq=%d)\n",
                 gpio_ctx->pin, irq);
         mutex_unlock(&hp_dev->lock);
         return IRQ_HANDLED;
@@ -981,8 +981,8 @@ static ssize_t debug_state_store(struct device *dev,
 
     mutex_lock(&hp_dev->lock);
 
-    /* Enable manual control mode to prevent IRQ handler interference */
-    hp_dev->manual_control = true;
+    /* Suppress GPIO interrupts during sysfs-initiated operations */
+    hp_dev->suppress_gpio_irq = true;
 
     switch (val) {
     case PCIE_HP_DEBUG_PLUG_OUT:
@@ -993,21 +993,23 @@ static ssize_t debug_state_store(struct device *dev,
          * hardware (GPIO, power, PCIe link). */
         hp_dev->state = STATE_PLUG_OUT;
         remove_device(hp_dev);
-        hp_dev->manual_control = false;  /* Re-enable automatic detection */
+        hp_dev->suppress_gpio_irq = false;  /* Re-enable GPIO interrupt handling */
         break;
 
     case PCIE_HP_DEBUG_PLUG_IN:
         dev_info(dev, "Debug: simulating cable plug-in\n");
         hp_dev->state = STATE_PLUG_IN;
+        hp_dev->suppress_gpio_irq = true;
         /* Enable device power */
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
         
-        /* Schedule hardware initialization in background (non-blocking) */
+        /* Schedule hardware initialization and wait for completion */
         schedule_work(&hp_dev->plugin_work);
+        flush_work(&hp_dev->plugin_work);
         break;
 
     default:
-        hp_dev->manual_control = false;
+        hp_dev->suppress_gpio_irq = false;
         mutex_unlock(&hp_dev->lock);
         return -EINVAL;
     }
@@ -1220,7 +1222,7 @@ static int pcie_hp_probe(struct platform_device *pdev)
     hp_dev->boot_pin = -1;
     hp_dev->prsnt_pin = -1;
     hp_dev->state = STATE_READY;
-    hp_dev->manual_control = false;  /* Start in automatic/physical hotplug mode */
+    hp_dev->suppress_gpio_irq = false;  /* GPIO interrupt handling enabled by default */
     mutex_init(&hp_dev->lock);
     INIT_WORK(&hp_dev->retrain_work, retrain_work_fn);
     INIT_WORK(&hp_dev->plugin_work, plugin_work_fn);
@@ -1267,14 +1269,14 @@ static int pcie_hp_probe(struct platform_device *pdev)
 
         /* Setup IRQ for interrupt-type GPIOs */
         if (app_ctx->ctx->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT) {
-            dev_info(&pdev->dev, "Setting up IRQ for GPIO %d (pin %d)\n", i, app_ctx->pin);
+            dev_info(&pdev->dev, "Setting up IRQ for GPIO %d (pin %d)\n", i, app_ctx->ctx->pin);
             app_ctx->hp_dev = hp_dev;
             ret = pcie_hp_setup_irq(app_ctx);
             if (ret) {
                 dev_err(&pdev->dev, "Failed to setup IRQ for GPIO %d\n", i);
                 goto gpio_release;
             }
-            dev_info(&pdev->dev, "IRQ %d registered for GPIO %d\n", app_ctx->irq, i);
+            dev_info(&pdev->dev, "IRQ %d registered for GPIO %d\n", gpiod_to_irq(app_ctx->desc), i);
         }
     }
 
