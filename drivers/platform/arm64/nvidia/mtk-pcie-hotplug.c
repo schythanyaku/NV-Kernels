@@ -88,7 +88,6 @@ struct pcie_port_info {
     int domain;
     int bus;
     int devfn;
-    struct pci_dev *root_port;
     void __iomem *mac_base;
 };
 
@@ -196,6 +195,7 @@ struct pcie_hp_dev {
     bool manual_control; /* True when debug_state is being used (ignore IRQs) */
     struct mutex lock; /* Protect state changes */
     struct work_struct retrain_work; /* Background link retraining work */
+    struct pci_dev *cached_root_ports[HP_PORT_MAX]; /* Cached root port pointers */
 };
  
 static int pcie_hp_pinctrl_init(struct pcie_hp_dev *hp_dev)
@@ -507,11 +507,12 @@ get_port_root_port(struct pcie_hp_dev *hp_dev, int port_idx)
     port = &hp_dev->pd->ports[port_idx];
 
     /* Try to find the root port if not cached */
-    if (!port->root_port) {
-        port->root_port = pci_get_domain_bus_and_slot(port->domain,
-                                                        port->bus,
-                                                        port->devfn);
-        if (!port->root_port) {
+    if (!hp_dev->cached_root_ports[port_idx]) {
+        hp_dev->cached_root_ports[port_idx] = 
+            pci_get_domain_bus_and_slot(port->domain,
+                                        port->bus,
+                                        port->devfn);
+        if (!hp_dev->cached_root_ports[port_idx]) {
             dev_warn(&hp_dev->pdev->dev,
                      "Root port not found for domain %d bus %d\n",
                      port->domain, port->bus);
@@ -519,7 +520,7 @@ get_port_root_port(struct pcie_hp_dev *hp_dev, int port_idx)
         }
     }
 
-    return port->root_port;
+    return hp_dev->cached_root_ports[port_idx];
 }
  
 static void remove_device(struct pcie_hp_dev *dev)
@@ -1130,6 +1131,10 @@ static int pcie_hp_probe(struct platform_device *pdev)
     hp_dev->manual_control = false;  /* Start in automatic/physical hotplug mode */
     mutex_init(&hp_dev->lock);
     INIT_WORK(&hp_dev->retrain_work, retrain_work_fn);
+    
+    /* Initialize cached root port pointers */
+    for (i = 0; i < HP_PORT_MAX; i++)
+        hp_dev->cached_root_ports[i] = NULL;
 
     /* Discover GPIO pins */
     hp_dev->gpio_count = pcie_hp_probe_io_info(pdev);
@@ -1264,8 +1269,8 @@ static void pcie_hp_remove(struct platform_device *pdev)
 
     /* Release cached PCI device references */
     for (i = 0; i < hp_dev->pd->port_nums; i++) {
-        if (hp_dev->pd->ports[i].root_port)
-            pci_dev_put(hp_dev->pd->ports[i].root_port);
+        if (hp_dev->cached_root_ports[i])
+            pci_dev_put(hp_dev->cached_root_ports[i]);
     }
 
     mutex_destroy(&hp_dev->lock);
