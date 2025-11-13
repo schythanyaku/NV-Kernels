@@ -664,10 +664,12 @@ static void plugin_work_fn(struct work_struct *work)
         /* Power off on failure */
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 0);
         hp_dev->state = STATE_PLUG_OUT;
+        hp_dev->manual_control = false;  /* Re-enable automatic detection */
         return;
     }
 
     hp_dev->state = STATE_READY;
+    hp_dev->manual_control = false;  /* Re-enable automatic/physical hotplug detection */
     dev_info(&hp_dev->pdev->dev, "PCIe hardware initialized, ready for PCI rescan\n");
 }
 
@@ -991,6 +993,7 @@ static ssize_t debug_state_store(struct device *dev,
          * hardware (GPIO, power, PCIe link). */
         hp_dev->state = STATE_PLUG_OUT;
         remove_device(hp_dev);
+        hp_dev->manual_control = false;  /* Re-enable automatic detection */
         break;
 
     case PCIE_HP_DEBUG_PLUG_IN:
@@ -1232,6 +1235,8 @@ static int pcie_hp_probe(struct platform_device *pdev)
         dev_err(&pdev->dev, "No GPIO descriptors found\n");
         return -ENODEV;
     }
+    
+    dev_info(&pdev->dev, "Found %d GPIO descriptors\n", hp_dev->gpio_count);
 
     hp_dev->pins = devm_kcalloc(&pdev->dev, hp_dev->gpio_count,
                                  sizeof(struct pcie_hp_gpio_ctx),
@@ -1262,12 +1267,14 @@ static int pcie_hp_probe(struct platform_device *pdev)
 
         /* Setup IRQ for interrupt-type GPIOs */
         if (app_ctx->ctx->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT) {
+            dev_info(&pdev->dev, "Setting up IRQ for GPIO %d (pin %d)\n", i, app_ctx->pin);
             app_ctx->hp_dev = hp_dev;
             ret = pcie_hp_setup_irq(app_ctx);
             if (ret) {
                 dev_err(&pdev->dev, "Failed to setup IRQ for GPIO %d\n", i);
                 goto gpio_release;
             }
+            dev_info(&pdev->dev, "IRQ %d registered for GPIO %d\n", app_ctx->irq, i);
         }
     }
 
