@@ -546,16 +546,9 @@ static void remove_device(struct pcie_hp_dev *dev)
     gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
 }
 
-/*
- * retrain_work_fn - Background worker for PCIe link retraining
- *
- * Workaround for hardware limitation: After hotplug, devices initially
- * enumerate at Gen1 speed (2.5GT/s). Hardware cannot automatically
- * retrain to maximum speed. This worker explicitly triggers link
- * retraining to reach Gen4/Gen5 speeds.
- *
- * Runs in workqueue context (can block safely without affecting userspace).
- */
+/* Forward declaration */
+static int polling_link_to_l0(struct pcie_hp_dev *dev);
+
 /*
  * init_pcie_hardware - Initialize PCIe hardware for hotplug
  *
@@ -945,9 +938,8 @@ static ssize_t debug_state_store(struct device *dev,
                                   const char *buf, size_t count)
 {
     struct pcie_hp_dev *hp_dev = dev_get_drvdata(dev);
-    struct pci_bus *bus;
     unsigned long val;
-    int err, i;
+    int err;
 
     if (!hp_dev)
         return -EINVAL;
