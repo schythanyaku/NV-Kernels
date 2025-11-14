@@ -598,19 +598,39 @@ static int init_pcie_hardware(struct pcie_hp_dev *dev)
             dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
     }
 
-    /* Wait for links to reach L0 */
-    err = polling_link_to_l0(dev);
-    if (err) {
-        dev_err(&dev->pdev->dev, "Links failed to reach L0\n");
-        return err;
-    }
+	/* Wait for links to reach L0 */
+	err = polling_link_to_l0(dev);
+	if (err) {
+		dev_err(&dev->pdev->dev, "Links failed to reach L0\n");
+		return err;
+	}
 
-    /* Hardware initialization complete
-     * Note: Link retraining to Gen5 is handled by userspace after PCI rescan
-     * (Root ports may not exist yet at this stage, especially after removal) */
-    dev_info(&dev->pdev->dev, "PCIe hardware initialized, ready for PCI rescan\n");
+	/* Retrain PCIe links to Gen5 if root ports exist (like 6.14)
+	 * Note: After full removal, root ports may not exist yet.
+	 * In that case, userspace must retrain after PCI rescan. */
+	{
+		bool retrained = false;
+		for (i = 0; i < dev->pd->port_nums; i++) {
+			struct pci_dev *pci_dev = get_port_root_port(dev, i);
+			if (pci_dev) {
+				retrain_pcie_link(pci_dev);
+				dev_info(&dev->pdev->dev, "Retrained link for domain %d\n",
+					 dev->pd->ports[i].domain);
+				retrained = true;
+			}
+		}
 
-    return 0;
+		if (retrained) {
+			/* Wait for link stability */
+			msleep(PCIE_HP_DELAY_LINK_STABLE_MS);
+			dev_info(&dev->pdev->dev, "PCIe hardware initialized at Gen5, ready for PCI rescan\n");
+		} else {
+			dev_info(&dev->pdev->dev, "PCIe hardware initialized (root ports not found, retraining skipped)\n");
+			dev_info(&dev->pdev->dev, "Userspace should retrain links after PCI rescan\n");
+		}
+	}
+
+	return 0;
 }
 
 static void retrain_work_fn(struct work_struct *work)
@@ -967,7 +987,7 @@ static bool pci_devices_present_on_domain(int domain)
 
     return has_devices;
 }
-
+ 
 static ssize_t debug_state_show(struct device *dev,
                                  struct device_attribute *attr, char *buf)
 {
