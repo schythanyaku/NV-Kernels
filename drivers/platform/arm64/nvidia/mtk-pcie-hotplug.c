@@ -564,7 +564,6 @@ static int polling_link_to_l0(struct pcie_hp_dev *dev);
  */
 static int init_pcie_hardware(struct pcie_hp_dev *dev)
 {
-    struct pci_dev *pci_dev;
     int i, err;
 
     /* Change pinctrl state */
@@ -578,7 +577,7 @@ static int init_pcie_hardware(struct pcie_hp_dev *dev)
 
     /* Resume root ports if they exist (may not exist during initial plug-in) */
     for (i = 0; i < dev->pd->port_nums; i++) {
-        pci_dev = get_port_root_port(dev, i);
+        struct pci_dev *pci_dev = get_port_root_port(dev, i);
         if (!pci_dev)
             continue;
 
@@ -606,18 +605,10 @@ static int init_pcie_hardware(struct pcie_hp_dev *dev)
         return err;
     }
 
-    /* Retrain PCIe links to Gen4/Gen5 */
-    for (i = 0; i < dev->pd->port_nums; i++) {
-        pci_dev = get_port_root_port(dev, i);
-        if (pci_dev) {
-            retrain_pcie_link(pci_dev);
-            dev_info(&dev->pdev->dev, "Retrained link for domain %d\n",
-                     dev->pd->ports[i].domain);
-        }
-    }
-
-    /* Wait for link stability */
-    msleep(PCIE_HP_DELAY_LINK_STABLE_MS);
+    /* Hardware initialization complete
+     * Note: Link retraining to Gen5 is handled by userspace after PCI rescan
+     * (Root ports may not exist yet at this stage, especially after removal) */
+    dev_info(&dev->pdev->dev, "PCIe hardware initialized, ready for PCI rescan\n");
 
     return 0;
 }
