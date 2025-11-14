@@ -511,8 +511,8 @@ get_port_root_port(struct pcie_hp_dev *hp_dev, int port_idx)
     if (!hp_dev->cached_root_ports[port_idx]) {
         hp_dev->cached_root_ports[port_idx] = 
             pci_get_domain_bus_and_slot(port->domain,
-                                        port->bus,
-                                        port->devfn);
+                                                        port->bus,
+                                                        port->devfn);
         if (!hp_dev->cached_root_ports[port_idx]) {
             dev_warn(&hp_dev->pdev->dev,
                      "Root port not found for domain %d bus %d\n",
@@ -953,6 +953,30 @@ static acpi_status acpi_gpio_resource_handler(struct acpi_resource *ares, void *
     return AE_OK;
 }
  
+/**
+ * pci_devices_present_on_domain() - Check if PCI devices exist on a domain
+ * @domain: PCI domain number to check
+ *
+ * Returns true if any PCI devices are present on the specified domain,
+ * false otherwise. This is used as a safety check before hardware shutdown.
+ */
+static bool pci_devices_present_on_domain(int domain)
+{
+    struct pci_bus *bus;
+    bool has_devices = false;
+
+    /* Find the root bus for this domain */
+    bus = pci_find_bus(domain, 0);
+    if (!bus)
+        return false;
+
+    /* Check if the bus has any child devices */
+    if (!list_empty(&bus->devices))
+        has_devices = true;
+
+    return has_devices;
+}
+
 static ssize_t debug_state_show(struct device *dev,
                                  struct device_attribute *attr, char *buf)
 {
@@ -987,10 +1011,33 @@ static ssize_t debug_state_store(struct device *dev,
     switch (val) {
     case PCIE_HP_DEBUG_PLUG_OUT:
         dev_info(dev, "Debug: simulating cable removal\n");
-        /* NOTE: Userspace must remove PCI devices BEFORE writing to debug_state.
-         * This avoids kernel locking issues and follows the proven approach
-         * from the legacy implementation. The kernel driver only manages
-         * hardware (GPIO, power, PCIe link). */
+        
+        /* Safety check: Verify no devices on the bus before hardware shutdown.
+         * This prevents silicon bug where CPU access during link down causes
+         * system hang. Userspace must remove PCI devices first. */
+        if (pci_devices_present_on_domain(0x0000) || 
+            pci_devices_present_on_domain(0x0002)) {
+            dev_err(dev, "ERROR: PCI devices still present on bus!\n");
+            dev_err(dev, "       You must remove PCI devices before hardware shutdown.\n");
+            dev_err(dev, "       Refusing to power down to prevent PCIe errors.\n");
+            dev_err(dev, "\n");
+            dev_err(dev, "Correct usage:\n");
+            dev_err(dev, "  Option 1 (Recommended):\n");
+            dev_err(dev, "    /opt/nvidia/dgx-spark-mlnx-hotplug/mtk-hotplug-handler.sh removal\n");
+            dev_err(dev, "\n");
+            dev_err(dev, "  Option 2 (Manual):\n");
+            dev_err(dev, "    # Remove devices first:\n");
+            dev_err(dev, "    for dev in /sys/bus/pci/devices/0000:01:*/remove; do echo 1 > $dev; done\n");
+            dev_err(dev, "    for dev in /sys/bus/pci/devices/0002:01:*/remove; do echo 1 > $dev; done\n");
+            dev_err(dev, "    sleep 2\n");
+            dev_err(dev, "    # Then power down:\n");
+            dev_err(dev, "    echo 0 > /sys/devices/platform/MTKP0001:00/pcie_hotplug/debug_state\n");
+            hp_dev->suppress_gpio_irq = false;
+            mutex_unlock(&hp_dev->lock);
+            return -EBUSY;  /* Device or resource busy */
+        }
+        
+        /* Safe to proceed - no devices on bus */
         hp_dev->state = STATE_PLUG_OUT;
         remove_device(hp_dev);
         hp_dev->suppress_gpio_irq = false;  /* Re-enable GPIO interrupt handling */
@@ -998,6 +1045,33 @@ static ssize_t debug_state_store(struct device *dev,
 
     case PCIE_HP_DEBUG_PLUG_IN:
         dev_info(dev, "Debug: simulating cable plug-in\n");
+        
+        /* Safety check: Verify no devices already on the bus.
+         * Re-initializing hardware (toggling PERST, power) while devices are
+         * active can cause driver crashes, incomplete cleanup, and data loss.
+         * Userspace must remove existing devices first. */
+        if (pci_devices_present_on_domain(0x0000) || 
+            pci_devices_present_on_domain(0x0002)) {
+            dev_err(dev, "ERROR: PCI devices already present on bus!\n");
+            dev_err(dev, "       Hardware re-initialization while devices are active is unsafe.\n");
+            dev_err(dev, "       Remove devices before re-initializing hardware.\n");
+            dev_err(dev, "\n");
+            dev_err(dev, "Correct usage:\n");
+            dev_err(dev, "  Option 1 (Recommended):\n");
+            dev_err(dev, "    /opt/nvidia/dgx-spark-mlnx-hotplug/mtk-hotplug-handler.sh plug-in\n");
+            dev_err(dev, "\n");
+            dev_err(dev, "  Option 2 (Manual - only if no devices present):\n");
+            dev_err(dev, "    # Verify no devices:\n");
+            dev_err(dev, "    lspci -D | grep Mellanox  # Should be empty\n");
+            dev_err(dev, "    # Then initialize:\n");
+            dev_err(dev, "    echo 1 > /sys/devices/platform/MTKP0001:00/pcie_hotplug/debug_state\n");
+            dev_err(dev, "    echo 1 > /sys/bus/pci/rescan\n");
+            hp_dev->suppress_gpio_irq = false;
+            mutex_unlock(&hp_dev->lock);
+            return -EBUSY;  /* Device or resource busy */
+        }
+        
+        /* Safe to proceed - no devices on bus */
         hp_dev->state = STATE_PLUG_IN;
         hp_dev->suppress_gpio_irq = true;
         /* Enable device power */
