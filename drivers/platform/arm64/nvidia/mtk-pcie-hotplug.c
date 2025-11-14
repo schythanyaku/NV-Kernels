@@ -973,19 +973,25 @@ static acpi_status acpi_gpio_resource_handler(struct acpi_resource *ares, void *
  */
 static bool pci_devices_present_on_domain(int domain)
 {
-    struct pci_bus *bus;
-    bool has_devices = false;
+	struct pci_bus *bus;
+	struct pci_dev *dev;
+	bool has_endpoint_devices = false;
 
-    /* Find the root bus for this domain */
-    bus = pci_find_bus(domain, 0);
-    if (!bus)
-        return false;
+	/* Find the secondary bus (bus 01) for this domain
+	 * This is where CX7 endpoint devices live, not the root ports.
+	 * We want to keep root ports alive (6.14 behavior), so only
+	 * check for endpoint devices on the secondary bus. */
+	bus = pci_find_bus(domain, 1);
+	if (!bus)
+		return false;  /* No secondary bus means no endpoints */
 
-    /* Check if the bus has any child devices */
-    if (!list_empty(&bus->devices))
-        has_devices = true;
+	/* Check if the secondary bus has any devices (CX7 endpoints) */
+	list_for_each_entry(dev, &bus->devices, bus_list) {
+		has_endpoint_devices = true;
+		break;
+	}
 
-    return has_devices;
+	return has_endpoint_devices;
 }
  
 static ssize_t debug_state_show(struct device *dev,
