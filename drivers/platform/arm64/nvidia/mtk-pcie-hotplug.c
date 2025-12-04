@@ -177,6 +177,11 @@ struct pcie_hp_gpio_ctx {
     struct pcie_hp_dev *hp_dev;
 };
 
+struct acpi_gpio_parse_context {
+    struct gpio_acpi_context *ctx;
+    struct pcie_hp_dev *hp_dev;
+};
+
 enum pcie_hp_debug_val {
     PCIE_HP_DEBUG_PLUG_OUT = 0,
     PCIE_HP_DEBUG_PLUG_IN,
@@ -193,9 +198,7 @@ struct pcie_hp_dev {
     int prsnt_pin;
     enum pcie_hp_debug_val debug_state;
     bool suppress_gpio_irq; /* Suppress GPIO IRQs during sysfs operations */
-    struct mutex lock; /* Protect state changes */
-    struct work_struct retrain_work; /* Background link retraining work */
-    struct work_struct plugin_work; /* Background hardware initialization work */
+    spinlock_t lock; /* Protect state changes (IRQ-safe) */
     struct pci_dev *cached_root_ports[HP_PORT_MAX]; /* Cached root port pointers */
 };
  
@@ -547,143 +550,6 @@ static void remove_device(struct pcie_hp_dev *dev)
     gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
 }
 
-/* Forward declaration */
-static int polling_link_to_l0(struct pcie_hp_dev *dev);
-
-/*
- * init_pcie_hardware - Initialize PCIe hardware for hotplug
- *
- * Performs the complete hardware initialization sequence needed for hotplug:
- * - Enable clocks and configure pinctrl
- * - Assert PERST to reset PCIe
- * - Apply bus protection
- * - Wait for links to reach L0
- * - Retrain links to Gen4/Gen5
- *
- * This does NOT do PCI enumeration - userspace must call pci rescan after.
- */
-static int init_pcie_hardware(struct pcie_hp_dev *dev)
-{
-    int i, err;
-
-    /* Change pinctrl state */
-    err = pcie_hp_change_state(dev, "clkreqn");
-    if (err)
-        return err;
-
-    /* Enable clock */
-    pcie_hp_ckm_control(dev, false);
-    usleep_range(PCIE_HP_DELAY_STANDARD_US, PCIE_HP_DELAY_STANDARD_US + 1000);
-
-    /* Resume root ports if they exist (may not exist during initial plug-in) */
-    for (i = 0; i < dev->pd->port_nums; i++) {
-        struct pci_dev *pci_dev = get_port_root_port(dev, i);
-        if (!pci_dev)
-            continue;
-
-        err = pm_runtime_resume_and_get(&pci_dev->dev);
-        if (err < 0) {
-            dev_warn(&dev->pdev->dev,
-                    "Runtime resume failed for %s: %d\n",
-                    pci_name(pci_dev), err);
-        }
-    }
-
-    /* Assert PCIe reset */
-    gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
-
-    /* Apply bus protection */
-    if (dev->pd->rp_bus_protect) {
-        for (i = 0; i < dev->pd->port_nums; i++)
-            dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
-    }
-
-	/* Wait for links to reach L0 */
-	err = polling_link_to_l0(dev);
-	if (err) {
-		dev_err(&dev->pdev->dev, "Links failed to reach L0\n");
-		return err;
-	}
-
-	/* Retrain PCIe links to Gen5 if root ports exist (like 6.14)
-	 * Note: After full removal, root ports may not exist yet.
-	 * In that case, userspace must retrain after PCI rescan. */
-	{
-		bool retrained = false;
-		for (i = 0; i < dev->pd->port_nums; i++) {
-			struct pci_dev *pci_dev = get_port_root_port(dev, i);
-			if (pci_dev) {
-				retrain_pcie_link(pci_dev);
-				dev_info(&dev->pdev->dev, "Retrained link for domain %d\n",
-					 dev->pd->ports[i].domain);
-				retrained = true;
-			}
-		}
-
-		if (retrained) {
-			/* Wait for link stability */
-			msleep(PCIE_HP_DELAY_LINK_STABLE_MS);
-			dev_info(&dev->pdev->dev, "PCIe hardware initialized at Gen5, ready for PCI rescan\n");
-		} else {
-			dev_info(&dev->pdev->dev, "PCIe hardware initialized (root ports not found, retraining skipped)\n");
-			dev_info(&dev->pdev->dev, "Userspace should retrain links after PCI rescan\n");
-		}
-	}
-
-	return 0;
-}
-
-static void retrain_work_fn(struct work_struct *work)
-{
-    struct pcie_hp_dev *hp_dev = container_of(work, struct pcie_hp_dev, retrain_work);
-    struct pci_dev *pci_dev;
-    int i;
-
-    dev_info(&hp_dev->pdev->dev, "Starting PCIe link retraining\n");
-
-    /* Retrain all configured PCIe ports */
-    for (i = 0; i < hp_dev->pd->port_nums; i++) {
-        pci_dev = get_port_root_port(hp_dev, i);
-        if (pci_dev) {
-            retrain_pcie_link(pci_dev);
-            dev_info(&hp_dev->pdev->dev, "Retrained link for domain %d\n",
-                     hp_dev->pd->ports[i].domain);
-        }
-    }
-
-    dev_info(&hp_dev->pdev->dev, "PCIe link retraining completed\n");
-}
-
-/*
- * plugin_work_fn - Background worker for PCIe hardware initialization
- *
- * Performs the complete PCIe hardware initialization sequence including
- * clocks, PERST, link training. Runs in workqueue context so it can
- * safely perform blocking operations without holding locks.
- */
-static void plugin_work_fn(struct work_struct *work)
-{
-    struct pcie_hp_dev *hp_dev = container_of(work, struct pcie_hp_dev, plugin_work);
-    int err;
-
-    dev_info(&hp_dev->pdev->dev, "Starting PCIe hardware initialization\n");
-
-    /* Perform complete hardware initialization */
-    err = init_pcie_hardware(hp_dev);
-    if (err) {
-        dev_err(&hp_dev->pdev->dev, "PCIe hardware initialization failed: %d\n", err);
-        /* Power off on failure */
-        gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 0);
-        hp_dev->state = STATE_PLUG_OUT;
-        hp_dev->suppress_gpio_irq = false;  /* Re-enable GPIO interrupt handling */
-        return;
-    }
-
-    hp_dev->state = STATE_READY;
-    hp_dev->suppress_gpio_irq = false;  /* Re-enable GPIO interrupt handling */
-    dev_info(&hp_dev->pdev->dev, "PCIe hardware initialized, ready for PCI rescan\n");
-}
-
 static int polling_link_to_l0(struct pcie_hp_dev *dev)
 {
     struct pci_dev *pci_dev;
@@ -784,16 +650,6 @@ static int rescan_device(struct pcie_hp_dev *dev)
     /* Wait for link stability */
     msleep(PCIE_HP_DELAY_LINK_STABLE_MS);
 
-    /* Rescan buses */
-    for (i = 0; i < dev->pd->port_nums; i++) {
-        bus = pci_find_bus(dev->pd->ports[i].domain, dev->pd->ports[i].bus);
-        if (bus) {
-            pci_lock_rescan_remove();
-            pci_rescan_bus(bus);
-            pci_unlock_rescan_remove();
-        }
-    }
-
     return 0;
 }
  
@@ -802,9 +658,10 @@ static irqreturn_t pcie_hp_work(int irq, void *dev_id)
     struct pcie_hp_gpio_ctx *app_ctx = dev_id;
     struct pcie_hp_dev *hp_dev = app_ctx->hp_dev;
     enum pcie_hp_state state;
+    unsigned long flags;
     int ret;
 
-    mutex_lock(&hp_dev->lock);
+    spin_lock_irqsave(&hp_dev->lock, flags);
     state = hp_dev->state;
 
     switch (state) {
@@ -834,7 +691,7 @@ static irqreturn_t pcie_hp_work(int irq, void *dev_id)
         break;
     }
 
-    mutex_unlock(&hp_dev->lock);
+    spin_unlock_irqrestore(&hp_dev->lock, flags);
     return IRQ_HANDLED;
 }
 
@@ -843,18 +700,19 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
     struct pcie_hp_gpio_ctx *app_ctx = dev_id;
     struct pcie_hp_dev *hp_dev = app_ctx->hp_dev;
     struct gpio_acpi_context *gpio_ctx = app_ctx->ctx;
+    unsigned long flags;
     int value;
     enum pcie_hp_state state;
 
     value = gpiod_get_value(app_ctx->desc);
 
-    mutex_lock(&hp_dev->lock);
+    spin_lock_irqsave(&hp_dev->lock, flags);
 
     /* Ignore GPIO events during sysfs operations to prevent conflicts */
     if (hp_dev->suppress_gpio_irq) {
         dev_dbg(gpio_ctx->dev, "IRQ ignored: GPIO suppression active (pin=%d, irq=%d)\n",
                 gpio_ctx->pin, irq);
-        mutex_unlock(&hp_dev->lock);
+        spin_unlock_irqrestore(&hp_dev->lock, flags);
         return IRQ_HANDLED;
     }
     state = hp_dev->state;
@@ -868,7 +726,7 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
             dev_dbg(gpio_ctx->dev, "Presence pin: cable plug-in detected\n");
             pcie_hp_send_uevent(hp_dev, PLUG_IN_EVT);
         }
-        mutex_unlock(&hp_dev->lock);
+        spin_unlock_irqrestore(&hp_dev->lock, flags);
         /* For physical hotplug, let userspace handle device management
          * to avoid potential deadlocks when hardware is in transition */
         return IRQ_HANDLED;
@@ -891,25 +749,20 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
         } else {
             dev_dbg(gpio_ctx->dev, "Boot pin changed: pin=%d irq=%d value=%d state=%d\n",
                     gpio_ctx->pin, irq, value, state);
-            mutex_unlock(&hp_dev->lock);
+            spin_unlock_irqrestore(&hp_dev->lock, flags);
             return IRQ_HANDLED;
         }
-        mutex_unlock(&hp_dev->lock);
+        spin_unlock_irqrestore(&hp_dev->lock, flags);
         return IRQ_WAKE_THREAD;
     }
 
     /* Unknown GPIO pin */
     dev_warn(gpio_ctx->dev, "Unknown GPIO pin event: pin=%d irq=%d value=%d\n",
              gpio_ctx->pin, irq, value);
-    mutex_unlock(&hp_dev->lock);
+    spin_unlock_irqrestore(&hp_dev->lock, flags);
     return IRQ_HANDLED;
 }
  
-struct acpi_gpio_parse_context {
-    struct gpio_acpi_context *ctx;
-    struct pcie_hp_dev *hp_dev;
-};
-
 static acpi_status acpi_gpio_resource_handler(struct acpi_resource *ares, void *context)
 {
     struct acpi_gpio_parse_context *parse_ctx = context;
@@ -978,9 +831,8 @@ static bool pci_devices_present_on_domain(int domain)
 	bool has_endpoint_devices = false;
 
 	/* Find the secondary bus (bus 01) for this domain
-	 * This is where CX7 endpoint devices live, not the root ports.
-	 * We want to keep root ports alive (6.14 behavior), so only
-	 * check for endpoint devices on the secondary bus. */
+	 * This is where endpoint devices live, not the root ports.
+	 * Only check for endpoint devices, not root ports (which must remain). */
 	bus = pci_find_bus(domain, 1);
 	if (!bus)
 		return false;  /* No secondary bus means no endpoints */
@@ -1010,8 +862,8 @@ static ssize_t debug_state_store(struct device *dev,
                                   const char *buf, size_t count)
 {
     struct pcie_hp_dev *hp_dev = dev_get_drvdata(dev);
-    unsigned long val;
-    int err;
+    unsigned long val, flags;
+    int err, i;
 
     if (!hp_dev)
         return -EINVAL;
@@ -1020,7 +872,7 @@ static ssize_t debug_state_store(struct device *dev,
     if (err)
         return err;
 
-    mutex_lock(&hp_dev->lock);
+    spin_lock_irqsave(&hp_dev->lock, flags);
 
     /* Suppress GPIO interrupts during sysfs-initiated operations */
     hp_dev->suppress_gpio_irq = true;
@@ -1032,26 +884,13 @@ static ssize_t debug_state_store(struct device *dev,
         /* Safety check: Verify no devices on the bus before hardware shutdown.
          * This prevents silicon bug where CPU access during link down causes
          * system hang. Userspace must remove PCI devices first. */
-        if (pci_devices_present_on_domain(0x0000) || 
-            pci_devices_present_on_domain(0x0002)) {
-            dev_err(dev, "ERROR: PCI devices still present on bus!\n");
-            dev_err(dev, "       You must remove PCI devices before hardware shutdown.\n");
-            dev_err(dev, "       Refusing to power down to prevent PCIe errors.\n");
-            dev_err(dev, "\n");
-            dev_err(dev, "Correct usage:\n");
-            dev_err(dev, "  Option 1 (Recommended):\n");
-            dev_err(dev, "    /opt/nvidia/dgx-spark-mlnx-hotplug/mtk-hotplug-handler.sh removal\n");
-            dev_err(dev, "\n");
-            dev_err(dev, "  Option 2 (Manual):\n");
-            dev_err(dev, "    # Remove devices first:\n");
-            dev_err(dev, "    for dev in /sys/bus/pci/devices/0000:01:*/remove; do echo 1 > $dev; done\n");
-            dev_err(dev, "    for dev in /sys/bus/pci/devices/0002:01:*/remove; do echo 1 > $dev; done\n");
-            dev_err(dev, "    sleep 2\n");
-            dev_err(dev, "    # Then power down:\n");
-            dev_err(dev, "    echo 0 > /sys/devices/platform/MTKP0001:00/pcie_hotplug/debug_state\n");
-            hp_dev->suppress_gpio_irq = false;
-            mutex_unlock(&hp_dev->lock);
-            return -EBUSY;  /* Device or resource busy */
+        for (i = 0; i < hp_dev->pd->port_nums; i++) {
+            if (pci_devices_present_on_domain(hp_dev->pd->ports[i].domain)) {
+                dev_err(dev, "PCI devices still present, remove them first\n");
+                hp_dev->suppress_gpio_irq = false;
+                spin_unlock_irqrestore(&hp_dev->lock, flags);
+                return -EBUSY;
+            }
         }
         
         /* Safe to proceed - no devices on bus */
@@ -1063,102 +902,38 @@ static ssize_t debug_state_store(struct device *dev,
     case PCIE_HP_DEBUG_PLUG_IN:
         dev_info(dev, "Debug: simulating cable plug-in\n");
         
-        /* Safety check: Verify no devices already on the bus.
-         * Re-initializing hardware (toggling PERST, power) while devices are
-         * active can cause driver crashes, incomplete cleanup, and data loss.
-         * Userspace must remove existing devices first. */
-        if (pci_devices_present_on_domain(0x0000) || 
-            pci_devices_present_on_domain(0x0002)) {
-            dev_err(dev, "ERROR: PCI devices already present on bus!\n");
-            dev_err(dev, "       Hardware re-initialization while devices are active is unsafe.\n");
-            dev_err(dev, "       Remove devices before re-initializing hardware.\n");
-            dev_err(dev, "\n");
-            dev_err(dev, "Correct usage:\n");
-            dev_err(dev, "  Option 1 (Recommended):\n");
-            dev_err(dev, "    /opt/nvidia/dgx-spark-mlnx-hotplug/mtk-hotplug-handler.sh plug-in\n");
-            dev_err(dev, "\n");
-            dev_err(dev, "  Option 2 (Manual - only if no devices present):\n");
-            dev_err(dev, "    # Verify no devices:\n");
-            dev_err(dev, "    lspci -D | grep Mellanox  # Should be empty\n");
-            dev_err(dev, "    # Then initialize:\n");
-            dev_err(dev, "    echo 1 > /sys/devices/platform/MTKP0001:00/pcie_hotplug/debug_state\n");
-            dev_err(dev, "    echo 1 > /sys/bus/pci/rescan\n");
-            hp_dev->suppress_gpio_irq = false;
-            mutex_unlock(&hp_dev->lock);
-            return -EBUSY;  /* Device or resource busy */
+        for (i = 0; i < hp_dev->pd->port_nums; i++) {
+            if (pci_devices_present_on_domain(hp_dev->pd->ports[i].domain)) {
+                dev_err(dev, "PCI devices already present, cannot reinitialize hardware\n");
+                hp_dev->suppress_gpio_irq = false;
+                spin_unlock_irqrestore(&hp_dev->lock, flags);
+                return -EBUSY;
+            }
         }
         
         /* Safe to proceed - no devices on bus */
         hp_dev->state = STATE_PLUG_IN;
-        hp_dev->suppress_gpio_irq = true;
-        /* Enable device power */
+        /* Enable device power - GPIO IRQ state machine will handle rest */
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
-        
-        /* Schedule hardware initialization and wait for completion */
-        schedule_work(&hp_dev->plugin_work);
-        flush_work(&hp_dev->plugin_work);
+        hp_dev->suppress_gpio_irq = false;  /* Re-enable GPIO interrupt handling */
         break;
 
     default:
         hp_dev->suppress_gpio_irq = false;
-        mutex_unlock(&hp_dev->lock);
+        spin_unlock_irqrestore(&hp_dev->lock, flags);
         return -EINVAL;
     }
 
     hp_dev->debug_state = val;
-    mutex_unlock(&hp_dev->lock);
+    spin_unlock_irqrestore(&hp_dev->lock, flags);
 
     return count;
 }
 
 DEVICE_ATTR_RW(debug_state);
 
-/*
- * retrain_link_store - Trigger PCIe link retraining
- *
- * Workaround for hardware limitation where devices enumerate at Gen1
- * speed after hotplug. Writing 1 triggers background link retraining
- * to reach maximum supported speed (Gen4/Gen5).
- *
- * Usage: echo 1 > /sys/devices/.../pcie_hotplug/retrain_link
- */
-static ssize_t retrain_link_store(struct device *dev,
-                                   struct device_attribute *attr,
-                                   const char *buf, size_t count)
-{
-    struct pcie_hp_dev *hp_dev = dev_get_drvdata(dev);
-    unsigned long val;
-    int err;
-
-    if (!hp_dev)
-        return -EINVAL;
-
-    err = kstrtoul(buf, 10, &val);
-    if (err)
-        return err;
-
-    if (val != 1)
-        return -EINVAL;
-
-    /* Schedule link retraining in background workqueue */
-    schedule_work(&hp_dev->retrain_work);
-
-    return count;
-}
-
-static ssize_t retrain_link_show(struct device *dev,
-                                  struct device_attribute *attr,
-                                  char *buf)
-{
-    return scnprintf(buf, PAGE_SIZE,
-                     "Write 1 to trigger PCIe link retraining\n");
-}
-
-DEVICE_ATTR_RW(retrain_link);
-
 static struct attribute *pcie_hp_attrs[] = {
     &dev_attr_debug_state.attr,
-    &dev_attr_retrain_link.attr,
     NULL
 };
 
@@ -1314,13 +1089,17 @@ static int pcie_hp_probe(struct platform_device *pdev)
     hp_dev->prsnt_pin = -1;
     hp_dev->state = STATE_READY;
     hp_dev->suppress_gpio_irq = false;  /* GPIO interrupt handling enabled by default */
-    mutex_init(&hp_dev->lock);
-    INIT_WORK(&hp_dev->retrain_work, retrain_work_fn);
-    INIT_WORK(&hp_dev->plugin_work, plugin_work_fn);
+    spin_lock_init(&hp_dev->lock);
     
     /* Initialize cached root port pointers */
     for (i = 0; i < HP_PORT_MAX; i++)
         hp_dev->cached_root_ports[i] = NULL;
+
+    /* Initialize bus protection (like 6.14's rp_bus_prepare during probe) */
+    if (pd->rp_bus_protect) {
+        for (i = 0; i < pd->port_nums; i++)
+            pd->rp_bus_protect(hp_dev, i, BUS_PROTECT_INIT);
+    }
 
     /* Discover GPIO pins */
     hp_dev->gpio_count = pcie_hp_probe_io_info(pdev);
@@ -1548,5 +1327,4 @@ static struct platform_driver pcie_hp_driver = {
 module_platform_driver(pcie_hp_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("MediaTek PCIe Hotplug Driver with GPIO Support");
-MODULE_AUTHOR("MediaTek Inc.");
+MODULE_DESCRIPTION("MediaTek PCIe Hotplug Driver for NVIDIA DGX Systems");
