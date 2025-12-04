@@ -8,6 +8,7 @@ config MTK_PCIE_HOTPLUG
 	depends on (ARCH_MEDIATEK || COMPILE_TEST) && PCI
 	depends on ACPI || OF
 	depends on GPIOLIB
+	default m if ARCH_MEDIATEK
 	help
 	  Say Y here to enable the MediaTek PCIe hotplug driver for
 	  managing PCIe device hot-plug events on MediaTek SoCs.
