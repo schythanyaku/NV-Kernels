@@ -56,9 +56,11 @@
 
 /*
  * Use bus protect to prevent pcie core_reset glitch issue.
+ * stage 0: init bus protection during probe
  * stage 1: disable pcie ltssm
  * stage 2: set bus protection and enable pcie ltssm
  */
+#define BUS_PROTECT_INIT		0
 #define BUS_PROTECT_CABLE_REMOVAL	1
 #define BUS_PROTECT_CABLE_PLUGIN	2
  
@@ -434,6 +436,11 @@ static void mt8901_rp_bus_protect(struct pcie_hp_dev *dev, int port_idx, int sta
     if (!mac_base)
         return;
 
+    if (stage == BUS_PROTECT_INIT) {
+        /* Initialize bus protection during probe - nothing to do */
+        return;
+    }
+
     if (stage == BUS_PROTECT_CABLE_REMOVAL) {
         /* Deassert LTSSM enable and PHY reset */
         pcie_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
@@ -600,7 +607,6 @@ static int polling_link_to_l0(struct pcie_hp_dev *dev)
 static int rescan_device(struct pcie_hp_dev *dev)
 {
     struct pci_dev *pci_dev;
-    struct pci_bus *bus;
     int i, err;
 
     /* Change pinctrl state */
@@ -1220,10 +1226,6 @@ static void pcie_hp_remove(struct platform_device *pdev)
     if (!hp_dev)
         return;
 
-    /* Cancel any pending workqueue operations */
-    cancel_work_sync(&hp_dev->retrain_work);
-    cancel_work_sync(&hp_dev->plugin_work);
-
     /* Remove sysfs interface */
     sysfs_remove_group(&pdev->dev.kobj, &pcie_hp_attr_group);
 
@@ -1243,7 +1245,6 @@ static void pcie_hp_remove(struct platform_device *pdev)
             pci_dev_put(hp_dev->cached_root_ports[i]);
     }
 
-    mutex_destroy(&hp_dev->lock);
     platform_set_drvdata(pdev, NULL);
 
     /* MMIO regions are automatically unmapped via devm_* */
