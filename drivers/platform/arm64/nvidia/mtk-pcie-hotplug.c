@@ -1116,12 +1116,7 @@ static int pcie_hp_probe(struct platform_device *pdev)
     
     dev_info(&pdev->dev, "Found %d GPIO descriptors\n", hp_dev->gpio_count);
 
-    /* Allocate array large enough for all possible pins (PCIE_PIN_MAX)
-     * even if ACPI only reports some of them. We use enum indices to access
-     * specific pins (e.g., pins[PCIE_PIN_EN]), so array must be sized by
-     * PCIE_PIN_MAX, not gpio_count.
-     */
-    hp_dev->pins = devm_kcalloc(&pdev->dev, PCIE_PIN_MAX,
+    hp_dev->pins = devm_kcalloc(&pdev->dev, hp_dev->gpio_count,
                                  sizeof(struct pcie_hp_gpio_ctx),
                                  GFP_KERNEL);
     if (!hp_dev->pins)
