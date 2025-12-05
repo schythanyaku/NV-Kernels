@@ -93,21 +93,6 @@ struct pcie_port_info {
     void __iomem *mac_base;
 };
 
-/* MMIO resource indices - for platform_get_resource() */
-enum pcie_hp_resource_idx {
-    PCIE_HP_RES_TOP = 0,
-    PCIE_HP_RES_PROTECT,
-    PCIE_HP_RES_CKM,
-    PCIE_HP_RES_MAC_BASE,  /* First MAC resource, others follow */
-};
-
-/* Helper structure for MMIO region mapping */
-struct mmio_region_map {
-    const char *name;
-    unsigned int res_idx;
-    void __iomem **base_ptr;
-};
-
 struct rp_bus_mmio_top {
     void __iomem *base;
     u32 ctrl;
@@ -355,38 +340,62 @@ static void pcie_hp_ckm_control(struct pcie_hp_dev *dev, bool disable)
 }
 
 /**
- * pcie_hp_map_single_region - Map a single MMIO region
+ * pcie_hp_map_from_dsd - Map MMIO region from _DSD device properties
  * @pdev: platform device
- * @map: region mapping descriptor
+ * @base_prop: property name for base address
+ * @size_prop: property name for size
+ * @base_ptr: pointer to store mapped address
+ * @name: region name for logging
  *
- * Returns: 0 on success, negative error code on failure
+ * Reads MMIO base/size from ACPI _DSD properties and maps the region.
+ * This avoids _CRS conflicts and is more upstream-friendly.
+ *
+ * Returns: 0 on success, negative error code on failure, -ENOENT if property missing
  */
-static int pcie_hp_map_single_region(struct platform_device *pdev,
-                                       const struct mmio_region_map *map)
+static int pcie_hp_map_from_dsd(struct platform_device *pdev,
+                                 const char *base_prop,
+                                 const char *size_prop,
+                                 void __iomem **base_ptr,
+                                 const char *name)
 {
-    struct resource *res;
+    u32 base_addr, size;
     void __iomem *base;
+    int ret;
 
-    res = platform_get_resource(pdev, IORESOURCE_MEM, map->res_idx);
-    if (!res)
-        return 0; /* Optional resource */
-
-    base = devm_ioremap_resource(&pdev->dev, res);
-    if (IS_ERR(base)) {
-        dev_err(&pdev->dev, "Failed to map %s region\n", map->name);
-        return PTR_ERR(base);
+    /* Read base address from _DSD */
+    ret = device_property_read_u32(&pdev->dev, base_prop, &base_addr);
+    if (ret) {
+        if (ret == -EINVAL || ret == -ENODATA)
+            return -ENOENT; /* Property not present - try fallback */
+        dev_err(&pdev->dev, "Failed to read %s property: %d\n", base_prop, ret);
+        return ret;
     }
 
-    *map->base_ptr = base;
-    dev_dbg(&pdev->dev, "Mapped %s region at %pR\n", map->name, res);
+    /* Read size from _DSD */
+    ret = device_property_read_u32(&pdev->dev, size_prop, &size);
+    if (ret) {
+        dev_err(&pdev->dev, "Failed to read %s property: %d\n", size_prop, ret);
+        return ret;
+    }
+
+    /* Map the region */
+    base = devm_ioremap(&pdev->dev, base_addr, size);
+    if (!base) {
+        dev_err(&pdev->dev, "Failed to map %s region at 0x%x\n", name, base_addr);
+        return -ENOMEM;
+    }
+
+    *base_ptr = base;
+    dev_info(&pdev->dev, "Mapped %s region: 0x%x (size 0x%x)\n", name, base_addr, size);
     return 0;
 }
 
 /**
- * pcie_hp_map_resources - Map all MMIO regions from platform resources
+ * pcie_hp_map_resources - Map all MMIO regions from _DSD device properties
  * @dev: hotplug device
  *
- * All MMIO addresses must be provided via platform device resources.
+ * Reads MMIO base addresses from ACPI _DSD properties and maps them.
+ * This avoids _CRS namespace conflicts and is the upstream-friendly approach.
  * Resources are automatically unmapped via devm_* management.
  *
  * Returns: 0 on success, negative error code on failure
@@ -395,32 +404,55 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 {
     struct rp_bus_mmio_info *mmio = &dev->pd->rp_bus_mmio;
     struct platform_device *pdev = dev->pdev;
-    const struct mmio_region_map regions[] = {
-        { "TOP", PCIE_HP_RES_TOP, &mmio->top.base },
-        { "PROTECT", PCIE_HP_RES_PROTECT, &mmio->protect.base },
-        { "CKM", PCIE_HP_RES_CKM, &mmio->ckm.base },
-    };
-    int i, ret;
+    int ret;
 
-    /* Map control regions */
-    for (i = 0; i < ARRAY_SIZE(regions); i++) {
-        ret = pcie_hp_map_single_region(pdev, &regions[i]);
-        if (ret)
-            return ret;
+    dev_info(&pdev->dev, "Mapping MMIO regions from _DSD properties\n");
+
+    /* Map TOP region (required) */
+    ret = pcie_hp_map_from_dsd(pdev, "nvidia,mmio-top-base", "nvidia,mmio-top-size",
+                                &mmio->top.base, "TOP");
+    if (ret) {
+        dev_err(&pdev->dev, "Failed to map TOP region: %d\n", ret);
+        return ret;
     }
 
-    /* Map MAC regions (one per port) */
-    for (i = 0; i < dev->pd->port_nums; i++) {
-        struct mmio_region_map mac_map = {
-            .name = "MAC",
-            .res_idx = PCIE_HP_RES_MAC_BASE + i,
-            .base_ptr = &dev->pd->ports[i].mac_base,
-        };
-        ret = pcie_hp_map_single_region(pdev, &mac_map);
-        if (ret)
-            return ret;
+    /* Map PROTECT region (required) */
+    ret = pcie_hp_map_from_dsd(pdev, "nvidia,mmio-protect-base", "nvidia,mmio-protect-size",
+                                &mmio->protect.base, "PROTECT");
+    if (ret) {
+        dev_err(&pdev->dev, "Failed to map PROTECT region: %d\n", ret);
+        return ret;
     }
 
+    /* Map CKM region (required) */
+    ret = pcie_hp_map_from_dsd(pdev, "nvidia,mmio-ckm-base", "nvidia,mmio-ckm-size",
+                                &mmio->ckm.base, "CKM");
+    if (ret) {
+        dev_err(&pdev->dev, "Failed to map CKM region: %d\n", ret);
+        return ret;
+    }
+
+    /* Map MAC Port 0 (required) */
+    if (dev->pd->port_nums > 0) {
+        ret = pcie_hp_map_from_dsd(pdev, "nvidia,mmio-mac0-base", "nvidia,mmio-mac0-size",
+                                    &dev->pd->ports[0].mac_base, "MAC Port 0");
+        if (ret) {
+            dev_err(&pdev->dev, "Failed to map MAC Port 0: %d\n", ret);
+            return ret;
+        }
+    }
+
+    /* Map MAC Port 1 (optional - only if we have 2 ports) */
+    if (dev->pd->port_nums > 1) {
+        ret = pcie_hp_map_from_dsd(pdev, "nvidia,mmio-mac1-base", "nvidia,mmio-mac1-size",
+                                    &dev->pd->ports[1].mac_base, "MAC Port 1");
+        if (ret && ret != -ENOENT) {
+            dev_err(&pdev->dev, "Failed to map MAC Port 1: %d\n", ret);
+            return ret;
+        }
+    }
+
+    dev_info(&pdev->dev, "Successfully mapped all MMIO regions from _DSD\n");
     return 0;
 }
  
