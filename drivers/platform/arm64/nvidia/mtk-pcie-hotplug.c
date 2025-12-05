@@ -90,7 +90,6 @@ struct pcie_port_info {
     int domain;
     int bus;
     int devfn;
-    void __iomem *mac_base;
 };
 
 struct rp_bus_mmio_top {
@@ -177,6 +176,7 @@ enum pcie_hp_debug_val {
  * @top_base: Mapped TOP region base
  * @protect_base: Mapped PROTECT region base
  * @ckm_base: Mapped CKM region base
+ * @mac_port_base: Mapped MAC port base addresses (per port)
  *
  * These are the dynamically mapped MMIO base addresses, separate from the
  * const platform data which only contains offsets and bit masks.
@@ -185,6 +185,7 @@ struct pcie_hp_mmio_runtime {
 	void __iomem *top_base;
 	void __iomem *protect_base;
 	void __iomem *ckm_base;
+	void __iomem *mac_port_base[HP_PORT_MAX];
 };
 
 struct pcie_hp_dev {
@@ -496,11 +497,11 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 			break;
 		case 3:
 			if (dev->pd->port_nums > 0)
-				dev->pd->ports[0].mac_base = base;
+				dev->mmio.mac_port_base[0] = base;
 			break;
 		case 4:
 			if (dev->pd->port_nums > 1)
-				dev->pd->ports[1].mac_base = base;
+				dev->mmio.mac_port_base[1] = base;
 			break;
 		}
 	}
@@ -517,7 +518,7 @@ static void mt8901_rp_bus_protect(struct pcie_hp_dev *dev, int port_idx, int sta
     if (port_idx >= dev->pd->port_nums)
         return;
 
-    mac_base = dev->pd->ports[port_idx].mac_base;
+    mac_base = dev->mmio.mac_port_base[port_idx];
     if (!mac_base)
         return;
 
