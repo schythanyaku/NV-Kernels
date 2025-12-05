@@ -340,110 +340,160 @@ static void pcie_hp_ckm_control(struct pcie_hp_dev *dev, bool disable)
 }
 
 /**
- * pcie_hp_map_mmio_resource - Map single MMIO region from platform resources
- * @pdev: platform device
- * @index: resource index in ACPI _CRS (MMIO resources come after GPIOs)
- * @base_ptr: pointer to store mapped address
- * @name: region name for logging
+ * struct pcie_hp_acpi_mmio - Container for parsed ACPI MMIO resources
+ * @mmio_regions: array of Memory32Fixed resources from ACPI _CRS
+ * @count: number of MMIO regions found
+ * @dev: device pointer for logging
  *
- * Gets MMIO resource from platform device (populated by ACPI _CRS) and maps it.
- * ACPI enumerates resources in order: GPIOs first, then Memory32Fixed regions.
- *
- * Returns: 0 on success, negative error code on failure
+ * This structure is used to collect MMIO resources during ACPI _CRS parsing.
+ * The callback function populates this as it walks through the ACPI resources.
  */
-static int pcie_hp_map_mmio_resource(struct platform_device *pdev, int index,
-                                     void __iomem **base_ptr, const char *name)
+struct pcie_hp_acpi_mmio {
+	struct acpi_resource_fixed_memory32 mmio_regions[5];
+	int count;
+	struct device *dev;
+};
+
+/**
+ * pcie_hp_parse_acpi_resources - ACPI resource callback for parsing _CRS
+ * @ares: ACPI resource being processed
+ * @data: pointer to pcie_hp_acpi_mmio structure
+ *
+ * This callback is invoked by acpi_walk_resources() for each resource in
+ * the device's _CRS. It extracts Memory32Fixed resources and stores them
+ * for later mapping.
+ *
+ * Returns: AE_OK to continue iteration, AE_ERROR on error
+ */
+static acpi_status pcie_hp_parse_acpi_resources(struct acpi_resource *ares, void *data)
 {
-    struct resource *res;
-    void __iomem *base;
+	struct pcie_hp_acpi_mmio *parsed = data;
 
-    /* Get MMIO resource from ACPI _CRS */
-    res = platform_get_resource(pdev, IORESOURCE_MEM, index);
-    if (!res) {
-        dev_err(&pdev->dev, "Failed to get %s MMIO resource (index %d)\n", name, index);
-        return -ENODEV;
-    }
+	switch (ares->type) {
+	case ACPI_RESOURCE_TYPE_FIXED_MEMORY32:
+		if (parsed->count >= 5) {
+			dev_warn(parsed->dev, "More than 5 MMIO regions found, ignoring extras\n");
+			break;
+		}
+		/* Store the Memory32Fixed resource */
+		parsed->mmio_regions[parsed->count] = ares->data.fixed_memory32;
+		dev_dbg(parsed->dev, "Found MMIO[%d]: addr=0x%08x len=0x%08x\n",
+			parsed->count,
+			parsed->mmio_regions[parsed->count].address,
+			parsed->mmio_regions[parsed->count].address_length);
+		parsed->count++;
+		break;
+	default:
+		/* Ignore other resource types (GPIO, IRQ, etc.) */
+		break;
+	}
 
-    /* Map the region using devm for automatic cleanup */
-    base = devm_ioremap_resource(&pdev->dev, res);
-    if (IS_ERR(base)) {
-        dev_err(&pdev->dev, "Failed to map %s region: %ld\n", name, PTR_ERR(base));
-        return PTR_ERR(base);
-    }
-
-    *base_ptr = base;
-    dev_info(&pdev->dev, "Mapped %s region: %pR\n", name, res);
-    return 0;
+	return AE_OK;
 }
 
 /**
  * pcie_hp_map_resources - Map all MMIO regions from ACPI _CRS
  * @dev: hotplug device
  *
- * Maps MMIO regions enumerated by ACPI in the device's _CRS.
- * ACPI enumerates resources in order: GPIOs first, then Memory32Fixed MMIO regions.
- * Resources are automatically unmapped via devm_* management.
+ * Uses acpi_walk_resources() to parse Memory32Fixed entries in ACPI _CRS,
+ * then maps each region using devm_ioremap(). This is the upstream-friendly
+ * method for ARM64 ACPI platforms where platform_get_resource() may not work.
+ *
+ * Expected MMIO order in _CRS:
+ *   0: TOP region (PCIe control)
+ *   1: PROTECT region (bus protection)
+ *   2: CKM region (clock management)
+ *   3: MAC Port 0 (per-port MAC)
+ *   4: MAC Port 1 (per-port MAC)
  *
  * Returns: 0 on success, negative error code on failure
  */
 static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 {
-    struct rp_bus_mmio_info *mmio = &dev->pd->rp_bus_mmio;
-    struct platform_device *pdev = dev->pdev;
-    int ret;
+	struct rp_bus_mmio_info *mmio = &dev->pd->rp_bus_mmio;
+	struct platform_device *pdev = dev->pdev;
+	struct acpi_device *adev;
+	struct pcie_hp_acpi_mmio parsed = { .count = 0, .dev = &pdev->dev };
+	acpi_status status;
+	int i;
 
-    dev_info(&pdev->dev, "Mapping MMIO regions from ACPI _CRS\n");
+	dev_info(&pdev->dev, "Parsing MMIO regions from ACPI _CRS\n");
 
-    /* 
-     * MMIO resource indices in _CRS (after GPIOs):
-     * Index 0: TOP region (0x1D600000)
-     * Index 1: PROTECT region (0x1D640000)
-     * Index 2: CKM region (0x16BD0000)
-     * Index 3: MAC Port 0 (0x1D790000)
-     * Index 4: MAC Port 1 (0x1D690000)
-     */
+	/* Get ACPI companion device */
+	adev = ACPI_COMPANION(&pdev->dev);
+	if (!adev) {
+		dev_err(&pdev->dev, "No ACPI companion device found\n");
+		return -ENODEV;
+	}
 
-    /* Map TOP region (required) */
-    ret = pcie_hp_map_mmio_resource(pdev, 0, &mmio->top.base, "TOP");
-    if (ret) {
-        dev_err(&pdev->dev, "Failed to map TOP region: %d\n", ret);
-        return ret;
-    }
+	/* Walk through ACPI _CRS resources to find Memory32Fixed entries */
+	status = acpi_walk_resources(adev->handle, METHOD_NAME__CRS,
+				      pcie_hp_parse_acpi_resources, &parsed);
+	if (ACPI_FAILURE(status)) {
+		dev_err(&pdev->dev, "Failed to walk ACPI resources: %s\n",
+			acpi_format_exception(status));
+		return -ENODEV;
+	}
 
-    /* Map PROTECT region (required) */
-    ret = pcie_hp_map_mmio_resource(pdev, 1, &mmio->protect.base, "PROTECT");
-    if (ret) {
-        dev_err(&pdev->dev, "Failed to map PROTECT region: %d\n", ret);
-        return ret;
-    }
+	/* Verify we found all required MMIO regions */
+	if (parsed.count < 5) {
+		dev_err(&pdev->dev, "Expected 5 MMIO regions, found %d\n", parsed.count);
+		return -ENODEV;
+	}
 
-    /* Map CKM region (required) */
-    ret = pcie_hp_map_mmio_resource(pdev, 2, &mmio->ckm.base, "CKM");
-    if (ret) {
-        dev_err(&pdev->dev, "Failed to map CKM region: %d\n", ret);
-        return ret;
-    }
+	dev_info(&pdev->dev, "Found %d MMIO regions in _CRS, mapping...\n", parsed.count);
 
-    /* Map MAC Port 0 (required) */
-    if (dev->pd->port_nums > 0) {
-        ret = pcie_hp_map_mmio_resource(pdev, 3, &dev->pd->ports[0].mac_base, "MAC Port 0");
-        if (ret) {
-            dev_err(&pdev->dev, "Failed to map MAC Port 0: %d\n", ret);
-            return ret;
-        }
-    }
+	/* Map each MMIO region using the addresses from ACPI */
+	for (i = 0; i < parsed.count; i++) {
+		void __iomem *base;
+		u32 addr = parsed.mmio_regions[i].address;
+		u32 size = parsed.mmio_regions[i].address_length;
+		const char *name;
 
-    /* Map MAC Port 1 (required for 2-port systems) */
-    if (dev->pd->port_nums > 1) {
-        ret = pcie_hp_map_mmio_resource(pdev, 4, &dev->pd->ports[1].mac_base, "MAC Port 1");
-        if (ret) {
-            dev_err(&pdev->dev, "Failed to map MAC Port 1: %d\n", ret);
-            return ret;
-        }
-    }
+		/* Determine region name based on index */
+		switch (i) {
+		case 0: name = "TOP"; break;
+		case 1: name = "PROTECT"; break;
+		case 2: name = "CKM"; break;
+		case 3: name = "MAC Port 0"; break;
+		case 4: name = "MAC Port 1"; break;
+		default: name = "Unknown"; break;
+		}
 
-    dev_info(&pdev->dev, "Successfully mapped all MMIO regions from _CRS\n");
-    return 0;
+		/* Map the region (devm handles cleanup automatically) */
+		base = devm_ioremap(&pdev->dev, addr, size);
+		if (!base) {
+			dev_err(&pdev->dev, "Failed to map %s region (0x%08x)\n", name, addr);
+			return -ENOMEM;
+		}
+
+		dev_info(&pdev->dev, "Mapped %s: 0x%08x (size 0x%x) -> %p\n",
+			 name, addr, size, base);
+
+		/* Store the mapped address in the appropriate structure */
+		switch (i) {
+		case 0:
+			mmio->top.base = base;
+			break;
+		case 1:
+			mmio->protect.base = base;
+			break;
+		case 2:
+			mmio->ckm.base = base;
+			break;
+		case 3:
+			if (dev->pd->port_nums > 0)
+				dev->pd->ports[0].mac_base = base;
+			break;
+		case 4:
+			if (dev->pd->port_nums > 1)
+				dev->pd->ports[1].mac_base = base;
+			break;
+		}
+	}
+
+	dev_info(&pdev->dev, "Successfully mapped all MMIO regions from ACPI _CRS\n");
+	return 0;
 }
  
 static void mt8901_rp_bus_protect(struct pcie_hp_dev *dev, int port_idx, int stage)
