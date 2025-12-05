@@ -94,14 +94,12 @@ struct pcie_port_info {
 };
 
 struct rp_bus_mmio_top {
-    void __iomem *base;
     u32 ctrl;
     u32 port_bits[HP_PORT_MAX];
     u32 update_bit;
 };
 
 struct rp_bus_mmio_protect {
-    void __iomem *base;
     u32 mode;
     u32 enable;
     u32 port_bits[HP_PORT_MAX];
@@ -114,7 +112,6 @@ struct rp_bus_mmio_mac {
 };
 
 struct rp_bus_mmio_ckm {
-    void __iomem *base;
     u32 ctrl;
     u32 disable_bit;
 };
@@ -175,6 +172,21 @@ enum pcie_hp_debug_val {
     PCIE_HP_DEBUG_MAX_VAL
 };
 
+/**
+ * struct pcie_hp_mmio_runtime - Runtime MMIO base addresses
+ * @top_base: Mapped TOP region base
+ * @protect_base: Mapped PROTECT region base
+ * @ckm_base: Mapped CKM region base
+ *
+ * These are the dynamically mapped MMIO base addresses, separate from the
+ * const platform data which only contains offsets and bit masks.
+ */
+struct pcie_hp_mmio_runtime {
+	void __iomem *top_base;
+	void __iomem *protect_base;
+	void __iomem *ckm_base;
+};
+
 struct pcie_hp_dev {
     struct pcie_hp_gpio_ctx *pins;
     struct pcie_hp_plat_data *pd;
@@ -187,6 +199,7 @@ struct pcie_hp_dev {
     bool suppress_gpio_irq; /* Suppress GPIO IRQs during sysfs operations */
     spinlock_t lock; /* Protect state changes (IRQ-safe) */
     struct pci_dev *cached_root_ports[HP_PORT_MAX]; /* Cached root port pointers */
+    struct pcie_hp_mmio_runtime mmio; /* Runtime mapped MMIO base addresses */
 };
  
 static int pcie_hp_pinctrl_init(struct pcie_hp_dev *hp_dev)
@@ -298,33 +311,33 @@ static void pcie_hp_toggle_update_bit(void __iomem *base, u32 ctrl_offset,
 
 /**
  * pcie_hp_bus_protect_enable - Enable bus protection for a port
- * @mmio_info: MMIO configuration
+ * @dev: hotplug device
  * @port_idx: Port index
  */
-static void pcie_hp_bus_protect_enable(struct rp_bus_mmio_info *mmio_info,
-                                         int port_idx)
+static void pcie_hp_bus_protect_enable(struct pcie_hp_dev *dev, int port_idx)
 {
+    struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
     u32 port_bit = mmio_info->protect.port_bits[port_idx];
     
-    pcie_hp_reg_update_bits(mmio_info->protect.base,
+    pcie_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.mode, port_bit, true);
-    pcie_hp_reg_update_bits(mmio_info->protect.base,
+    pcie_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.enable, port_bit, true);
 }
 
 /**
  * pcie_hp_bus_protect_disable - Disable bus protection for a port
- * @mmio_info: MMIO configuration
+ * @dev: hotplug device
  * @port_idx: Port index
  */
-static void pcie_hp_bus_protect_disable(struct rp_bus_mmio_info *mmio_info,
-                                          int port_idx)
+static void pcie_hp_bus_protect_disable(struct pcie_hp_dev *dev, int port_idx)
 {
+    struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
     u32 port_bit = mmio_info->protect.port_bits[port_idx];
     
-    pcie_hp_reg_update_bits(mmio_info->protect.base,
+    pcie_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.enable, port_bit, false);
-    pcie_hp_reg_update_bits(mmio_info->protect.base,
+    pcie_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.mode, port_bit, false);
 }
 
@@ -332,10 +345,10 @@ static void pcie_hp_ckm_control(struct pcie_hp_dev *dev, bool disable)
 {
     struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
     
-    if (!mmio_info->ckm.base)
+    if (!dev->mmio.ckm_base)
         return;
     
-    pcie_hp_reg_update_bits(mmio_info->ckm.base, mmio_info->ckm.ctrl,
+    pcie_hp_reg_update_bits(dev->mmio.ckm_base, mmio_info->ckm.ctrl,
                              mmio_info->ckm.disable_bit, disable);
 }
 
@@ -470,16 +483,16 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 		dev_info(&pdev->dev, "Mapped %s: 0x%08x (size 0x%x) -> %p\n",
 			 name, addr, size, base);
 
-		/* Store the mapped address in the appropriate structure */
+		/* Store the mapped address in the runtime structure */
 		switch (i) {
 		case 0:
-			mmio->top.base = base;
+			dev->mmio.top_base = base;
 			break;
 		case 1:
-			mmio->protect.base = base;
+			dev->mmio.protect_base = base;
 			break;
 		case 2:
-			mmio->ckm.base = base;
+			dev->mmio.ckm_base = base;
 			break;
 		case 3:
 			if (dev->pd->port_nums > 0)
@@ -522,17 +535,17 @@ static void mt8901_rp_bus_protect(struct pcie_hp_dev *dev, int port_idx, int sta
     }
 
     if (stage == BUS_PROTECT_CABLE_PLUGIN) {
-        if (!mmio_info->top.base || !mmio_info->protect.base)
+        if (!dev->mmio.top_base || !dev->mmio.protect_base)
             return;
 
         /* Deassert way_en */
-        pcie_hp_toggle_update_bit(mmio_info->top.base, mmio_info->top.ctrl,
+        pcie_hp_toggle_update_bit(dev->mmio.top_base, mmio_info->top.ctrl,
                                    mmio_info->top.port_bits[port_idx],
                                    mmio_info->top.update_bit, false);
         udelay(PCIE_HP_DELAY_SHORT_US);
 
         /* Enable bus protection */
-        pcie_hp_bus_protect_enable(mmio_info, port_idx);
+        pcie_hp_bus_protect_enable(dev, port_idx);
         usleep_range(PCIE_HP_DELAY_BUS_PROTECT_US, PCIE_HP_DELAY_BUS_PROTECT_US + 1000);
 
         /* Assert LTSSM enable and PHY reset */
@@ -543,10 +556,10 @@ static void mt8901_rp_bus_protect(struct pcie_hp_dev *dev, int port_idx, int sta
         usleep_range(PCIE_HP_DELAY_PHY_RESET_US, PCIE_HP_DELAY_PHY_RESET_US + 1000);
 
         /* Disable bus protection */
-        pcie_hp_bus_protect_disable(mmio_info, port_idx);
+        pcie_hp_bus_protect_disable(dev, port_idx);
 
         /* Assert way_en */
-        pcie_hp_toggle_update_bit(mmio_info->top.base, mmio_info->top.ctrl,
+        pcie_hp_toggle_update_bit(dev->mmio.top_base, mmio_info->top.ctrl,
                                    mmio_info->top.port_bits[port_idx],
                                    mmio_info->top.update_bit, true);
     }
