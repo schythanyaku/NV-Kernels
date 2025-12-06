@@ -1248,7 +1248,8 @@ static int pcie_hp_setup_irq(struct pcie_hp_gpio_ctx *app_ctx)
  *   - prsnt-gpios: Presence detection pin
  *   - perst-gpios: PCIe reset pin
  *   - enable-gpios: Power enable pin
- *   - clkreq-gpios: Clock request pins (CLQ0, CLQ1 as array)
+ *   - clkreq0-gpios: Clock request 0 pin (CLQ0)
+ *   - clkreq1-gpios: Clock request 1 pin (CLQ1)
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -1337,36 +1338,36 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
     dev_info(dev, "DEBUG:SCK: [GPIO 3/6] EN SUCCESS - desc=%p\n", pin_ctx->desc);
     pin_ctx->hp_dev = hp_dev;
 
-    /* GPIO 4: CLQ0 - Clock request 0 (GpioIo, input, part of clkreq group) */
-    dev_info(dev, "DEBUG:SCK: [GPIO 4/6] Requesting CLQ0 via devm_gpiod_get_index(dev, \"clkreq\", 0, GPIOD_IN)...\n");
-    pin_ctx = &hp_dev->pins[PCIE_PIN_CLQ0];
-    pin_ctx->desc = devm_gpiod_get_index(dev, "clkreq", 0, GPIOD_IN);
-    if (IS_ERR(pin_ctx->desc)) {
-        ret = PTR_ERR(pin_ctx->desc);
-        dev_err(dev, "DEBUG:SCK: [GPIO 4/6] CLQ0 FAILED: error=%d (%s)\n", ret,
-                ret == -ENOENT ? "ENOENT-not-found" :
-                ret == -EPROBE_DEFER ? "EPROBE_DEFER" :
-                ret == -EINVAL ? "EINVAL-invalid" : "unknown");
-        dev_err(dev, "Failed to get CLQ0 GPIO: %d\n", ret);
-        return ret;
-    }
-    dev_info(dev, "DEBUG:SCK: [GPIO 4/6] CLQ0 SUCCESS - desc=%p\n", pin_ctx->desc);
-    pin_ctx->hp_dev = hp_dev;
+	/* GPIO 4: CLQ0 - Clock request 0 (GpioIo, input) */
+	dev_info(dev, "DEBUG:SCK: [GPIO 4/6] Requesting CLQ0 via devm_gpiod_get(dev, \"clkreq0\", GPIOD_IN)...\n");
+	pin_ctx = &hp_dev->pins[PCIE_PIN_CLQ0];
+	pin_ctx->desc = devm_gpiod_get(dev, "clkreq0", GPIOD_IN);
+	if (IS_ERR(pin_ctx->desc)) {
+		ret = PTR_ERR(pin_ctx->desc);
+		dev_err(dev, "DEBUG:SCK: [GPIO 4/6] CLQ0 FAILED: error=%d (%s)\n", ret,
+			ret == -ENOENT ? "ENOENT-not-found" :
+			ret == -EPROBE_DEFER ? "EPROBE_DEFER" :
+			ret == -EINVAL ? "EINVAL-invalid" : "unknown");
+		dev_err(dev, "Failed to get CLQ0 GPIO: %d\n", ret);
+		return ret;
+	}
+	dev_info(dev, "DEBUG:SCK: [GPIO 4/6] CLQ0 SUCCESS - desc=%p\n", pin_ctx->desc);
+	pin_ctx->hp_dev = hp_dev;
 
-    /* GPIO 5: CLQ1 - Clock request 1 (GpioIo, input, part of clkreq group) */
-    dev_info(dev, "DEBUG:SCK: [GPIO 5/6] Requesting CLQ1 via devm_gpiod_get_index(dev, \"clkreq\", 1, GPIOD_IN)...\n");
-    pin_ctx = &hp_dev->pins[PCIE_PIN_CLQ1];
-    pin_ctx->desc = devm_gpiod_get_index(dev, "clkreq", 1, GPIOD_IN);
-    if (IS_ERR(pin_ctx->desc)) {
-        ret = PTR_ERR(pin_ctx->desc);
-        dev_err(dev, "DEBUG:SCK: [GPIO 5/6] CLQ1 FAILED: error=%d (%s)\n", ret,
-                ret == -ENOENT ? "ENOENT-not-found" :
-                ret == -EPROBE_DEFER ? "EPROBE_DEFER" :
-                ret == -EINVAL ? "EINVAL-invalid" : "unknown");
-        dev_err(dev, "Failed to get CLQ1 GPIO: %d\n", ret);
-        return ret;
-    }
-    dev_info(dev, "DEBUG:SCK: [GPIO 5/6] CLQ1 SUCCESS - desc=%p\n", pin_ctx->desc);
+	/* GPIO 5: CLQ1 - Clock request 1 (GpioIo, input) */
+	dev_info(dev, "DEBUG:SCK: [GPIO 5/6] Requesting CLQ1 via devm_gpiod_get(dev, \"clkreq1\", GPIOD_IN)...\n");
+	pin_ctx = &hp_dev->pins[PCIE_PIN_CLQ1];
+	pin_ctx->desc = devm_gpiod_get(dev, "clkreq1", GPIOD_IN);
+	if (IS_ERR(pin_ctx->desc)) {
+		ret = PTR_ERR(pin_ctx->desc);
+		dev_err(dev, "DEBUG:SCK: [GPIO 5/6] CLQ1 FAILED: error=%d (%s)\n", ret,
+			ret == -ENOENT ? "ENOENT-not-found" :
+			ret == -EPROBE_DEFER ? "EPROBE_DEFER" :
+			ret == -EINVAL ? "EINVAL-invalid" : "unknown");
+		dev_err(dev, "Failed to get CLQ1 GPIO: %d\n", ret);
+		return ret;
+	}
+	dev_info(dev, "DEBUG:SCK: [GPIO 5/6] CLQ1 SUCCESS - desc=%p\n", pin_ctx->desc);
     pin_ctx->hp_dev = hp_dev;
 
     dev_info(dev, "DEBUG:SCK: ========================================\n");
