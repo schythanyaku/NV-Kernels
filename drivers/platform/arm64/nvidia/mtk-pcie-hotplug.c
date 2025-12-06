@@ -1252,34 +1252,90 @@ static int pcie_hp_setup_irq(struct pcie_hp_gpio_ctx *app_ctx)
  *   [4] GpioIo InputOnly - CLQ0 (pin 177)
  *   [5] GpioIo InputOnly - CLQ1 (pin 178)
  */
-static const struct acpi_gpio_params boot_gpio   = { 0, 0, false };
-static const struct acpi_gpio_params prsnt_gpio  = { 1, 0, false };
-static const struct acpi_gpio_params perst_gpio  = { 2, 0, false };
-static const struct acpi_gpio_params en_gpio     = { 3, 0, false };
-static const struct acpi_gpio_params clq0_gpio   = { 4, 0, false };
-static const struct acpi_gpio_params clq1_gpio   = { 5, 0, false };
-
-static const struct acpi_gpio_mapping pcie_hp_acpi_gpios[] = {
-	{ "boot-gpios",    &boot_gpio,  1 },
-	{ "prsnt-gpios",   &prsnt_gpio, 1 },
-	{ "perst-gpios",   &perst_gpio, 1 },
-	{ "enable-gpios",  &en_gpio,    1 },
-	{ "clkreq0-gpios", &clq0_gpio,  1 },
-	{ "clkreq1-gpios", &clq1_gpio,  1 },
-	{ }
+/* Structure to hold GPIO resource information from ACPI _CRS */
+struct acpi_gpio_info {
+	unsigned int pin;
+	bool is_interrupt;  /* GpioInt vs GpioIo */
+	bool is_output;     /* IoRestrictionOutputOnly */
+	bool active_low;
+	char name[16];
 };
+
+/* Context for ACPI resource parsing */
+struct gpio_parse_ctx {
+	struct device *dev;
+	struct acpi_gpio_info gpios[PCIE_PIN_MAX];
+	int count;
+};
+
+/**
+ * pcie_hp_parse_gpio_resources - ACPI resource callback to extract GPIO info
+ * @ares: ACPI resource
+ * @data: Pointer to gpio_parse_ctx
+ *
+ * Extracts GPIO pin numbers, types, and directions from raw ACPI _CRS,
+ * bypassing the kernel 6.17+ GPIO grouping bug.
+ *
+ * Returns: 1 to continue iteration, 0 to stop
+ */
+static acpi_status pcie_hp_parse_gpio_resources(struct acpi_resource *ares, void *data)
+{
+	struct gpio_parse_ctx *ctx = data;
+	struct acpi_resource_gpio *gpio;
+	struct acpi_gpio_info *info;
+
+	if (ares->type != ACPI_RESOURCE_TYPE_GPIO)
+		return AE_OK;
+
+	if (ctx->count >= PCIE_PIN_MAX) {
+		dev_warn(ctx->dev, "Too many GPIO resources, stopping at %d\n", PCIE_PIN_MAX);
+		return AE_OK;
+	}
+
+	gpio = &ares->data.gpio;
+	info = &ctx->gpios[ctx->count];
+
+	/* Extract pin number (first pin in the list) */
+	info->pin = gpio->pin_table[0];
+
+	/* Determine type */
+	info->is_interrupt = (gpio->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT);
+
+	/* Determine direction */
+	info->is_output = (gpio->io_restriction == ACPI_IO_RESTRICT_OUTPUT);
+
+	/* Extract polarity */
+	info->active_low = (gpio->polarity == ACPI_ACTIVE_LOW);
+
+	/* Extract vendor data as name if available */
+	if (gpio->vendor_length > 0 && gpio->vendor_length < sizeof(info->name)) {
+		memcpy(info->name, gpio->vendor_data, gpio->vendor_length);
+		info->name[gpio->vendor_length] = '\0';
+	} else {
+		snprintf(info->name, sizeof(info->name), "gpio%d", ctx->count);
+	}
+
+	dev_info(ctx->dev, "DEBUG:SCK: Raw ACPI GPIO[%d]: pin=%u type=%s dir=%s name=%s\n",
+	         ctx->count, info->pin,
+	         info->is_interrupt ? "GpioInt" : "GpioIo",
+	         info->is_output ? "Output" : "Input",
+	         info->name);
+
+	ctx->count++;
+	return AE_OK;
+}
 
 /**
  * pcie_hp_probe_gpios - Enumerate and configure GPIO pins via ACPI
  * @pdev: platform device
  * @hp_dev: hotplug device context
  *
- * Uses devm_acpi_dev_add_driver_gpios() to map connection names to _CRS indices,
- * bypassing the consumer API grouping bug in kernel 6.17+.
+ * Manually extracts GPIO pin numbers from ACPI _CRS using acpi_walk_resources(),
+ * then converts them to descriptors using gpio_to_desc(). This completely bypasses
+ * the kernel 6.17+ GPIO grouping bug that affects the standard gpiod APIs.
  *
- * This is the standard upstream-friendly approach used by platform drivers
- * (e.g., surface_hotplug, dwc3-pci, etc.) when firmware GPIO resources don't
- * match kernel's grouping expectations.
+ * This is the upstream-recommended approach when firmware GPIOs are grouped
+ * incorrectly by the ACPI GPIO subsystem.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -1287,148 +1343,123 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
                                 struct pcie_hp_dev *hp_dev)
 {
 	struct device *dev = &pdev->dev;
+	struct acpi_device *adev;
+	struct gpio_parse_ctx parse_ctx = { .dev = dev, .count = 0 };
 	struct pcie_hp_gpio_ctx *pin_ctx;
-	int ret;
+	struct gpio_desc *desc;
+	acpi_status status;
+	int ret, i;
 
 	dev_info(dev, "DEBUG:SCK: ========================================\n");
-	dev_info(dev, "DEBUG:SCK: Starting ACPI GPIO Enumeration\n");
-	dev_info(dev, "DEBUG:SCK: Using driver GPIO mapping to bypass grouping\n");
+	dev_info(dev, "DEBUG:SCK: Starting Manual ACPI GPIO Enumeration\n");
+	dev_info(dev, "DEBUG:SCK: Using raw _CRS parsing + pin→desc conversion\n");
+	dev_info(dev, "DEBUG:SCK: This bypasses kernel 6.17+ GPIO grouping bug\n");
 	dev_info(dev, "DEBUG:SCK: ========================================\n");
 
-	/* Install driver GPIO mapping table (maps names → _CRS indices) */
-	ret = devm_acpi_dev_add_driver_gpios(dev, pcie_hp_acpi_gpios);
-	if (ret) {
-		dev_err(dev, "DEBUG:SCK: Failed to add driver GPIO mapping: %d\n", ret);
-		dev_err(dev, "Failed to install GPIO mapping table: %d\n", ret);
-		return ret;
+	/* Get ACPI companion */
+	adev = ACPI_COMPANION(dev);
+	if (!adev) {
+		dev_err(dev, "No ACPI companion device found\n");
+		return -ENODEV;
 	}
-	dev_info(dev, "DEBUG:SCK: Installed GPIO mapping table (bypasses kernel grouping)\n");
 
-	/* Allocate GPIO context array for all pins */
+	/* Step 1: Walk ACPI _CRS to extract all GPIO resources */
+	dev_info(dev, "DEBUG:SCK: Walking ACPI _CRS to extract GPIO pin numbers...\n");
+	status = acpi_walk_resources(adev->handle, METHOD_NAME__CRS,
+	                              pcie_hp_parse_gpio_resources, &parse_ctx);
+	if (ACPI_FAILURE(status)) {
+		dev_err(dev, "Failed to walk ACPI resources: %d\n", status);
+		return -ENODEV;
+	}
+
+	if (parse_ctx.count != PCIE_PIN_MAX) {
+		dev_err(dev, "Expected %d GPIOs, found %d in _CRS\n",
+		        PCIE_PIN_MAX, parse_ctx.count);
+		return -EINVAL;
+	}
+	dev_info(dev, "DEBUG:SCK: Found %d GPIO resources in raw _CRS (pre-grouping)\n",
+	         parse_ctx.count);
+
+	/* Step 2: Allocate GPIO context array */
 	hp_dev->pins = devm_kcalloc(dev, PCIE_PIN_MAX,
 	                             sizeof(struct pcie_hp_gpio_ctx),
 	                             GFP_KERNEL);
 	if (!hp_dev->pins) {
-		dev_err(dev, "DEBUG:SCK: Failed to allocate GPIO context array\n");
+		dev_err(dev, "Failed to allocate GPIO context array\n");
 		return -ENOMEM;
 	}
-	dev_info(dev, "DEBUG:SCK: Allocated pins array for %d GPIOs\n", PCIE_PIN_MAX);
 
-	/* GPIO 0: BOOT - Device boot status (GpioInt) */
-	dev_info(dev, "DEBUG:SCK: [GPIO 0/6] Requesting BOOT via devm_gpiod_get(dev, \"boot\", GPIOD_IN)...\n");
-	pin_ctx = &hp_dev->pins[PCIE_PIN_BOOT];
-	pin_ctx->desc = devm_gpiod_get(dev, "boot", GPIOD_IN);
-	if (IS_ERR(pin_ctx->desc)) {
-		ret = PTR_ERR(pin_ctx->desc);
-		dev_err(dev, "DEBUG:SCK: [GPIO 0/6] BOOT FAILED: error=%d (%s)\n", ret,
-			ret == -ENOENT ? "ENOENT-not-found" :
-			ret == -EPROBE_DEFER ? "EPROBE_DEFER" :
-			ret == -EINVAL ? "EINVAL-invalid" : "unknown");
-		dev_err(dev, "Failed to get BOOT GPIO: %d\n", ret);
-		return ret;
-	}
-	dev_info(dev, "DEBUG:SCK: [GPIO 0/6] BOOT SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
-	pin_ctx->hp_dev = hp_dev;
+	/* Step 3: Convert each pin number to GPIO descriptor */
+	dev_info(dev, "DEBUG:SCK: Converting pin numbers to GPIO descriptors...\n");
+	
+	for (i = 0; i < PCIE_PIN_MAX; i++) {
+		struct acpi_gpio_info *gpio_info = &parse_ctx.gpios[i];
+		
+		dev_info(dev, "DEBUG:SCK: [GPIO %d/6] %s: pin=%u type=%s dir=%s\n",
+		         i, gpio_info->name, gpio_info->pin,
+		         gpio_info->is_interrupt ? "GpioInt" : "GpioIo",
+		         gpio_info->is_output ? "Output" : "Input");
 
-	/* GPIO 1: PRSNT - Presence detection (GpioInt) */
-	dev_info(dev, "DEBUG:SCK: [GPIO 1/6] Requesting PRSNT via devm_gpiod_get(dev, \"prsnt\", GPIOD_IN)...\n");
-	pin_ctx = &hp_dev->pins[PCIE_PIN_PRSNT];
-	pin_ctx->desc = devm_gpiod_get(dev, "prsnt", GPIOD_IN);
-	if (IS_ERR(pin_ctx->desc)) {
-		ret = PTR_ERR(pin_ctx->desc);
-		dev_err(dev, "DEBUG:SCK: [GPIO 1/6] PRSNT FAILED: error=%d (%s)\n", ret,
-			ret == -ENOENT ? "ENOENT-not-found" :
-			ret == -EPROBE_DEFER ? "EPROBE_DEFER" :
-			ret == -EINVAL ? "EINVAL-invalid" : "unknown");
-		dev_err(dev, "Failed to get PRSNT GPIO: %d\n", ret);
-		return ret;
-	}
-	dev_info(dev, "DEBUG:SCK: [GPIO 1/6] PRSNT SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
-	pin_ctx->hp_dev = hp_dev;
+		/* Convert pin number to descriptor */
+		desc = gpio_to_desc(gpio_info->pin);
+		if (!desc || IS_ERR(desc)) {
+			dev_err(dev, "Failed to convert pin %u to descriptor: %ld\n",
+			        gpio_info->pin, PTR_ERR(desc));
+			return PTR_ERR(desc) ?: -EINVAL;
+		}
 
-	/* GPIO 2: PERST - PCIe reset (GpioIo, output) */
-	dev_info(dev, "DEBUG:SCK: [GPIO 2/6] Requesting PERST via devm_gpiod_get(dev, \"perst\", GPIOD_OUT_HIGH)...\n");
-	pin_ctx = &hp_dev->pins[PCIE_PIN_PERST];
-	pin_ctx->desc = devm_gpiod_get(dev, "perst", GPIOD_OUT_HIGH);
-	if (IS_ERR(pin_ctx->desc)) {
-		ret = PTR_ERR(pin_ctx->desc);
-		dev_err(dev, "DEBUG:SCK: [GPIO 2/6] PERST FAILED: error=%d (%s)\n", ret,
-			ret == -ENOENT ? "ENOENT-not-found" :
-			ret == -EPROBE_DEFER ? "EPROBE_DEFER" :
-			ret == -EINVAL ? "EINVAL-invalid" : "unknown");
-		dev_err(dev, "Failed to get PERST GPIO: %d\n", ret);
-		return ret;
-	}
-	dev_info(dev, "DEBUG:SCK: [GPIO 2/6] PERST SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
-	pin_ctx->hp_dev = hp_dev;
+		/* Request ownership of the GPIO */
+		ret = devm_gpio_request(dev, gpio_info->pin, gpio_info->name);
+		if (ret) {
+			dev_err(dev, "Failed to request GPIO pin %u: %d\n",
+			        gpio_info->pin, ret);
+			return ret;
+		}
 
-	/* GPIO 3: EN - Power enable (GpioIo, output) */
-	dev_info(dev, "DEBUG:SCK: [GPIO 3/6] Requesting EN via devm_gpiod_get(dev, \"enable\", GPIOD_OUT_LOW)...\n");
-	pin_ctx = &hp_dev->pins[PCIE_PIN_EN];
-	pin_ctx->desc = devm_gpiod_get(dev, "enable", GPIOD_OUT_LOW);
-	if (IS_ERR(pin_ctx->desc)) {
-		ret = PTR_ERR(pin_ctx->desc);
-		dev_err(dev, "DEBUG:SCK: [GPIO 3/6] EN FAILED: error=%d (%s)\n", ret,
-			ret == -ENOENT ? "ENOENT-not-found" :
-			ret == -EPROBE_DEFER ? "EPROBE_DEFER" :
-			ret == -EINVAL ? "EINVAL-invalid" : "unknown");
-		dev_err(dev, "Failed to get EN GPIO: %d\n", ret);
-		return ret;
-	}
-	dev_info(dev, "DEBUG:SCK: [GPIO 3/6] EN SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
-	pin_ctx->hp_dev = hp_dev;
+		/* Configure direction and initial value */
+		if (gpio_info->is_output) {
+			/* Output GPIOs: PERST (high), EN (low) */
+			int init_val = (i == PCIE_PIN_PERST) ? 1 : 0;
+			ret = gpio_direction_output(gpio_info->pin, init_val);
+			if (ret) {
+				dev_err(dev, "Failed to set GPIO %u as output: %d\n",
+				        gpio_info->pin, ret);
+				return ret;
+			}
+			dev_info(dev, "DEBUG:SCK:   → Configured as OUTPUT, init=%d\n", init_val);
+		} else {
+			/* Input GPIOs: BOOT, PRSNT, CLQ0, CLQ1 */
+			ret = gpio_direction_input(gpio_info->pin);
+			if (ret) {
+				dev_err(dev, "Failed to set GPIO %u as input: %d\n",
+				        gpio_info->pin, ret);
+				return ret;
+			}
+			dev_info(dev, "DEBUG:SCK:   → Configured as INPUT\n");
+		}
 
-	/* GPIO 4: CLQ0 - Clock request 0 (GpioIo, input) */
-	dev_info(dev, "DEBUG:SCK: [GPIO 4/6] Requesting CLQ0 via devm_gpiod_get(dev, \"clkreq0\", GPIOD_IN)...\n");
-	pin_ctx = &hp_dev->pins[PCIE_PIN_CLQ0];
-	pin_ctx->desc = devm_gpiod_get(dev, "clkreq0", GPIOD_IN);
-	if (IS_ERR(pin_ctx->desc)) {
-		ret = PTR_ERR(pin_ctx->desc);
-		dev_err(dev, "DEBUG:SCK: [GPIO 4/6] CLQ0 FAILED: error=%d (%s)\n", ret,
-			ret == -ENOENT ? "ENOENT-not-found" :
-			ret == -EPROBE_DEFER ? "EPROBE_DEFER" :
-			ret == -EINVAL ? "EINVAL-invalid" : "unknown");
-		dev_err(dev, "Failed to get CLQ0 GPIO: %d\n", ret);
-		return ret;
-	}
-	dev_info(dev, "DEBUG:SCK: [GPIO 4/6] CLQ0 SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
-	pin_ctx->hp_dev = hp_dev;
+		/* Store descriptor in context */
+		pin_ctx = &hp_dev->pins[i];
+		pin_ctx->desc = desc;
+		pin_ctx->hp_dev = hp_dev;
 
-	/* GPIO 5: CLQ1 - Clock request 1 (GpioIo, input) */
-	dev_info(dev, "DEBUG:SCK: [GPIO 5/6] Requesting CLQ1 via devm_gpiod_get(dev, \"clkreq1\", GPIOD_IN)...\n");
-	pin_ctx = &hp_dev->pins[PCIE_PIN_CLQ1];
-	pin_ctx->desc = devm_gpiod_get(dev, "clkreq1", GPIOD_IN);
-	if (IS_ERR(pin_ctx->desc)) {
-		ret = PTR_ERR(pin_ctx->desc);
-		dev_err(dev, "DEBUG:SCK: [GPIO 5/6] CLQ1 FAILED: error=%d (%s)\n", ret,
-			ret == -ENOENT ? "ENOENT-not-found" :
-			ret == -EPROBE_DEFER ? "EPROBE_DEFER" :
-			ret == -EINVAL ? "EINVAL-invalid" : "unknown");
-		dev_err(dev, "Failed to get CLQ1 GPIO: %d\n", ret);
-		return ret;
+		dev_info(dev, "DEBUG:SCK:   → SUCCESS: desc=%p global_pin=%u\n",
+		         desc, gpio_info->pin);
 	}
-	dev_info(dev, "DEBUG:SCK: [GPIO 5/6] CLQ1 SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
-	pin_ctx->hp_dev = hp_dev;
 
 	hp_dev->gpio_count = PCIE_PIN_MAX;
-	
+
 	dev_info(dev, "DEBUG:SCK: ========================================\n");
-	dev_info(dev, "DEBUG:SCK: GPIO Enumeration Summary:\n");
-	dev_info(dev, "DEBUG:SCK:   All %d GPIOs enumerated successfully!\n", PCIE_PIN_MAX);
-	dev_info(dev, "DEBUG:SCK:   BOOT:  pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_BOOT].desc));
-	dev_info(dev, "DEBUG:SCK:   PRSNT: pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_PRSNT].desc));
-	dev_info(dev, "DEBUG:SCK:   PERST: pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_PERST].desc));
-	dev_info(dev, "DEBUG:SCK:   EN:    pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_EN].desc));
-	dev_info(dev, "DEBUG:SCK:   CLQ0:  pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_CLQ0].desc));
-	dev_info(dev, "DEBUG:SCK:   CLQ1:  pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_CLQ1].desc));
+	dev_info(dev, "DEBUG:SCK: GPIO Enumeration COMPLETE\n");
+	dev_info(dev, "DEBUG:SCK:   All %d GPIOs configured via manual conversion\n", PCIE_PIN_MAX);
+	dev_info(dev, "DEBUG:SCK:   BOOT:  pin=%u\n", parse_ctx.gpios[0].pin);
+	dev_info(dev, "DEBUG:SCK:   PRSNT: pin=%u\n", parse_ctx.gpios[1].pin);
+	dev_info(dev, "DEBUG:SCK:   PERST: pin=%u\n", parse_ctx.gpios[2].pin);
+	dev_info(dev, "DEBUG:SCK:   EN:    pin=%u\n", parse_ctx.gpios[3].pin);
+	dev_info(dev, "DEBUG:SCK:   CLQ0:  pin=%u\n", parse_ctx.gpios[4].pin);
+	dev_info(dev, "DEBUG:SCK:   CLQ1:  pin=%u\n", parse_ctx.gpios[5].pin);
 	dev_info(dev, "DEBUG:SCK: ========================================\n");
-	dev_info(dev, "Successfully enumerated all %d GPIOs using driver mapping\n", PCIE_PIN_MAX);
+	dev_info(dev, "Successfully enumerated all %d GPIOs via manual pin→desc conversion\n", PCIE_PIN_MAX);
 
 	return 0;
 }
