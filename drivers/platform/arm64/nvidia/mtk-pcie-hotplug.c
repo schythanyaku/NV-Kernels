@@ -429,7 +429,6 @@ static acpi_status pcie_hp_parse_acpi_resources(struct acpi_resource *ares, void
  */
 static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 {
-	struct rp_bus_mmio_info *mmio = &dev->pd->rp_bus_mmio;
 	struct platform_device *pdev = dev->pdev;
 	struct acpi_device *adev;
 	struct pcie_hp_acpi_mmio parsed = { .count = 0, .dev = &pdev->dev };
@@ -1328,10 +1327,9 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 		dev_err(dev, "Failed to get BOOT GPIO: %d\n", ret);
 		return ret;
 	}
-	pin_ctx->hp_dev = hp_dev;
-	pin_ctx->pin = desc_to_gpio(pin_ctx->desc);
 	dev_info(dev, "DEBUG:SCK: [GPIO 0/6] BOOT SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, pin_ctx->pin);
+	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
+	pin_ctx->hp_dev = hp_dev;
 
 	/* GPIO 1: PRSNT - Presence detection (GpioInt) */
 	dev_info(dev, "DEBUG:SCK: [GPIO 1/6] Requesting PRSNT via devm_gpiod_get(dev, \"prsnt\", GPIOD_IN)...\n");
@@ -1346,10 +1344,9 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 		dev_err(dev, "Failed to get PRSNT GPIO: %d\n", ret);
 		return ret;
 	}
-	pin_ctx->hp_dev = hp_dev;
-	pin_ctx->pin = desc_to_gpio(pin_ctx->desc);
 	dev_info(dev, "DEBUG:SCK: [GPIO 1/6] PRSNT SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, pin_ctx->pin);
+	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
+	pin_ctx->hp_dev = hp_dev;
 
 	/* GPIO 2: PERST - PCIe reset (GpioIo, output) */
 	dev_info(dev, "DEBUG:SCK: [GPIO 2/6] Requesting PERST via devm_gpiod_get(dev, \"perst\", GPIOD_OUT_HIGH)...\n");
@@ -1364,10 +1361,9 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 		dev_err(dev, "Failed to get PERST GPIO: %d\n", ret);
 		return ret;
 	}
-	pin_ctx->hp_dev = hp_dev;
-	pin_ctx->pin = desc_to_gpio(pin_ctx->desc);
 	dev_info(dev, "DEBUG:SCK: [GPIO 2/6] PERST SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, pin_ctx->pin);
+	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
+	pin_ctx->hp_dev = hp_dev;
 
 	/* GPIO 3: EN - Power enable (GpioIo, output) */
 	dev_info(dev, "DEBUG:SCK: [GPIO 3/6] Requesting EN via devm_gpiod_get(dev, \"enable\", GPIOD_OUT_LOW)...\n");
@@ -1382,10 +1378,9 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 		dev_err(dev, "Failed to get EN GPIO: %d\n", ret);
 		return ret;
 	}
-	pin_ctx->hp_dev = hp_dev;
-	pin_ctx->pin = desc_to_gpio(pin_ctx->desc);
 	dev_info(dev, "DEBUG:SCK: [GPIO 3/6] EN SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, pin_ctx->pin);
+	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
+	pin_ctx->hp_dev = hp_dev;
 
 	/* GPIO 4: CLQ0 - Clock request 0 (GpioIo, input) */
 	dev_info(dev, "DEBUG:SCK: [GPIO 4/6] Requesting CLQ0 via devm_gpiod_get(dev, \"clkreq0\", GPIOD_IN)...\n");
@@ -1400,10 +1395,9 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 		dev_err(dev, "Failed to get CLQ0 GPIO: %d\n", ret);
 		return ret;
 	}
-	pin_ctx->hp_dev = hp_dev;
-	pin_ctx->pin = desc_to_gpio(pin_ctx->desc);
 	dev_info(dev, "DEBUG:SCK: [GPIO 4/6] CLQ0 SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, pin_ctx->pin);
+	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
+	pin_ctx->hp_dev = hp_dev;
 
 	/* GPIO 5: CLQ1 - Clock request 1 (GpioIo, input) */
 	dev_info(dev, "DEBUG:SCK: [GPIO 5/6] Requesting CLQ1 via devm_gpiod_get(dev, \"clkreq1\", GPIOD_IN)...\n");
@@ -1418,20 +1412,21 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 		dev_err(dev, "Failed to get CLQ1 GPIO: %d\n", ret);
 		return ret;
 	}
-	pin_ctx->hp_dev = hp_dev;
-	pin_ctx->pin = desc_to_gpio(pin_ctx->desc);
 	dev_info(dev, "DEBUG:SCK: [GPIO 5/6] CLQ1 SUCCESS: desc=%p pin=%d\n",
-	         pin_ctx->desc, pin_ctx->pin);
+	         pin_ctx->desc, desc_to_gpio(pin_ctx->desc));
+	pin_ctx->hp_dev = hp_dev;
 
+	hp_dev->gpio_count = PCIE_PIN_MAX;
+	
 	dev_info(dev, "DEBUG:SCK: ========================================\n");
 	dev_info(dev, "DEBUG:SCK: GPIO Enumeration Summary:\n");
 	dev_info(dev, "DEBUG:SCK:   All %d GPIOs enumerated successfully!\n", PCIE_PIN_MAX);
-	dev_info(dev, "DEBUG:SCK:   BOOT:  pin=%d\n", hp_dev->pins[PCIE_PIN_BOOT].pin);
-	dev_info(dev, "DEBUG:SCK:   PRSNT: pin=%d\n", hp_dev->pins[PCIE_PIN_PRSNT].pin);
-	dev_info(dev, "DEBUG:SCK:   PERST: pin=%d\n", hp_dev->pins[PCIE_PIN_PERST].pin);
-	dev_info(dev, "DEBUG:SCK:   EN:    pin=%d\n", hp_dev->pins[PCIE_PIN_EN].pin);
-	dev_info(dev, "DEBUG:SCK:   CLQ0:  pin=%d\n", hp_dev->pins[PCIE_PIN_CLQ0].pin);
-	dev_info(dev, "DEBUG:SCK:   CLQ1:  pin=%d\n", hp_dev->pins[PCIE_PIN_CLQ1].pin);
+	dev_info(dev, "DEBUG:SCK:   BOOT:  pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_BOOT].desc));
+	dev_info(dev, "DEBUG:SCK:   PRSNT: pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_PRSNT].desc));
+	dev_info(dev, "DEBUG:SCK:   PERST: pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_PERST].desc));
+	dev_info(dev, "DEBUG:SCK:   EN:    pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_EN].desc));
+	dev_info(dev, "DEBUG:SCK:   CLQ0:  pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_CLQ0].desc));
+	dev_info(dev, "DEBUG:SCK:   CLQ1:  pin=%d\n", desc_to_gpio(hp_dev->pins[PCIE_PIN_CLQ1].desc));
 	dev_info(dev, "DEBUG:SCK: ========================================\n");
 	dev_info(dev, "Successfully enumerated all %d GPIOs using driver mapping\n", PCIE_PIN_MAX);
 
