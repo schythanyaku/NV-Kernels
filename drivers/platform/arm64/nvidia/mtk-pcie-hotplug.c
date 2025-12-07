@@ -1995,3 +1995,4 @@ module_platform_driver(pcie_hp_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("MediaTek PCIe Hotplug Driver for NVIDIA DGX Systems");
+MODULE_SOFTDEP("pre: mtk-pcie-mmio-resources");

@@ -22,6 +22,7 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/ioport.h>
+#include <linux/acpi.h>
 
 /*
  * MMIO resource definitions for MediaTek PCIe controller
@@ -136,11 +137,16 @@ static void __exit mtk_pcie_mmio_exit(void)
 	pr_info("mtk-pcie-mmio: Cleanup complete\n");
 }
 
+static const struct acpi_device_id mtk_pcie_mmio_acpi_match[] = {
+	{"MTKP0001", 0},
+	{}
+};
+MODULE_DEVICE_TABLE(acpi, mtk_pcie_mmio_acpi_match);
+
 module_init(mtk_pcie_mmio_init);
 module_exit(mtk_pcie_mmio_exit);
 
 MODULE_DESCRIPTION("MMIO resource provider for MTK PCIe Hotplug Driver");
 MODULE_AUTHOR("NVIDIA Corporation");
 MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:mtk-pcie-mmio");
 
