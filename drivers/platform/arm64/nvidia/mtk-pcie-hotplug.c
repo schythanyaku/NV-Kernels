@@ -1552,17 +1552,21 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 			}
 		}
 		/* Test GPIO will be auto-freed by devm when device is removed */
-	} else if (ret == -EPROBE_DEFER) {
-		dev_info(dev, "GPIO controller not ready, deferring probe...\n");
-		return ret;
 	} else {
-		/* Failed - pins might be controller-relative, try with common base */
-		dev_warn(dev, "GPIO pin %u failed as-is (error %d), trying common bases...\n",
-		         first_gpio->pin, ret);
+		/* Failed or deferred - try known bases in case pin is controller-relative */
+		bool all_deferred = (ret == -EPROBE_DEFER);
+		
+		if (ret == -EPROBE_DEFER) {
+			dev_info(dev, "DEBUG:SCK: GPIO pin %u returned EPROBE_DEFER with base=0\n",
+			         first_gpio->pin);
+			dev_info(dev, "DEBUG:SCK: Trying known bases (512, 256) in case pin is controller-relative...\n");
+		} else {
+			dev_warn(dev, "GPIO pin %u failed as-is (error %d), trying common bases...\n",
+			         first_gpio->pin, ret);
+			dev_info(dev, "DEBUG:SCK: Trying GPIO chip bases: 512, 256\n");
+		}
 		
 		/* Try GPIO chip bases: 512 (known correct for MT8901), then 256 */
-		/* Note: base 0 was already tested above (as-is request) */
-		dev_info(dev, "DEBUG:SCK: Trying GPIO chip bases: 512, 256\n");
 		for (j = 0; j < ARRAY_SIZE(test_bases); j++) {
 			unsigned int test_global = test_bases[j] + first_gpio->pin;
 			dev_info(dev, "DEBUG:SCK:   Testing base=%d -> GPIO %u (pin %u + base %d)\n",
@@ -1576,13 +1580,27 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 				dev_info(dev, "DEBUG:SCK: Pin %u (controller-relative) -> GPIO %u (global)\n",
 				         first_gpio->pin, test_global);
 				/* Test GPIO will be auto-freed by devm when device is removed */
+				all_deferred = false;
 				break;
+			} else if (ret == -EPROBE_DEFER) {
+				dev_info(dev, "DEBUG:SCK:   Base %d also returned EPROBE_DEFER\n",
+				         test_bases[j]);
+				/* Continue to next base */
 			} else {
 				dev_info(dev, "DEBUG:SCK:   Base %d failed (error %d), trying next...\n",
 				         test_bases[j], ret);
+				all_deferred = false;
 			}
 		}
 		
+		/* If all attempts returned EPROBE_DEFER, defer the probe */
+		if (all_deferred && ret == -EPROBE_DEFER) {
+			dev_info(dev, "DEBUG:SCK: All base attempts returned EPROBE_DEFER - GPIO controller not ready\n");
+			dev_info(dev, "GPIO controller not ready, deferring probe...\n");
+			return ret;
+		}
+		
+		/* If we didn't find a working base, fail */
 		if (j == ARRAY_SIZE(test_bases)) {
 			dev_err(dev, "DEBUG:SCK: ========================================\n");
 			dev_err(dev, "DEBUG:SCK: GPIO BASE DETECTION FAILED\n");
@@ -1600,8 +1618,8 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 	/* Convert controller-relative pins to global if needed */
 	if (gpio_base > 0) {
 		dev_info(dev, "DEBUG:SCK: Converting %d controller pins to global (base=%d)\n",
-		         parse_ctx.count, gpio_base);
-		for (i = 0; i < parse_ctx.count; i++) {
+		         PCIE_PIN_MAX, gpio_base);
+		for (i = 0; i < PCIE_PIN_MAX; i++) {
 			unsigned int old_pin = parse_ctx.gpios[i].pin;
 			parse_ctx.gpios[i].pin = gpio_base + old_pin;
 			dev_info(dev, "DEBUG:SCK:   Pin %u -> GPIO %u\n", old_pin, parse_ctx.gpios[i].pin);
