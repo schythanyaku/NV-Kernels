@@ -1380,6 +1380,48 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 	dev_info(dev, "DEBUG:SCK: Found %d GPIO resources in raw _CRS (pre-grouping)\n",
 	         parse_ctx.count);
 
+	/* Step 1.5: Convert controller-relative pins to global GPIO numbers */
+	/* ACPI gives us controller-relative pin numbers (e.g., 102)
+	 * but devm_gpio_request_one() needs global GPIO numbers (e.g., 512+102=614)
+	 * We need to find the GPIO chip and add its base
+	 */
+	dev_info(dev, "DEBUG:SCK: Converting controller-relative to global GPIO numbers...\n");
+	for (i = 0; i < parse_ctx.count; i++) {
+		struct gpio_desc *temp_desc;
+		struct gpio_chip *chip;
+		int gpio_base;
+		
+		/* Try to get descriptor using current pin number */
+		temp_desc = gpio_to_desc(parse_ctx.gpios[i].pin);
+		if (!temp_desc || IS_ERR(temp_desc)) {
+			/* Pin number is controller-relative, need to add chip base */
+			/* Try common base values: 0, 512, 256 */
+			int bases_to_try[] = {512, 0, 256, 480};
+			int j, found = 0;
+			
+			for (j = 0; j < ARRAY_SIZE(bases_to_try); j++) {
+				unsigned int global_pin = bases_to_try[j] + parse_ctx.gpios[i].pin;
+				temp_desc = gpio_to_desc(global_pin);
+				if (temp_desc && !IS_ERR(temp_desc)) {
+					dev_info(dev, "DEBUG:SCK:   Pin %u -> global GPIO %u (base=%d)\n",
+					         parse_ctx.gpios[i].pin, global_pin, bases_to_try[j]);
+					parse_ctx.gpios[i].pin = global_pin;
+					found = 1;
+					break;
+				}
+			}
+			
+			if (!found) {
+				dev_err(dev, "Failed to find valid GPIO base for pin %u\n",
+				        parse_ctx.gpios[i].pin);
+				return -ENODEV;
+			}
+		} else {
+			dev_info(dev, "DEBUG:SCK:   Pin %u already valid (no base needed)\n",
+			         parse_ctx.gpios[i].pin);
+		}
+	}
+
 	/* Step 2: Allocate GPIO context array */
 	hp_dev->pins = devm_kcalloc(dev, PCIE_PIN_MAX,
 	                             sizeof(struct pcie_hp_gpio_ctx),
@@ -1408,8 +1450,12 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 		
 		ret = devm_gpio_request_one(dev, gpio_info->pin, flags, gpio_info->name);
 		if (ret) {
-			dev_err(dev, "Failed to request GPIO pin %u as output: %d\n",
-			        gpio_info->pin, ret);
+			if (ret == -EPROBE_DEFER) {
+				dev_info(dev, "GPIO controller not ready yet, deferring probe...\n");
+			} else {
+				dev_err(dev, "Failed to request GPIO pin %u as output: %d\n",
+				        gpio_info->pin, ret);
+			}
 			return ret;
 		}
 		dev_info(dev, "DEBUG:SCK:   → Configured as OUTPUT, init=%d\n", init_val);
@@ -1417,8 +1463,12 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 		/* Input GPIOs: BOOT, PRSNT, CLQ0, CLQ1 */
 		ret = devm_gpio_request_one(dev, gpio_info->pin, GPIOF_IN, gpio_info->name);
 		if (ret) {
-			dev_err(dev, "Failed to request GPIO pin %u as input: %d\n",
-			        gpio_info->pin, ret);
+			if (ret == -EPROBE_DEFER) {
+				dev_info(dev, "GPIO controller not ready yet, deferring probe...\n");
+			} else {
+				dev_err(dev, "Failed to request GPIO pin %u as input: %d\n",
+				        gpio_info->pin, ret);
+			}
 			return ret;
 		}
 		dev_info(dev, "DEBUG:SCK:   → Configured as INPUT\n");
