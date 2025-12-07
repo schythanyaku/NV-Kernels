@@ -335,6 +335,9 @@ static void pcie_hp_bus_protect_enable(struct pcie_hp_dev *dev, int port_idx)
     struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
     u32 port_bit = mmio_info->protect.port_bits[port_idx];
     
+    if (!dev->mmio.protect_base)
+        return;
+    
     pcie_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.mode, port_bit, true);
     pcie_hp_reg_update_bits(dev->mmio.protect_base,
@@ -350,6 +353,9 @@ static void pcie_hp_bus_protect_disable(struct pcie_hp_dev *dev, int port_idx)
 {
     struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
     u32 port_bit = mmio_info->protect.port_bits[port_idx];
+    
+    if (!dev->mmio.protect_base)
+        return;
     
     pcie_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.enable, port_bit, false);
@@ -1030,19 +1036,19 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
     if (gpio_ctx->pin == hp_dev->boot_pin) {
         dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT pin IRQ - value=%d, state=%d\n", value, state);
         if (value && state == STATE_PLUG_IN) {
-            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT high + STATE_PLUG_IN → STATE_DEV_POWER_ON\n");
+            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT high + STATE_PLUG_IN -> STATE_DEV_POWER_ON\n");
             dev_dbg(gpio_ctx->dev, "Boot pin high: device powered on\n");
             hp_dev->state = STATE_DEV_POWER_ON;
         } else if (value && state == STATE_DEV_FW_START) {
-            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT high + STATE_DEV_FW_START → STATE_RESCAN (device ready!)\n");
+            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT high + STATE_DEV_FW_START -> STATE_RESCAN (device ready!)\n");
             dev_dbg(gpio_ctx->dev, "Boot pin high: device ready\n");
             hp_dev->state = STATE_RESCAN;
         } else if (!value && state == STATE_DEV_POWER_ON) {
-            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT low + STATE_DEV_POWER_ON → STATE_DEV_FW_START\n");
+            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT low + STATE_DEV_POWER_ON -> STATE_DEV_FW_START\n");
             dev_dbg(gpio_ctx->dev, "Boot pin low: firmware starting\n");
             hp_dev->state = STATE_DEV_FW_START;
         } else if (!value && state == STATE_PLUG_OUT) {
-            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT low + STATE_PLUG_OUT → STATE_DEV_POWER_OFF\n");
+            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT low + STATE_PLUG_OUT -> STATE_DEV_POWER_OFF\n");
             dev_dbg(gpio_ctx->dev, "Boot pin low: device powered off\n");
             hp_dev->state = STATE_DEV_POWER_OFF;
         } else {
@@ -1458,7 +1464,7 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 
 	dev_info(dev, "DEBUG:SCK: ========================================\n");
 	dev_info(dev, "DEBUG:SCK: Starting Manual ACPI GPIO Enumeration\n");
-	dev_info(dev, "DEBUG:SCK: Using raw _CRS parsing + pin→desc conversion\n");
+	dev_info(dev, "DEBUG:SCK: Using raw _CRS parsing + pin-to-desc conversion\n");
 	dev_info(dev, "DEBUG:SCK: This bypasses kernel 6.17+ GPIO grouping bug\n");
 	dev_info(dev, "DEBUG:SCK: ========================================\n");
 
@@ -1581,7 +1587,7 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 			}
 			return ret;
 		}
-		dev_info(dev, "DEBUG:SCK:   → Configured as OUTPUT, init=%d\n", init_val);
+		dev_info(dev, "DEBUG:SCK:   Configured as OUTPUT, init=%d\n", init_val);
 	} else {
 		/* Input GPIOs: BOOT, PRSNT, CLQ0, CLQ1 */
 		ret = devm_gpio_request_one(dev, gpio_info->pin, GPIOF_IN, gpio_info->name);
@@ -1594,7 +1600,7 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 			}
 			return ret;
 		}
-		dev_info(dev, "DEBUG:SCK:   → Configured as INPUT\n");
+		dev_info(dev, "DEBUG:SCK:   Configured as INPUT\n");
 	}
 
 	/* Convert pin number to descriptor */
@@ -1610,7 +1616,7 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 		pin_ctx->desc = desc;
 		pin_ctx->hp_dev = hp_dev;
 
-		dev_info(dev, "DEBUG:SCK:   → SUCCESS: desc=%p global_pin=%u\n",
+		dev_info(dev, "DEBUG:SCK:   SUCCESS: desc=%p global_pin=%u\n",
 		         desc, gpio_info->pin);
 	}
 
@@ -1626,7 +1632,7 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 	dev_info(dev, "DEBUG:SCK:   CLQ0:  pin=%u\n", parse_ctx.gpios[4].pin);
 	dev_info(dev, "DEBUG:SCK:   CLQ1:  pin=%u\n", parse_ctx.gpios[5].pin);
 	dev_info(dev, "DEBUG:SCK: ========================================\n");
-	dev_info(dev, "Successfully enumerated all %d GPIOs via manual pin→desc conversion\n", PCIE_PIN_MAX);
+	dev_info(dev, "Successfully enumerated all %d GPIOs via manual pin-to-desc conversion\n", PCIE_PIN_MAX);
 
 	return 0;
 }
@@ -1750,7 +1756,7 @@ static int pcie_hp_probe(struct platform_device *pdev)
             dev_err(&pdev->dev, "DEBUG:SCK: GPIO %d: gpio_acpi_setup() FAILED\n", i);
             dev_err(&pdev->dev, "Failed to setup ACPI context for GPIO %d\n", i);
             ret = -ENODEV;
-            goto gpio_release;
+            return ret;
         }
         dev_info(&pdev->dev, "DEBUG:SCK: GPIO %d: ACPI context OK - pin=%d, type=%s\n", 
                  i, app_ctx->ctx->pin,
@@ -1771,7 +1777,7 @@ static int pcie_hp_probe(struct platform_device *pdev)
             if (ret) {
                 dev_err(&pdev->dev, "DEBUG:SCK: GPIO %d: pcie_hp_setup_irq() FAILED: %d\n", i, ret);
                 dev_err(&pdev->dev, "Failed to setup IRQ for GPIO %d: %d\n", i, ret);
-                goto gpio_release;
+                return ret;
             }
             if (app_ctx->desc) {
                 dev_info(&pdev->dev, "DEBUG:SCK: GPIO %d: IRQ setup SUCCESS - IRQ %d\n", i, gpiod_to_irq(app_ctx->desc));
@@ -1788,9 +1794,11 @@ static int pcie_hp_probe(struct platform_device *pdev)
 
     /* Check that we found the required pins */
     if (hp_dev->boot_pin < 0 || hp_dev->prsnt_pin < 0) {
-        dev_warn(&pdev->dev,
-                 "Warning: boot_pin=%d prsnt_pin=%d (may not work correctly)\n",
-                 hp_dev->boot_pin, hp_dev->prsnt_pin);
+        dev_err(&pdev->dev,
+                "Critical GPIOs missing: boot_pin=%d prsnt_pin=%d\n",
+                hp_dev->boot_pin, hp_dev->prsnt_pin);
+        dev_err(&pdev->dev, "BOOT and PRSNT GPIOs are required for hotplug functionality\n");
+        return -ENODEV;
     }
 
     platform_set_drvdata(pdev, hp_dev);
@@ -1799,7 +1807,7 @@ static int pcie_hp_probe(struct platform_device *pdev)
     ret = pcie_hp_pinctrl_init(hp_dev);
     if (ret) {
         dev_err(&pdev->dev, "Pinctrl init failed: %d\n", ret);
-        goto gpio_release;
+        return ret;
     }
 
     /* Create sysfs interface */
@@ -1813,20 +1821,24 @@ static int pcie_hp_probe(struct platform_device *pdev)
     dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
     dev_info(&pdev->dev, "DEBUG:SCK: GPIO ENUMERATION CHECKPOINT\n");
     dev_info(&pdev->dev, "DEBUG:SCK:   Total GPIOs enumerated: %d/%d\n", hp_dev->gpio_count, PCIE_PIN_MAX);
-    dev_info(&pdev->dev, "DEBUG:SCK:   BOOT pin:  %d (IRQ: %d)\n", hp_dev->boot_pin, 
-             (hp_dev->boot_pin >= 0 && hp_dev->pins[PCIE_PIN_BOOT].desc) ? 
-             gpiod_to_irq(hp_dev->pins[PCIE_PIN_BOOT].desc) : -1);
-    dev_info(&pdev->dev, "DEBUG:SCK:   PRSNT pin: %d (IRQ: %d)\n", hp_dev->prsnt_pin,
-             (hp_dev->prsnt_pin >= 0 && hp_dev->pins[PCIE_PIN_PRSNT].desc) ? 
-             gpiod_to_irq(hp_dev->pins[PCIE_PIN_PRSNT].desc) : -1);
-    for (i = 0; i < PCIE_PIN_MAX; i++) {
-        if (hp_dev->pins[i].desc) {
-            dev_info(&pdev->dev, "DEBUG:SCK:   GPIO[%d]: desc=%p (READY)\n", i, hp_dev->pins[i].desc);
-        } else {
-            dev_warn(&pdev->dev, "DEBUG:SCK:   GPIO[%d]: desc=NULL (MISSING!)\n", i);
+    if (hp_dev->pins) {
+        dev_info(&pdev->dev, "DEBUG:SCK:   BOOT pin:  %d (IRQ: %d)\n", hp_dev->boot_pin, 
+                 (hp_dev->boot_pin >= 0 && hp_dev->pins[PCIE_PIN_BOOT].desc) ? 
+                 gpiod_to_irq(hp_dev->pins[PCIE_PIN_BOOT].desc) : -1);
+        dev_info(&pdev->dev, "DEBUG:SCK:   PRSNT pin: %d (IRQ: %d)\n", hp_dev->prsnt_pin,
+                 (hp_dev->prsnt_pin >= 0 && hp_dev->pins[PCIE_PIN_PRSNT].desc) ? 
+                 gpiod_to_irq(hp_dev->pins[PCIE_PIN_PRSNT].desc) : -1);
+        for (i = 0; i < PCIE_PIN_MAX; i++) {
+            if (hp_dev->pins[i].desc) {
+                dev_info(&pdev->dev, "DEBUG:SCK:   GPIO[%d]: desc=%p (READY)\n", i, hp_dev->pins[i].desc);
+            } else {
+                dev_warn(&pdev->dev, "DEBUG:SCK:   GPIO[%d]: desc=NULL (MISSING!)\n", i);
+            }
         }
+    } else {
+        dev_warn(&pdev->dev, "DEBUG:SCK:   GPIO pins array is NULL\n");
     }
-    dev_info(&pdev->dev, "DEBUG:SCK: ✅ GPIO ENUMERATION COMPLETE - Proceeding to MMIO\n");
+    dev_info(&pdev->dev, "DEBUG:SCK: GPIO ENUMERATION COMPLETE - Proceeding to MMIO\n");
     dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
 
     /* Map MMIO regions from platform resources */
@@ -1835,12 +1847,12 @@ static int pcie_hp_probe(struct platform_device *pdev)
     dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
     ret = pcie_hp_map_resources(hp_dev);
     if (ret) {
-        dev_err(&pdev->dev, "DEBUG:SCK: ❌ MMIO MAPPING FAILED with error %d\n", ret);
+        dev_err(&pdev->dev, "DEBUG:SCK: MMIO MAPPING FAILED with error %d\n", ret);
         dev_err(&pdev->dev, "Failed to map MMIO resources: %d\n", ret);
         goto sysfs_remove;
     }
     dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ✅ MMIO MAPPING COMPLETE\n");
+    dev_info(&pdev->dev, "DEBUG:SCK: MMIO MAPPING COMPLETE\n");
     dev_info(&pdev->dev, "DEBUG:SCK:   All 5 MMIO regions successfully mapped\n");
     dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
 
@@ -1851,7 +1863,7 @@ static int pcie_hp_probe(struct platform_device *pdev)
 
     /* Send initial state uevent */
     dev_info(&pdev->dev, "DEBUG:SCK: Reading PRSNT pin for initial state...\n");
-    if (hp_dev->pins[PCIE_PIN_PRSNT].desc) {
+    if (hp_dev->pins && hp_dev->pins[PCIE_PIN_PRSNT].desc) {
         if (gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc)) {
             dev_info(&pdev->dev, "DEBUG:SCK: PRSNT=1 (cable removed), sending REMOVAL_EVT\n");
             hp_dev->debug_state = PCIE_HP_DEBUG_PLUG_OUT;
@@ -1890,7 +1902,6 @@ pinctrl_remove:
 static void pcie_hp_remove(struct platform_device *pdev)
 {
     struct pcie_hp_dev *hp_dev = platform_get_drvdata(pdev);
-    struct pcie_hp_gpio_ctx *app_ctx;
     int i;
 
     if (!hp_dev)
