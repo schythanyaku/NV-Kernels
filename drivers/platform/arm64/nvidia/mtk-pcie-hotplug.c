@@ -2207,7 +2207,7 @@ try_method_2:
 	hp_dev->pins = NULL;
 	hp_dev->gpio_count = 0;
 	
-	int ret2 = pcie_hp_probe_gpios_fallback_get_index(pdev, hp_dev);
+	ret2 = pcie_hp_probe_gpios_fallback_get_index(pdev, hp_dev);
 	if (ret2 == -EPROBE_DEFER) {
 		dev_info(dev, "DEBUG:SCK: [METHOD 2] GPIO controller not ready - DEFERRED\n");
 		method2_gpio_count = 0;
@@ -2245,7 +2245,7 @@ try_method_2:
 		}
 	}
 
-try_method_3:
+	/* Method 3: Try hardcoded GPIOs */
 	dev_info(dev, "DEBUG:SCK: [METHOD 3] Testing hardcoded GPIO pins...\n");
 	/* Temporarily clear pins so Method 3 can try */
 	struct pcie_hp_gpio_ctx *current_pins = hp_dev->pins;
@@ -2253,7 +2253,7 @@ try_method_3:
 	hp_dev->pins = NULL;
 	hp_dev->gpio_count = 0;
 	
-	int ret3 = pcie_hp_probe_gpios_fallback_hardcoded(pdev, hp_dev);
+	ret3 = pcie_hp_probe_gpios_fallback_hardcoded(pdev, hp_dev);
 	if (ret3 == -EPROBE_DEFER) {
 		dev_info(dev, "DEBUG:SCK: [METHOD 3] GPIO controller not ready - DEFERRED\n");
 		method3_gpio_count = 0;
