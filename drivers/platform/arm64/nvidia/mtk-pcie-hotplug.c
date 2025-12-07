@@ -525,7 +525,7 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 	struct acpi_device *adev;
 	struct pcie_hp_acpi_mmio parsed = { .count = 0, .dev = &pdev->dev };
 	acpi_status status;
-	int i;
+	int ret, i;
 
 	pr_info("mtk-pcie-hotplug: ========================================\n");
 	pr_info("mtk-pcie-hotplug: MMIO RESOURCE MAPPING START\n");
@@ -1811,12 +1811,6 @@ static int pcie_hp_probe(struct platform_device *pdev)
     pr_info("mtk-pcie-hotplug: Device: %s\n", dev_name(&pdev->dev));
     pr_info("mtk-pcie-hotplug: ========================================\n");
 
-    /* Check if driver is disabled via module parameter */
-    if (disable_hotplug) {
-        pr_info("mtk-pcie-hotplug: Driver disabled via module parameter\n");
-        return -ENODEV;
-    }
-
     pd = (struct pcie_hp_plat_data *)device_get_match_data(&pdev->dev);
     if (!pd) {
         dev_err(&pdev->dev, "No platform data available\n");
@@ -2142,11 +2136,6 @@ static struct platform_driver pcie_hp_driver = {
         .acpi_match_table = ACPI_PTR(pcie_hp_acpi_match),
     },
 };
-
-/* Module parameter to disable driver (for debugging boot issues) */
-static bool disable_hotplug = false;
-module_param(disable_hotplug, bool, 0444);
-MODULE_PARM_DESC(disable_hotplug, "Disable PCIe hotplug driver (set to 1 to disable)");
 
 module_platform_driver(pcie_hp_driver);
 
