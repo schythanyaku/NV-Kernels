@@ -4,4 +4,5 @@
 #
 
 obj-$(CONFIG_MTK_PCIE_HOTPLUG) += mtk-pcie-hotplug.o
+obj-$(CONFIG_MTK_PCIE_HOTPLUG) += mtk-pcie-mmio-resources.o
 

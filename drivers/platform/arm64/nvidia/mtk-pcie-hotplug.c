@@ -463,7 +463,68 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 	}
 	dev_info(&pdev->dev, "DEBUG:SCK: ACPI walk completed - found %d MMIO regions\n", parsed.count);
 
-	/* Verify we found all required MMIO regions */
+	/* Check if ACPI provided MMIO resources */
+	if (parsed.count == 0) {
+		dev_info(&pdev->dev, "DEBUG:SCK: No MMIO from ACPI _CRS, trying platform device fallback...\n");
+		dev_info(&pdev->dev, "No MMIO in ACPI _CRS - will try platform device resources\n");
+		
+		/* Fallback: Try platform device resources (from mtk-pcie-mmio-resources module) */
+		for (i = 0; i < 5; i++) {
+			struct resource *res;
+			void __iomem *base;
+			const char *name;
+			
+			res = platform_get_resource(pdev, IORESOURCE_MEM, i);
+			if (!res) {
+				dev_err(&pdev->dev, "DEBUG:SCK: Platform resource %d NOT FOUND\n", i);
+				dev_err(&pdev->dev, "Platform MMIO resource %d not available\n", i);
+				dev_err(&pdev->dev, "Hint: Load mtk-pcie-mmio-resources module first\n");
+				return -ENODEV;
+			}
+			
+			/* Determine region name */
+			switch (i) {
+			case 0: name = "TOP"; break;
+			case 1: name = "PROTECT"; break;
+			case 2: name = "CKM"; break;
+			case 3: name = "MAC Port 0"; break;
+			case 4: name = "MAC Port 1"; break;
+			default: name = "Unknown"; break;
+			}
+			
+			dev_info(&pdev->dev, "DEBUG:SCK: [Platform MMIO %d/5] %s: 0x%llx-0x%llx\n",
+				 i+1, name, (u64)res->start, (u64)res->end);
+			
+			base = devm_ioremap_resource(&pdev->dev, res);
+			if (IS_ERR(base)) {
+				dev_err(&pdev->dev, "DEBUG:SCK: [Platform MMIO %d/5] %s mapping FAILED: %ld\n",
+					i+1, name, PTR_ERR(base));
+				return PTR_ERR(base);
+			}
+			
+			dev_info(&pdev->dev, "DEBUG:SCK: [Platform MMIO %d/5] %s SUCCESS -> %p\n",
+				 i+1, name, base);
+			
+			/* Store mapped address */
+			switch (i) {
+			case 0: dev->mmio.top_base = base; break;
+			case 1: dev->mmio.protect_base = base; break;
+			case 2: dev->mmio.ckm_base = base; break;
+			case 3: if (dev->pd->port_nums > 0) dev->mmio.mac_port_base[0] = base; break;
+			case 4: if (dev->pd->port_nums > 1) dev->mmio.mac_port_base[1] = base; break;
+			}
+		}
+		
+		dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
+		dev_info(&pdev->dev, "DEBUG:SCK: Platform Device MMIO Mapping Complete\n");
+		dev_info(&pdev->dev, "DEBUG:SCK:   Source: Platform device resources\n");
+		dev_info(&pdev->dev, "DEBUG:SCK:   Regions: 5 (TOP, PROTECT, CKM, MAC0, MAC1)\n");
+		dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
+		dev_info(&pdev->dev, "Successfully mapped MMIO from platform device\n");
+		return 0;
+	}
+	
+	/* Verify we found all required MMIO regions from ACPI */
 	if (parsed.count < 5) {
 		dev_err(&pdev->dev, "DEBUG:SCK: INSUFFICIENT MMIO regions - expected 5, found %d\n", parsed.count);
 		dev_err(&pdev->dev, "Expected 5 MMIO regions, found %d\n", parsed.count);
@@ -529,7 +590,8 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 	}
 
 	dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-	dev_info(&pdev->dev, "DEBUG:SCK: MMIO Mapping Summary:\n");
+	dev_info(&pdev->dev, "DEBUG:SCK: ACPI MMIO Mapping Complete\n");
+	dev_info(&pdev->dev, "DEBUG:SCK:   Source: ACPI _CRS (firmware-provided)\n");
 	dev_info(&pdev->dev, "DEBUG:SCK:   TOP:        %p (0x%08x)\n", dev->mmio.top_base, 
 	         parsed.mmio_regions[0].address);
 	dev_info(&pdev->dev, "DEBUG:SCK:   PROTECT:    %p (0x%08x)\n", dev->mmio.protect_base,
@@ -1701,12 +1763,38 @@ static int pcie_hp_probe(struct platform_device *pdev)
         goto pinctrl_remove;
     }
 
+    /* GPIO enumeration checkpoint - verify all GPIOs are ready */
+    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
+    dev_info(&pdev->dev, "DEBUG:SCK: GPIO ENUMERATION CHECKPOINT\n");
+    dev_info(&pdev->dev, "DEBUG:SCK:   Total GPIOs enumerated: %d/%d\n", hp_dev->gpio_count, PCIE_PIN_MAX);
+    dev_info(&pdev->dev, "DEBUG:SCK:   BOOT pin:  %d (IRQ: %d)\n", hp_dev->boot_pin, 
+             hp_dev->boot_pin >= 0 ? gpiod_to_irq(hp_dev->pins[PCIE_PIN_BOOT].desc) : -1);
+    dev_info(&pdev->dev, "DEBUG:SCK:   PRSNT pin: %d (IRQ: %d)\n", hp_dev->prsnt_pin,
+             hp_dev->prsnt_pin >= 0 ? gpiod_to_irq(hp_dev->pins[PCIE_PIN_PRSNT].desc) : -1);
+    for (i = 0; i < PCIE_PIN_MAX; i++) {
+        if (hp_dev->pins[i].desc) {
+            dev_info(&pdev->dev, "DEBUG:SCK:   GPIO[%d]: desc=%p (READY)\n", i, hp_dev->pins[i].desc);
+        } else {
+            dev_warn(&pdev->dev, "DEBUG:SCK:   GPIO[%d]: desc=NULL (MISSING!)\n", i);
+        }
+    }
+    dev_info(&pdev->dev, "DEBUG:SCK: ✅ GPIO ENUMERATION COMPLETE - Proceeding to MMIO\n");
+    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
+
     /* Map MMIO regions from platform resources */
+    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
+    dev_info(&pdev->dev, "DEBUG:SCK: Starting MMIO Resource Mapping\n");
+    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
     ret = pcie_hp_map_resources(hp_dev);
     if (ret) {
+        dev_err(&pdev->dev, "DEBUG:SCK: ❌ MMIO MAPPING FAILED with error %d\n", ret);
         dev_err(&pdev->dev, "Failed to map MMIO resources: %d\n", ret);
         goto sysfs_remove;
     }
+    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
+    dev_info(&pdev->dev, "DEBUG:SCK: ✅ MMIO MAPPING COMPLETE\n");
+    dev_info(&pdev->dev, "DEBUG:SCK:   All 5 MMIO regions successfully mapped\n");
+    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
 
     /* Discover existing PCI devices */
     ret = pcie_hp_discover_devices(hp_dev);
