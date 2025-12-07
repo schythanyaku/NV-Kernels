@@ -18,17 +18,16 @@ config MTK_PCIE_HOTPLUG
 	  to properly initialize or remove devices.
 	  
 	  GPIOs are enumerated from ACPI _CRS using direct resource
-	  parsing to work around kernel 6.17+ GPIO grouping issues.
+	  parsing to work around kernel 6.17+ GPIO grouping regression.
 	  
-	  MMIO resources are obtained from ACPI _CRS when available,
-	  or from platform device resources as fallback when firmware
-	  does not provide them in ACPI tables.
+	  MMIO resources must be provided in ACPI _CRS by firmware.
+	  The driver will fail to probe if MMIO regions are missing.
 	  
 	  This is particularly useful for MediaTek MT8901 SoC-based
 	  systems like NVIDIA DGX Spark.
 	  
-	  Note: This also builds mtk-pcie-mmio-resources module which
-	  provides MMIO resources when ACPI firmware is incomplete.
+	  Note: Requires firmware team to add MMIO regions to PEDE
+	  device in DSDT. See driver documentation for details.
 	  
 	  If unsure, say N.
 
