@@ -433,88 +433,69 @@ static acpi_status pcie_hp_parse_acpi_resources(struct acpi_resource *ares, void
 }
 
 /**
- * pcie_hp_get_mmio_from_platform - Fallback: Get MMIO from platform device resources
+ * pcie_hp_get_mmio_hardcoded - Fallback: Map MMIO using hardcoded addresses
  * @dev: hotplug device
  *
  * This is a temporary workaround until firmware team provides custom DSDT.
- * Uses platform_get_resource() to get MMIO from platform device registered
- * by mtk-pcie-mmio-resources module.
+ * Uses hardcoded MMIO addresses for MediaTek PCIe controller.
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int pcie_hp_get_mmio_from_platform(struct pcie_hp_dev *dev)
+static int pcie_hp_get_mmio_hardcoded(struct pcie_hp_dev *dev)
 {
 	struct platform_device *pdev = dev->pdev;
-	struct device *mmio_dev;
-	struct platform_device *mmio_pdev = NULL;
-	struct resource *res;
 	void __iomem *base;
-	const char *name;
-	int i;
 	
-	dev_info(&pdev->dev, "DEBUG:SCK: Using platform device fallback (platform_get_resource)\n");
-	dev_info(&pdev->dev, "No MMIO in ACPI _CRS - trying platform device resources\n");
-	dev_info(&pdev->dev, "Hint: Load mtk-pcie-mmio-resources module first\n");
-	
-	/* Find the MMIO platform device by name */
-	mmio_dev = bus_find_device_by_name(&platform_bus_type, NULL, "mtk-pcie-mmio-resources");
-	if (!mmio_dev) {
-		dev_err(&pdev->dev, "MMIO platform device 'mtk-pcie-mmio-resources' not found\n");
-		dev_err(&pdev->dev, "Hint: Load mtk-pcie-mmio-resources module first\n");
-		return -ENODEV;
-	}
-	mmio_pdev = to_platform_device(mmio_dev);
-	
-	/* Get MMIO resources from the MMIO platform device */
-	for (i = 0; i < 5; i++) {
-		res = platform_get_resource(mmio_pdev, IORESOURCE_MEM, i);
-		if (!res) {
-			dev_err(&pdev->dev, "DEBUG:SCK: Platform resource %d NOT FOUND\n", i);
-			dev_err(&pdev->dev, "Platform MMIO resource %d not available\n", i);
-			dev_err(&pdev->dev, "Hint: Load mtk-pcie-mmio-resources module first\n");
-			put_device(&mmio_pdev->dev);
-			return -ENODEV;
-		}
-		
-		/* Determine region name */
-		switch (i) {
-		case 0: name = "TOP"; break;
-		case 1: name = "PROTECT"; break;
-		case 2: name = "CKM"; break;
-		case 3: name = "MAC Port 0"; break;
-		case 4: name = "MAC Port 1"; break;
-		default: name = "Unknown"; break;
-		}
-		
-		dev_info(&pdev->dev, "DEBUG:SCK: [Platform MMIO %d/5] %s: 0x%llx-0x%llx\n",
-			 i+1, name, (u64)res->start, (u64)res->end);
-		
-		base = devm_ioremap_resource(&pdev->dev, res);
-		if (IS_ERR(base)) {
-			dev_err(&pdev->dev, "DEBUG:SCK: [Platform MMIO %d/5] %s mapping FAILED: %ld\n",
-				i+1, name, PTR_ERR(base));
-			put_device(&mmio_pdev->dev);
-			return PTR_ERR(base);
-		}
-		
-		dev_info(&pdev->dev, "Mapped %s from platform: 0x%llx -> %p\n",
-			 name, (u64)res->start, base);
-		dev_info(&pdev->dev, "DEBUG:SCK: [Platform MMIO %d/5] %s SUCCESS -> %p\n",
-			 i+1, name, base);
-		
-		/* Store the mapped address */
-		switch (i) {
-		case 0: dev->mmio.top_base = base; break;
-		case 1: dev->mmio.protect_base = base; break;
-		case 2: dev->mmio.ckm_base = base; break;
-		case 3: dev->mmio.mac_port_base[0] = base; break;
-		case 4: dev->mmio.mac_port_base[1] = base; break;
-		}
+	if (!dev || !pdev) {
+		pr_err("mtk-pcie-hotplug: Invalid device pointer in hardcoded MMIO fallback\n");
+		return -EINVAL;
 	}
 	
-	put_device(&mmio_pdev->dev);  /* Release reference from bus_find_device_by_name */
+	dev_warn(&pdev->dev, "No MMIO in ACPI _CRS - using hardcoded fallback addresses\n");
+	dev_info(&pdev->dev, "DEBUG:SCK: Using hardcoded MMIO addresses\n");
 	
-	dev_info(&pdev->dev, "DEBUG:SCK: Platform device fallback: All 5 MMIO regions mapped\n");
+	/* Hardcoded MMIO addresses for MediaTek PCIe controller */
+	base = devm_ioremap(&pdev->dev, 0x1D600000, 0x1000);
+	if (!base) {
+		dev_err(&pdev->dev, "Failed to map TOP region (0x1D600000)\n");
+		return -ENOMEM;
+	}
+	dev->mmio.top_base = base;
+	dev_info(&pdev->dev, "Mapped TOP: 0x1D600000 -> %p\n", base);
+	
+	base = devm_ioremap(&pdev->dev, 0x1D640000, 0x1000);
+	if (!base) {
+		dev_err(&pdev->dev, "Failed to map PROTECT region (0x1D640000)\n");
+		return -ENOMEM;
+	}
+	dev->mmio.protect_base = base;
+	dev_info(&pdev->dev, "Mapped PROTECT: 0x1D640000 -> %p\n", base);
+	
+	base = devm_ioremap(&pdev->dev, 0x16BD0000, 0x1000);
+	if (!base) {
+		dev_err(&pdev->dev, "Failed to map CKM region (0x16BD0000)\n");
+		return -ENOMEM;
+	}
+	dev->mmio.ckm_base = base;
+	dev_info(&pdev->dev, "Mapped CKM: 0x16BD0000 -> %p\n", base);
+	
+	base = devm_ioremap(&pdev->dev, 0x1D790000, 0x1000);
+	if (!base) {
+		dev_err(&pdev->dev, "Failed to map MAC Port 0 region (0x1D790000)\n");
+		return -ENOMEM;
+	}
+	dev->mmio.mac_port_base[0] = base;
+	dev_info(&pdev->dev, "Mapped MAC Port 0: 0x1D790000 -> %p\n", base);
+	
+	base = devm_ioremap(&pdev->dev, 0x1D690000, 0x1000);
+	if (!base) {
+		dev_err(&pdev->dev, "Failed to map MAC Port 1 region (0x1D690000)\n");
+		return -ENOMEM;
+	}
+	dev->mmio.mac_port_base[1] = base;
+	dev_info(&pdev->dev, "Mapped MAC Port 1: 0x1D690000 -> %p\n", base);
+	
+	dev_info(&pdev->dev, "DEBUG:SCK: Hardcoded fallback: All 5 MMIO regions mapped\n");
 	return 0;
 }
 
@@ -577,10 +558,10 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 	if (parsed.count != 5) {
 		dev_warn(&pdev->dev, "DEBUG:SCK: INSUFFICIENT MMIO regions from ACPI - expected 5, found %d\n", parsed.count);
 		dev_warn(&pdev->dev, "Expected 5 MMIO regions in ACPI _CRS, found %d\n", parsed.count);
-		dev_warn(&pdev->dev, "Falling back to platform device resources...\n");
+		dev_warn(&pdev->dev, "Falling back to hardcoded MMIO addresses...\n");
 		
-		/* Fallback to platform device resources */
-		return pcie_hp_get_mmio_from_platform(dev);
+		/* Fallback to hardcoded MMIO addresses */
+		return pcie_hp_get_mmio_hardcoded(dev);
 	}
 
 	dev_info(&pdev->dev, "Found %d MMIO regions in _CRS, mapping...\n", parsed.count);
@@ -1525,27 +1506,33 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 			struct gpio_chip *chip;
 			bool found = false;
 			
-			/* Find a valid GPIO chip by probing */
-			for (i = 0; i < 2048 && !found; i += 32) {
-				test_desc = gpio_to_desc(i);
-				if (test_desc && !IS_ERR(test_desc)) {
-					chip = gpiod_to_chip(test_desc);
-					if (chip && chip->base >= 0) {
-						/* Test if this chip owns our pins */
-						unsigned int test_global = chip->base + parse_ctx.gpios[0].pin;
-						if (test_global < chip->base + chip->ngpio) {
-							test_desc = gpio_to_desc(test_global);
-							if (test_desc && !IS_ERR(test_desc)) {
-								gpio_base = chip->base;
-								dev_info(dev, "Found GPIO chip: base=%d ngpio=%d label=%s\n",
-								         gpio_base, chip->ngpio,
-								         chip->label ? chip->label : "unknown");
-								found = true;
-							}
+		/* Find a valid GPIO chip by probing */
+		/* Limit search to prevent infinite loops or excessive delays */
+		for (i = 0; i < 2048 && !found; i += 32) {
+			test_desc = gpio_to_desc(i);
+			if (test_desc && !IS_ERR(test_desc)) {
+				chip = gpiod_to_chip(test_desc);
+				if (chip && chip->base >= 0) {
+					/* Test if this chip owns our pins */
+					unsigned int test_global = chip->base + parse_ctx.gpios[0].pin;
+					if (test_global < chip->base + chip->ngpio) {
+						test_desc = gpio_to_desc(test_global);
+						if (test_desc && !IS_ERR(test_desc)) {
+							gpio_base = chip->base;
+							dev_info(dev, "Found GPIO chip: base=%d ngpio=%d label=%s\n",
+							         gpio_base, chip->ngpio,
+							         chip->label ? chip->label : "unknown");
+							found = true;
+							break;  /* Exit loop once found */
 						}
 					}
 				}
 			}
+			/* Add small delay to prevent tight loop from hanging system */
+			if (i % 256 == 0 && i > 0) {
+				udelay(10);
+			}
+		}
 			
 			if (!found) {
 				dev_err(dev, "Failed to find GPIO chip for controller pins\n");
@@ -1587,47 +1574,51 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 		         gpio_info->is_interrupt ? "GpioInt" : "GpioIo",
 		         gpio_info->is_output ? "Output" : "Input");
 
-	/* Request ownership and configure GPIO direction */
-	if (gpio_info->is_output) {
-		/* Output GPIOs: PERST (high), EN (low) */
-		int init_val = (i == PCIE_PIN_PERST) ? 1 : 0;
-		unsigned long flags = init_val ? GPIOF_OUT_INIT_HIGH : GPIOF_OUT_INIT_LOW;
-		
-		ret = devm_gpio_request_one(dev, gpio_info->pin, flags, gpio_info->name);
-		if (ret) {
-			if (ret == -EPROBE_DEFER) {
-				dev_info(dev, "GPIO controller not ready yet, deferring probe...\n");
-			} else {
-				dev_err(dev, "Failed to request GPIO pin %u as output: %d\n",
-				        gpio_info->pin, ret);
+		/* Request ownership and configure GPIO direction */
+		if (gpio_info->is_output) {
+			/* Output GPIOs: PERST (high), EN (low) */
+			int init_val = (i == PCIE_PIN_PERST) ? 1 : 0;
+			unsigned long flags = init_val ? GPIOF_OUT_INIT_HIGH : GPIOF_OUT_INIT_LOW;
+			
+			ret = devm_gpio_request_one(dev, gpio_info->pin, flags, gpio_info->name);
+			if (ret) {
+				if (ret == -EPROBE_DEFER) {
+					dev_info(dev, "GPIO controller not ready yet, deferring probe...\n");
+				} else {
+					dev_err(dev, "Failed to request GPIO pin %u as output: %d\n",
+					        gpio_info->pin, ret);
+				}
+				return ret;
 			}
-			return ret;
-		}
-		dev_info(dev, "DEBUG:SCK:   Configured as OUTPUT, init=%d\n", init_val);
-	} else {
-		/* Input GPIOs: BOOT, PRSNT, CLQ0, CLQ1 */
-		ret = devm_gpio_request_one(dev, gpio_info->pin, GPIOF_IN, gpio_info->name);
-		if (ret) {
-			if (ret == -EPROBE_DEFER) {
-				dev_info(dev, "GPIO controller not ready yet, deferring probe...\n");
-			} else {
-				dev_err(dev, "Failed to request GPIO pin %u as input: %d\n",
-				        gpio_info->pin, ret);
+			dev_info(dev, "DEBUG:SCK:   Configured as OUTPUT, init=%d\n", init_val);
+		} else {
+			/* Input GPIOs: BOOT, PRSNT, CLQ0, CLQ1 */
+			ret = devm_gpio_request_one(dev, gpio_info->pin, GPIOF_IN, gpio_info->name);
+			if (ret) {
+				if (ret == -EPROBE_DEFER) {
+					dev_info(dev, "GPIO controller not ready yet, deferring probe...\n");
+				} else {
+					dev_err(dev, "Failed to request GPIO pin %u as input: %d\n",
+					        gpio_info->pin, ret);
+				}
+				return ret;
 			}
-			return ret;
+			dev_info(dev, "DEBUG:SCK:   Configured as INPUT\n");
 		}
-		dev_info(dev, "DEBUG:SCK:   Configured as INPUT\n");
-	}
 
-	/* Convert pin number to descriptor */
-	desc = gpio_to_desc(gpio_info->pin);
-	if (!desc || IS_ERR(desc)) {
-		dev_err(dev, "Failed to convert pin %u to descriptor: %ld\n",
-		        gpio_info->pin, PTR_ERR(desc));
-		return PTR_ERR(desc) ?: -EINVAL;
-    }
+		/* Convert pin number to descriptor */
+		desc = gpio_to_desc(gpio_info->pin);
+		if (!desc || IS_ERR(desc)) {
+			dev_err(dev, "Failed to convert pin %u to descriptor: %ld\n",
+			        gpio_info->pin, PTR_ERR(desc));
+			return PTR_ERR(desc) ?: -EINVAL;
+		}
 
 		/* Store descriptor in context */
+		if (!hp_dev->pins) {
+			dev_err(dev, "GPIO pins array is NULL\n");
+			return -ENOMEM;
+		}
 		pin_ctx = &hp_dev->pins[i];
 		pin_ctx->desc = desc;
 		pin_ctx->hp_dev = hp_dev;
@@ -1732,11 +1723,9 @@ static int pcie_hp_probe(struct platform_device *pdev)
     for (i = 0; i < HP_PORT_MAX; i++)
         hp_dev->cached_root_ports[i] = NULL;
 
-    /* Initialize bus protection (like 6.14's rp_bus_prepare during probe) */
-    if (pd->rp_bus_protect) {
-        for (i = 0; i < pd->port_nums; i++)
-            pd->rp_bus_protect(hp_dev, i, BUS_PROTECT_INIT);
-    }
+    /* Note: Bus protection initialization is deferred until after MMIO mapping
+     * because it requires MMIO regions to be mapped first.
+     */
 
     /* Enumerate all GPIOs using ACPI _DSD named connections */
     dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
@@ -1871,6 +1860,14 @@ static int pcie_hp_probe(struct platform_device *pdev)
     dev_info(&pdev->dev, "DEBUG:SCK: MMIO MAPPING COMPLETE\n");
     dev_info(&pdev->dev, "DEBUG:SCK:   All 5 MMIO regions successfully mapped\n");
     dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
+
+    /* Initialize bus protection now that MMIO is mapped */
+    if (pd->rp_bus_protect) {
+        dev_info(&pdev->dev, "DEBUG:SCK: Initializing bus protection...\n");
+        for (i = 0; i < pd->port_nums; i++)
+            pd->rp_bus_protect(hp_dev, i, BUS_PROTECT_INIT);
+        dev_info(&pdev->dev, "DEBUG:SCK: Bus protection initialized\n");
+    }
 
     /* Discover existing PCI devices */
     ret = pcie_hp_discover_devices(hp_dev);
@@ -2022,4 +2019,3 @@ module_platform_driver(pcie_hp_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("MediaTek PCIe Hotplug Driver for NVIDIA DGX Systems");
-MODULE_SOFTDEP("pre: mtk-pcie-mmio-resources");

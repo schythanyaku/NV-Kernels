@@ -21,9 +21,8 @@ config MTK_PCIE_HOTPLUG
 	  parsing to work around kernel 6.17+ GPIO grouping regression.
 	  
 	  MMIO resources are preferred from ACPI _CRS, but the driver
-	  can fall back to platform device resources (provided by
-	  mtk-pcie-mmio-resources module) until firmware team adds MMIO
-	  to PEDE device in DSDT.
+	  can fall back to hardcoded MMIO addresses until firmware 
+	  adds MMIO to PEDE device in DSDT.
 	  
 	  This is particularly useful for MediaTek MT8901 SoC-based
 	  systems like NVIDIA DGX Spark.
