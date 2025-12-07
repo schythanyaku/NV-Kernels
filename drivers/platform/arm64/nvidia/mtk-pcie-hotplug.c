@@ -1380,45 +1380,62 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 	dev_info(dev, "DEBUG:SCK: Found %d GPIO resources in raw _CRS (pre-grouping)\n",
 	         parse_ctx.count);
 
-	/* Step 1.5: Convert controller-relative pins to global GPIO numbers */
-	/* ACPI gives us controller-relative pin numbers (e.g., 102)
-	 * but devm_gpio_request_one() needs global GPIO numbers (e.g., 512+102=614)
-	 * We need to find the GPIO chip and add its base
+	/* Step 1.5: Determine if we need to adjust GPIO pin numbers
+	 * Some systems provide controller-relative pins (e.g., 102) while the
+	 * legacy GPIO API expects global GPIO numbers (e.g., base+102).
+	 * Try the pin as-is first; if invalid, search for the GPIO chip base.
 	 */
-	dev_info(dev, "DEBUG:SCK: Converting controller-relative to global GPIO numbers...\n");
-	for (i = 0; i < parse_ctx.count; i++) {
-		struct gpio_desc *temp_desc;
-		struct gpio_chip *chip;
-		int gpio_base;
+	if (parse_ctx.count > 0) {
+		struct gpio_desc *test_desc;
+		int gpio_base = 0;  /* Default: assume pins are already global */
 		
-		/* Try to get descriptor using current pin number */
-		temp_desc = gpio_to_desc(parse_ctx.gpios[i].pin);
-		if (!temp_desc || IS_ERR(temp_desc)) {
-			/* Pin number is controller-relative, need to add chip base */
-			/* Try common base values: 0, 512, 256 */
-			int bases_to_try[] = {512, 0, 256, 480};
-			int j, found = 0;
+		/* Test if first pin is valid as-is */
+		test_desc = gpio_to_desc(parse_ctx.gpios[0].pin);
+		
+		if (!test_desc || IS_ERR(test_desc)) {
+			/* Pin is controller-relative, need to find chip base */
+			struct gpio_chip *chip;
+			bool found = false;
 			
-			for (j = 0; j < ARRAY_SIZE(bases_to_try); j++) {
-				unsigned int global_pin = bases_to_try[j] + parse_ctx.gpios[i].pin;
-				temp_desc = gpio_to_desc(global_pin);
-				if (temp_desc && !IS_ERR(temp_desc)) {
-					dev_info(dev, "DEBUG:SCK:   Pin %u -> global GPIO %u (base=%d)\n",
-					         parse_ctx.gpios[i].pin, global_pin, bases_to_try[j]);
-					parse_ctx.gpios[i].pin = global_pin;
-					found = 1;
-					break;
+			/* Find a valid GPIO chip by probing */
+			for (i = 0; i < 2048 && !found; i += 32) {
+				test_desc = gpio_to_desc(i);
+				if (test_desc && !IS_ERR(test_desc)) {
+					chip = gpiod_to_chip(test_desc);
+					if (chip && chip->base >= 0) {
+						/* Test if this chip owns our pins */
+						unsigned int test_global = chip->base + parse_ctx.gpios[0].pin;
+						if (test_global < chip->base + chip->ngpio) {
+							test_desc = gpio_to_desc(test_global);
+							if (test_desc && !IS_ERR(test_desc)) {
+								gpio_base = chip->base;
+								dev_info(dev, "Found GPIO chip: base=%d ngpio=%d label=%s\n",
+								         gpio_base, chip->ngpio,
+								         chip->label ? chip->label : "unknown");
+								found = true;
+							}
+						}
+					}
 				}
 			}
 			
 			if (!found) {
-				dev_err(dev, "Failed to find valid GPIO base for pin %u\n",
-				        parse_ctx.gpios[i].pin);
+				dev_err(dev, "Failed to find GPIO chip for controller pins\n");
 				return -ENODEV;
 			}
+		}
+		
+		/* Convert pins to global if needed */
+		if (gpio_base > 0) {
+			dev_info(dev, "Converting %d controller pins to global (base=%d)\n",
+			         parse_ctx.count, gpio_base);
+			for (i = 0; i < parse_ctx.count; i++) {
+				unsigned int old_pin = parse_ctx.gpios[i].pin;
+				parse_ctx.gpios[i].pin = gpio_base + old_pin;
+				dev_info(dev, "  Pin %u -> GPIO %u\n", old_pin, parse_ctx.gpios[i].pin);
+			}
 		} else {
-			dev_info(dev, "DEBUG:SCK:   Pin %u already valid (no base needed)\n",
-			         parse_ctx.gpios[i].pin);
+			dev_info(dev, "GPIO pins are already global numbers\n");
 		}
 	}
 
