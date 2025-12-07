@@ -1400,43 +1400,37 @@ static int pcie_hp_probe_gpios(struct platform_device *pdev,
 		         gpio_info->is_interrupt ? "GpioInt" : "GpioIo",
 		         gpio_info->is_output ? "Output" : "Input");
 
-		/* Convert pin number to descriptor */
-		desc = gpio_to_desc(gpio_info->pin);
-		if (!desc || IS_ERR(desc)) {
-			dev_err(dev, "Failed to convert pin %u to descriptor: %ld\n",
-			        gpio_info->pin, PTR_ERR(desc));
-			return PTR_ERR(desc) ?: -EINVAL;
-		}
-
-		/* Request ownership of the GPIO */
-		ret = devm_gpio_request(dev, gpio_info->pin, gpio_info->name);
+	/* Request ownership and configure GPIO direction */
+	if (gpio_info->is_output) {
+		/* Output GPIOs: PERST (high), EN (low) */
+		int init_val = (i == PCIE_PIN_PERST) ? 1 : 0;
+		unsigned long flags = init_val ? GPIOF_OUT_INIT_HIGH : GPIOF_OUT_INIT_LOW;
+		
+		ret = devm_gpio_request_one(dev, gpio_info->pin, flags, gpio_info->name);
 		if (ret) {
-			dev_err(dev, "Failed to request GPIO pin %u: %d\n",
+			dev_err(dev, "Failed to request GPIO pin %u as output: %d\n",
 			        gpio_info->pin, ret);
 			return ret;
 		}
-
-		/* Configure direction and initial value */
-		if (gpio_info->is_output) {
-			/* Output GPIOs: PERST (high), EN (low) */
-			int init_val = (i == PCIE_PIN_PERST) ? 1 : 0;
-			ret = gpio_direction_output(gpio_info->pin, init_val);
-			if (ret) {
-				dev_err(dev, "Failed to set GPIO %u as output: %d\n",
-				        gpio_info->pin, ret);
-				return ret;
-			}
-			dev_info(dev, "DEBUG:SCK:   → Configured as OUTPUT, init=%d\n", init_val);
-		} else {
-			/* Input GPIOs: BOOT, PRSNT, CLQ0, CLQ1 */
-			ret = gpio_direction_input(gpio_info->pin);
-			if (ret) {
-				dev_err(dev, "Failed to set GPIO %u as input: %d\n",
-				        gpio_info->pin, ret);
-				return ret;
-			}
-			dev_info(dev, "DEBUG:SCK:   → Configured as INPUT\n");
+		dev_info(dev, "DEBUG:SCK:   → Configured as OUTPUT, init=%d\n", init_val);
+	} else {
+		/* Input GPIOs: BOOT, PRSNT, CLQ0, CLQ1 */
+		ret = devm_gpio_request_one(dev, gpio_info->pin, GPIOF_IN, gpio_info->name);
+		if (ret) {
+			dev_err(dev, "Failed to request GPIO pin %u as input: %d\n",
+			        gpio_info->pin, ret);
+			return ret;
 		}
+		dev_info(dev, "DEBUG:SCK:   → Configured as INPUT\n");
+	}
+
+	/* Convert pin number to descriptor */
+	desc = gpio_to_desc(gpio_info->pin);
+	if (!desc || IS_ERR(desc)) {
+		dev_err(dev, "Failed to convert pin %u to descriptor: %ld\n",
+		        gpio_info->pin, PTR_ERR(desc));
+		return PTR_ERR(desc) ?: -EINVAL;
+	}
 
 		/* Store descriptor in context */
 		pin_ctx = &hp_dev->pins[i];
