@@ -41,6 +41,7 @@
 
 #include <linux/acpi.h>
 #include <linux/delay.h>
+#include <linux/device.h>
 #include <linux/gpio.h>
 #include <linux/gpio/driver.h>
 #include <linux/interrupt.h>
@@ -48,6 +49,7 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/pinctrl/consumer.h>
+#include <linux/platform_device.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/of.h>
@@ -444,6 +446,8 @@ static acpi_status pcie_hp_parse_acpi_resources(struct acpi_resource *ares, void
 static int pcie_hp_get_mmio_from_platform(struct pcie_hp_dev *dev)
 {
 	struct platform_device *pdev = dev->pdev;
+	struct device *mmio_dev;
+	struct platform_device *mmio_pdev = NULL;
 	struct resource *res;
 	void __iomem *base;
 	const char *name;
@@ -453,13 +457,23 @@ static int pcie_hp_get_mmio_from_platform(struct pcie_hp_dev *dev)
 	dev_info(&pdev->dev, "No MMIO in ACPI _CRS - trying platform device resources\n");
 	dev_info(&pdev->dev, "Hint: Load mtk-pcie-mmio-resources module first\n");
 	
-	/* Get MMIO resources from platform device (registered by mtk-pcie-mmio-resources) */
+	/* Find the MMIO platform device by name */
+	mmio_dev = bus_find_device_by_name(&platform_bus_type, NULL, "mtk-pcie-mmio-resources");
+	if (!mmio_dev) {
+		dev_err(&pdev->dev, "MMIO platform device 'mtk-pcie-mmio-resources' not found\n");
+		dev_err(&pdev->dev, "Hint: Load mtk-pcie-mmio-resources module first\n");
+		return -ENODEV;
+	}
+	mmio_pdev = to_platform_device(mmio_dev);
+	
+	/* Get MMIO resources from the MMIO platform device */
 	for (i = 0; i < 5; i++) {
-		res = platform_get_resource(pdev, IORESOURCE_MEM, i);
+		res = platform_get_resource(mmio_pdev, IORESOURCE_MEM, i);
 		if (!res) {
 			dev_err(&pdev->dev, "DEBUG:SCK: Platform resource %d NOT FOUND\n", i);
 			dev_err(&pdev->dev, "Platform MMIO resource %d not available\n", i);
 			dev_err(&pdev->dev, "Hint: Load mtk-pcie-mmio-resources module first\n");
+			put_device(&mmio_pdev->dev);
 			return -ENODEV;
 		}
 		
@@ -480,6 +494,7 @@ static int pcie_hp_get_mmio_from_platform(struct pcie_hp_dev *dev)
 		if (IS_ERR(base)) {
 			dev_err(&pdev->dev, "DEBUG:SCK: [Platform MMIO %d/5] %s mapping FAILED: %ld\n",
 				i+1, name, PTR_ERR(base));
+			put_device(&mmio_pdev->dev);
 			return PTR_ERR(base);
 		}
 		
@@ -497,6 +512,8 @@ static int pcie_hp_get_mmio_from_platform(struct pcie_hp_dev *dev)
 		case 4: dev->mmio.mac_port_base[1] = base; break;
 		}
 	}
+	
+	put_device(&mmio_pdev->dev);  /* Release reference from bus_find_device_by_name */
 	
 	dev_info(&pdev->dev, "DEBUG:SCK: Platform device fallback: All 5 MMIO regions mapped\n");
 	return 0;

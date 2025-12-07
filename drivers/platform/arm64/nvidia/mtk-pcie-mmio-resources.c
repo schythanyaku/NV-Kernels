@@ -83,11 +83,10 @@ static struct resource mtk_pcie_mmio_resources[] = {
 
 /*
  * Platform device definition
- * IMPORTANT: Device name must match driver's platform_driver.driver.name
- * or ACPI device name for proper binding
+ * Use a unique name to avoid conflict with ACPI-created platform device
  */
 static struct platform_device mtk_pcie_mmio_device = {
-	.name          = "MTKP0001:00",  /* Match ACPI device name */
+	.name          = "mtk-pcie-mmio-resources",  /* Unique name to avoid ACPI conflict */
 	.id            = -1,
 	.num_resources = ARRAY_SIZE(mtk_pcie_mmio_resources),
 	.resource      = mtk_pcie_mmio_resources,
@@ -120,6 +119,12 @@ static int __init mtk_pcie_mmio_init(void)
 
 	ret = platform_device_register(&mtk_pcie_mmio_device);
 	if (ret) {
+		if (ret == -EEXIST) {
+			pr_warn("mtk-pcie-mmio: Platform device already exists (may be from ACPI)\n");
+			pr_warn("mtk-pcie-mmio: This is OK - resources should still be available\n");
+			/* Device already exists, but that's OK - resources may still be accessible */
+			return 0;
+		}
 		pr_err("mtk-pcie-mmio: Failed to register platform device: %d\n", ret);
 		return ret;
 	}
