@@ -8,40 +8,24 @@
  * resources. It supports cable insertion/removal detection and device power
  * management.
  *
- * MMIO Resource Requirements (via ACPI _CRS):
+ * MMIO Resource Requirements (via platform_device resources):
  *   Resource 0: TOP region    - PCIe top-level control registers
  *   Resource 1: PROTECT region - Bus protection control registers  
  *   Resource 2: CKM region     - Clock management registers
- *   Resource 3: MAC region 0   - Per-port MAC control (port 0)
- *   Resource 4: MAC region 1   - Per-port MAC control (port 1)
+ *   Resource 3+: MAC regions   - Per-port MAC control registers
  *
- * Required ACPI _CRS definition in DSDT:
- *   Device (PEDE) {
- *       Name (_CRS, ResourceTemplate() {
- *           // GPIOs (6 total - see DSDT)
- *           GpioInt (...) { 102 }  // BOOT
- *           GpioInt (...) { 103 }  // PRSNT
- *           GpioIo  (...) { 94  }  // PERST
- *           GpioIo  (...) { 146 }  // EN
- *           GpioIo  (...) { 177 }  // CLQ0
- *           GpioIo  (...) { 178 }  // CLQ1
- *           
- *           // MMIO regions (5 total - firmware team must add these)
- *           Memory32Fixed(ReadWrite, 0x1D600000, 0x1000)  // TOP
- *           Memory32Fixed(ReadWrite, 0x1D640000, 0x1000)  // PROTECT
- *           Memory32Fixed(ReadWrite, 0x16BD0000, 0x1000)  // CKM
- *           Memory32Fixed(ReadWrite, 0x1D790000, 0x1000)  // MAC port 0
- *           Memory32Fixed(ReadWrite, 0x1D690000, 0x1000)  // MAC port 1
- *       })
- *   }
- *
- * Note: Driver parses GPIOs manually using acpi_walk_resources() to bypass
- * kernel 6.17 GPIO grouping regression. MMIO regions must be in DSDT.
+ * Example ACPI resource definition:
+ *   Name (_CRS, ResourceTemplate() {
+ *       Memory32Fixed(ReadWrite, 0x1d600000, 0x1000)  // TOP
+ *       Memory32Fixed(ReadWrite, 0x1d640000, 0x1000)  // PROTECT
+ *       Memory32Fixed(ReadWrite, 0x16bd0000, 0x1000)  // CKM
+ *       Memory32Fixed(ReadWrite, 0x1d790000, 0x1000)  // MAC port 0
+ *       Memory32Fixed(ReadWrite, 0x1d690000, 0x1000)  // MAC port 1
+ *   })
  */
 
 #include <linux/acpi.h>
 #include <linux/delay.h>
-#include <linux/device.h>
 #include <linux/gpio.h>
 #include <linux/gpio/driver.h>
 #include <linux/interrupt.h>
@@ -53,7 +37,6 @@
 #include <linux/pm_runtime.h>
 #include <linux/of.h>
 #include <linux/property.h>
-#include <linux/moduleparam.h>
 
 #define HP_PORT_MAX		8
 #define HP_POLL_CNT_MAX		200
@@ -214,7 +197,6 @@ struct pcie_hp_dev {
     int boot_pin;
     int prsnt_pin;
     enum pcie_hp_debug_val debug_state;
-    bool suppress_gpio_irq; /* Suppress GPIO IRQs during sysfs operations */
     spinlock_t lock; /* Protect state changes (IRQ-safe) */
     struct pci_dev *cached_root_ports[HP_PORT_MAX]; /* Cached root port pointers */
     struct pcie_hp_mmio_runtime mmio; /* Runtime mapped MMIO base addresses */
@@ -337,11 +319,6 @@ static void pcie_hp_bus_protect_enable(struct pcie_hp_dev *dev, int port_idx)
     struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
     u32 port_bit = mmio_info->protect.port_bits[port_idx];
     
-    if (!dev->mmio.protect_base) {
-        dev_warn(&dev->pdev->dev, "DEBUG:SCK: Bus protection enable skipped - protect_base not mapped\n");
-        return;
-    }
-    
     pcie_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.mode, port_bit, true);
     pcie_hp_reg_update_bits(dev->mmio.protect_base,
@@ -358,11 +335,6 @@ static void pcie_hp_bus_protect_disable(struct pcie_hp_dev *dev, int port_idx)
     struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
     u32 port_bit = mmio_info->protect.port_bits[port_idx];
     
-    if (!dev->mmio.protect_base) {
-        dev_warn(&dev->pdev->dev, "DEBUG:SCK: Bus protection disable skipped - protect_base not mapped\n");
-        return;
-    }
-    
     pcie_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.enable, port_bit, false);
     pcie_hp_reg_update_bits(dev->mmio.protect_base,
@@ -373,10 +345,8 @@ static void pcie_hp_ckm_control(struct pcie_hp_dev *dev, bool disable)
 {
     struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
     
-    if (!dev->mmio.ckm_base) {
-        dev_warn(&dev->pdev->dev, "DEBUG:SCK: CKM control skipped - ckm_base not mapped\n");
+    if (!dev->mmio.ckm_base)
         return;
-    }
     
     pcie_hp_reg_update_bits(dev->mmio.ckm_base, mmio_info->ckm.ctrl,
                              mmio_info->ckm.disable_bit, disable);
@@ -415,16 +385,11 @@ static acpi_status pcie_hp_parse_acpi_resources(struct acpi_resource *ares, void
 	switch (ares->type) {
 	case ACPI_RESOURCE_TYPE_FIXED_MEMORY32:
 		if (parsed->count >= 5) {
-			dev_warn(parsed->dev, "DEBUG:SCK: More than 5 MMIO regions in _CRS, ignoring extras\n");
 			dev_warn(parsed->dev, "More than 5 MMIO regions found, ignoring extras\n");
 			break;
 		}
 		/* Store the Memory32Fixed resource */
 		parsed->mmio_regions[parsed->count] = ares->data.fixed_memory32;
-		dev_info(parsed->dev, "DEBUG:SCK: ACPI _CRS: Found Memory32Fixed[%d]: addr=0x%08x, len=0x%08x\n",
-			parsed->count,
-			parsed->mmio_regions[parsed->count].address,
-			parsed->mmio_regions[parsed->count].address_length);
 		dev_dbg(parsed->dev, "Found MMIO[%d]: addr=0x%08x len=0x%08x\n",
 			parsed->count,
 			parsed->mmio_regions[parsed->count].address,
@@ -440,184 +405,46 @@ static acpi_status pcie_hp_parse_acpi_resources(struct acpi_resource *ares, void
 }
 
 /**
- * pcie_hp_get_mmio_hardcoded - Fallback: Map MMIO using hardcoded addresses
+ * pcie_hp_map_hardcoded_mmio - Map MMIO regions using hardcoded addresses
  * @dev: hotplug device
  *
- * This is a temporary workaround until firmware team provides custom DSDT.
- * Uses hardcoded MMIO addresses for MediaTek PCIe controller.
+ * TEMPORARY: Fallback function to map MMIO regions using hardcoded addresses
+ * when ACPI parsing fails or is unavailable.
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int pcie_hp_get_mmio_hardcoded(struct pcie_hp_dev *dev)
+static int pcie_hp_map_hardcoded_mmio(struct pcie_hp_dev *dev)
 {
 	struct platform_device *pdev = dev->pdev;
-	void __iomem *base;
-	
-	if (!dev || !pdev) {
-		pr_err("mtk-pcie-hotplug: Invalid device pointer in hardcoded MMIO fallback\n");
-		return -EINVAL;
-	}
-	
-	dev_warn(&pdev->dev, "No MMIO in ACPI _CRS - using hardcoded fallback addresses\n");
-	dev_info(&pdev->dev, "DEBUG:SCK: Using hardcoded MMIO addresses\n");
-	
-	/* Hardcoded MMIO addresses for MediaTek PCIe controller */
-	base = devm_ioremap(&pdev->dev, 0x1D600000, 0x1000);
-	if (!base) {
-		dev_err(&pdev->dev, "Failed to map TOP region (0x1D600000)\n");
-		return -ENOMEM;
-	}
-	dev->mmio.top_base = base;
-	dev_info(&pdev->dev, "Mapped TOP: 0x1D600000 -> %p\n", base);
-	
-	base = devm_ioremap(&pdev->dev, 0x1D640000, 0x1000);
-	if (!base) {
-		dev_err(&pdev->dev, "Failed to map PROTECT region (0x1D640000)\n");
-		return -ENOMEM;
-	}
-	dev->mmio.protect_base = base;
-	dev_info(&pdev->dev, "Mapped PROTECT: 0x1D640000 -> %p\n", base);
-	
-	base = devm_ioremap(&pdev->dev, 0x16BD0000, 0x1000);
-	if (!base) {
-		dev_err(&pdev->dev, "Failed to map CKM region (0x16BD0000)\n");
-		return -ENOMEM;
-	}
-	dev->mmio.ckm_base = base;
-	dev_info(&pdev->dev, "Mapped CKM: 0x16BD0000 -> %p\n", base);
-	
-	base = devm_ioremap(&pdev->dev, 0x1D790000, 0x1000);
-	if (!base) {
-		dev_err(&pdev->dev, "Failed to map MAC Port 0 region (0x1D790000)\n");
-		return -ENOMEM;
-	}
-	dev->mmio.mac_port_base[0] = base;
-	dev_info(&pdev->dev, "Mapped MAC Port 0: 0x1D790000 -> %p\n", base);
-	
-	base = devm_ioremap(&pdev->dev, 0x1D690000, 0x1000);
-	if (!base) {
-		dev_err(&pdev->dev, "Failed to map MAC Port 1 region (0x1D690000)\n");
-		return -ENOMEM;
-	}
-	dev->mmio.mac_port_base[1] = base;
-	dev_info(&pdev->dev, "Mapped MAC Port 1: 0x1D690000 -> %p\n", base);
-	
-	dev_info(&pdev->dev, "DEBUG:SCK: Hardcoded fallback: All 5 MMIO regions mapped\n");
-	return 0;
-}
-
-/**
- * pcie_hp_map_resources - Map all MMIO regions from ACPI _CRS
- * @dev: hotplug device
- *
- * Uses acpi_walk_resources() to parse Memory32Fixed entries in ACPI _CRS,
- * then maps each region using devm_ioremap(). This is the upstream-friendly
- * method for ARM64 ACPI platforms where platform_get_resource() may not work.
- *
- * Falls back to hardcoded platform addresses if ACPI doesn't provide MMIO.
- *
- * Expected MMIO order in _CRS:
- *   0: TOP region (PCIe control)
- *   1: PROTECT region (bus protection)
- *   2: CKM region (clock management)
- *   3: MAC Port 0 (per-port MAC)
- *   4: MAC Port 1 (per-port MAC)
- *
- * Returns: 0 on success, negative error code on failure
- */
-static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
-{
-    struct platform_device *pdev = dev->pdev;
-	struct acpi_device *adev;
-	struct pcie_hp_acpi_mmio parsed = { .count = 0, .dev = &pdev->dev };
-	acpi_status status;
-	int ret, i;
-
-	pr_info("mtk-pcie-hotplug: ========================================\n");
-	pr_info("mtk-pcie-hotplug: MMIO RESOURCE MAPPING START\n");
-	pr_info("mtk-pcie-hotplug: Device: %s\n", dev_name(&pdev->dev));
-	dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-	dev_info(&pdev->dev, "DEBUG:SCK: Starting MMIO Resource Mapping\n");
-	dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-	dev_info(&pdev->dev, "Parsing MMIO regions from ACPI _CRS\n");
-
-	/* Get ACPI companion device */
-	dev_info(&pdev->dev, "DEBUG:SCK: Getting ACPI companion device...\n");
-	adev = ACPI_COMPANION(&pdev->dev);
-	if (!adev) {
-		dev_err(&pdev->dev, "DEBUG:SCK: ACPI companion device NOT FOUND\n");
-		dev_err(&pdev->dev, "No ACPI companion device found\n");
-		return -ENODEV;
-	}
-	dev_info(&pdev->dev, "DEBUG:SCK: ACPI companion OK - %s\n", acpi_device_hid(adev));
-
-	/* Walk through ACPI _CRS resources to find Memory32Fixed entries */
-	dev_info(&pdev->dev, "DEBUG:SCK: Walking ACPI _CRS resources...\n");
-	status = acpi_walk_resources(adev->handle, METHOD_NAME__CRS,
-				      pcie_hp_parse_acpi_resources, &parsed);
-	if (ACPI_FAILURE(status)) {
-		dev_err(&pdev->dev, "DEBUG:SCK: acpi_walk_resources() FAILED: %s\n",
-			acpi_format_exception(status));
-		dev_err(&pdev->dev, "Failed to walk ACPI resources: %s\n",
-			acpi_format_exception(status));
-		return -ENODEV;
-	}
-	dev_info(&pdev->dev, "DEBUG:SCK: ACPI walk completed - found %d MMIO regions\n", parsed.count);
-
-	/* Verify we found all required MMIO regions from ACPI */
-	dev_info(&pdev->dev, "DEBUG:SCK: MMIO count check: found=%d, expected=5\n", parsed.count);
-	if (parsed.count != 5) {
-		dev_warn(&pdev->dev, "DEBUG:SCK: ========================================\n");
-		dev_warn(&pdev->dev, "DEBUG:SCK: INSUFFICIENT MMIO regions from ACPI\n");
-		dev_warn(&pdev->dev, "DEBUG:SCK: Expected 5 MMIO regions, found %d\n", parsed.count);
-		dev_warn(&pdev->dev, "DEBUG:SCK: Falling back to hardcoded MMIO addresses...\n");
-		dev_warn(&pdev->dev, "DEBUG:SCK: ========================================\n");
-		
-		/* Fallback to hardcoded MMIO addresses */
-		ret = pcie_hp_get_mmio_hardcoded(dev);
-		if (ret) {
-			dev_err(&pdev->dev, "DEBUG:SCK: Hardcoded MMIO fallback also failed: %d\n", ret);
-		} else {
-			dev_info(&pdev->dev, "DEBUG:SCK: Hardcoded MMIO fallback SUCCESS\n");
-		}
-		return ret;
-	}
-
-	dev_info(&pdev->dev, "Found %d MMIO regions in _CRS, mapping...\n", parsed.count);
-
-	/* Map each MMIO region using the addresses from ACPI */
-	dev_info(&pdev->dev, "DEBUG:SCK: Mapping %d MMIO regions...\n", parsed.count);
-	for (i = 0; i < parsed.count; i++) {
-		void __iomem *base;
-		u32 addr = parsed.mmio_regions[i].address;
-		u32 size = parsed.mmio_regions[i].address_length;
+	struct {
+		u32 addr;
+		u32 size;
 		const char *name;
+	} hardcoded_mmio[] = {
+		{ 0x1d600000, 0x1000, "TOP" },
+		{ 0x1d640000, 0x1000, "PROTECT" },
+		{ 0x16bd0000, 0x1000, "CKM" },
+		{ 0x1d790000, 0x1000, "MAC Port 0" },
+		{ 0x1d690000, 0x1000, "MAC Port 1" },
+	};
+	int i;
 
-		/* Determine region name based on index */
-		switch (i) {
-		case 0: name = "TOP"; break;
-		case 1: name = "PROTECT"; break;
-		case 2: name = "CKM"; break;
-		case 3: name = "MAC Port 0"; break;
-		case 4: name = "MAC Port 1"; break;
-		default: name = "Unknown"; break;
-    }
+	dev_warn(&pdev->dev, "Using hardcoded MMIO addresses (TEMPORARY FOR TESTING)\n");
+	dev_info(&pdev->dev, "Mapping MMIO regions using hardcoded addresses...\n");
 
-		dev_info(&pdev->dev, "DEBUG:SCK: [MMIO %d/%d] Mapping %s: addr=0x%08x, size=0x%x\n",
-			 i+1, parsed.count, name, addr, size);
+	for (i = 0; i < 5; i++) {
+		void __iomem *base;
 
-		/* Map the region (devm handles cleanup automatically) */
-		base = devm_ioremap(&pdev->dev, addr, size);
+		base = devm_ioremap(&pdev->dev, hardcoded_mmio[i].addr, hardcoded_mmio[i].size);
 		if (!base) {
-			dev_err(&pdev->dev, "DEBUG:SCK: [MMIO %d/%d] %s mapping FAILED\n", i+1, parsed.count, name);
-			dev_err(&pdev->dev, "Failed to map %s region (0x%08x)\n", name, addr);
+			dev_err(&pdev->dev, "Failed to map %s region (0x%08x)\n",
+				hardcoded_mmio[i].name, hardcoded_mmio[i].addr);
 			return -ENOMEM;
 		}
 
 		dev_info(&pdev->dev, "Mapped %s: 0x%08x (size 0x%x) -> %p\n",
-			 name, addr, size, base);
-		dev_info(&pdev->dev, "DEBUG:SCK: [MMIO %d/%d] %s SUCCESS -> virtual addr %p\n",
-			 i+1, parsed.count, name, base);
+			 hardcoded_mmio[i].name, hardcoded_mmio[i].addr,
+			 hardcoded_mmio[i].size, base);
 
 		/* Store the mapped address in the runtime structure */
 		switch (i) {
@@ -641,27 +468,136 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 		}
 	}
 
-	dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-	dev_info(&pdev->dev, "DEBUG:SCK: ACPI MMIO Mapping Complete\n");
-	dev_info(&pdev->dev, "DEBUG:SCK:   Source: ACPI _CRS (firmware-provided)\n");
-	dev_info(&pdev->dev, "DEBUG:SCK:   TOP:        %p (0x%08x)\n", dev->mmio.top_base, 
-	         parsed.mmio_regions[0].address);
-	dev_info(&pdev->dev, "DEBUG:SCK:   PROTECT:    %p (0x%08x)\n", dev->mmio.protect_base,
-	         parsed.mmio_regions[1].address);
-	dev_info(&pdev->dev, "DEBUG:SCK:   CKM:        %p (0x%08x)\n", dev->mmio.ckm_base,
-	         parsed.mmio_regions[2].address);
-	dev_info(&pdev->dev, "DEBUG:SCK:   MAC Port 0: %p (0x%08x)\n", dev->mmio.mac_port_base[0],
-	         parsed.mmio_regions[3].address);
-	dev_info(&pdev->dev, "DEBUG:SCK:   MAC Port 1: %p (0x%08x)\n", dev->mmio.mac_port_base[1],
-	         parsed.mmio_regions[4].address);
-	dev_info(&pdev->dev, "DEBUG:SCK: All %d MMIO regions mapped successfully!\n", parsed.count);
-	dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
+	dev_info(&pdev->dev, "Successfully mapped all MMIO regions using hardcoded addresses\n");
+	return 0;
+}
+
+/**
+ * pcie_hp_map_resources - Map all MMIO regions from ACPI _CRS
+ * @dev: hotplug device
+ *
+ * Uses acpi_walk_resources() to parse Memory32Fixed entries in ACPI _CRS,
+ * then maps each region using devm_ioremap(). This is the upstream-friendly
+ * method for ARM64 ACPI platforms where platform_get_resource() may not work.
+ *
+ * Expected MMIO order in _CRS:
+ *   0: TOP region (PCIe control)
+ *   1: PROTECT region (bus protection)
+ *   2: CKM region (clock management)
+ *   3: MAC Port 0 (per-port MAC)
+ *   4: MAC Port 1 (per-port MAC)
+ *
+ * Falls back to hardcoded addresses if ACPI is unavailable or parsing fails.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
+{
+	struct rp_bus_mmio_info *mmio = &dev->pd->rp_bus_mmio;
+	struct platform_device *pdev = dev->pdev;
+	struct acpi_device *adev;
+	struct pcie_hp_acpi_mmio parsed = { .count = 0, .dev = &pdev->dev };
+	acpi_status status;
+	int i;
+
+	dev_info(&pdev->dev, "Parsing MMIO regions from ACPI _CRS\n");
+
+	/* Get ACPI companion device */
+	adev = ACPI_COMPANION(&pdev->dev);
+	if (!adev) {
+		dev_warn(&pdev->dev, "No ACPI companion device found, falling back to hardcoded addresses\n");
+		return pcie_hp_map_hardcoded_mmio(dev);
+	}
+
+	/* Walk through ACPI _CRS resources to find Memory32Fixed entries */
+	status = acpi_walk_resources(adev->handle, METHOD_NAME__CRS,
+				      pcie_hp_parse_acpi_resources, &parsed);
+	if (ACPI_FAILURE(status)) {
+		dev_warn(&pdev->dev, "Failed to walk ACPI resources: %s, falling back to hardcoded addresses\n",
+			 acpi_format_exception(status));
+		return pcie_hp_map_hardcoded_mmio(dev);
+	}
+
+	/* Verify we found all required MMIO regions */
+	if (parsed.count < 5) {
+		dev_warn(&pdev->dev, "Expected 5 MMIO regions, found %d, falling back to hardcoded addresses\n",
+			 parsed.count);
+		return pcie_hp_map_hardcoded_mmio(dev);
+	}
+
+	dev_info(&pdev->dev, "Found %d MMIO regions in _CRS, mapping...\n", parsed.count);
+
+	/* Map each MMIO region using the addresses from ACPI */
+	for (i = 0; i < parsed.count; i++) {
+		void __iomem *base;
+		u32 addr = parsed.mmio_regions[i].address;
+		u32 size = parsed.mmio_regions[i].address_length;
+		const char *name;
+
+		/* Determine region name based on index */
+		switch (i) {
+		case 0: name = "TOP"; break;
+		case 1: name = "PROTECT"; break;
+		case 2: name = "CKM"; break;
+		case 3: name = "MAC Port 0"; break;
+		case 4: name = "MAC Port 1"; break;
+		default: name = "Unknown"; break;
+		}
+
+		/* Map the region (devm handles cleanup automatically) */
+		base = devm_ioremap(&pdev->dev, addr, size);
+		if (!base) {
+			dev_err(&pdev->dev, "Failed to map %s region (0x%08x)\n", name, addr);
+			return -ENOMEM;
+		}
+
+		dev_info(&pdev->dev, "Mapped %s: 0x%08x (size 0x%x) -> %p\n",
+			 name, addr, size, base);
+
+		/* Store the mapped address in the runtime structure */
+		switch (i) {
+		case 0:
+			dev->mmio.top_base = base;
+			break;
+		case 1:
+			dev->mmio.protect_base = base;
+			break;
+		case 2:
+			dev->mmio.ckm_base = base;
+			break;
+		case 3:
+			if (dev->pd->port_nums > 0)
+				dev->mmio.mac_port_base[0] = base;
+			break;
+		case 4:
+			if (dev->pd->port_nums > 1)
+				dev->mmio.mac_port_base[1] = base;
+			break;
+		}
+	}
+
 	dev_info(&pdev->dev, "Successfully mapped all MMIO regions from ACPI _CRS\n");
-    return 0;
+	return 0;
 }
  
 static void mt8901_rp_bus_protect(struct pcie_hp_dev *dev, int port_idx, int stage)
 {
+    if (stage == BUS_PROTECT_INIT) {
+        /* Initialize bus protection during probe - map MMIO regions (like 6.14's rp_bus_prepare) */
+        int ret;
+        
+        /* Map MMIO regions if not already mapped */
+        if (!dev->mmio.top_base) {
+            ret = pcie_hp_map_resources(dev);
+            if (ret) {
+                dev_err(&dev->pdev->dev, "Failed to map MMIO resources during bus init: %d\n", ret);
+                return;
+            }
+        }
+        
+        return;
+    }
+
     struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
     void __iomem *mac_base;
 
@@ -672,11 +608,6 @@ static void mt8901_rp_bus_protect(struct pcie_hp_dev *dev, int port_idx, int sta
     if (!mac_base)
         return;
 
-    if (stage == BUS_PROTECT_INIT) {
-        /* Initialize bus protection during probe - nothing to do */
-        return;
-    }
-
     if (stage == BUS_PROTECT_CABLE_REMOVAL) {
         /* Deassert LTSSM enable and PHY reset */
         pcie_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
@@ -686,11 +617,8 @@ static void mt8901_rp_bus_protect(struct pcie_hp_dev *dev, int port_idx, int sta
     }
 
     if (stage == BUS_PROTECT_CABLE_PLUGIN) {
-        if (!dev->mmio.top_base || !dev->mmio.protect_base) {
-            dev_warn(&dev->pdev->dev, "DEBUG:SCK: Bus protection skipped - MMIO not mapped (top_base=%p protect_base=%p)\n",
-                     dev->mmio.top_base, dev->mmio.protect_base);
+        if (!dev->mmio.top_base || !dev->mmio.protect_base)
             return;
-        }
 
         /* Deassert way_en */
         pcie_hp_toggle_update_bit(dev->mmio.top_base, mmio_info->top.ctrl,
@@ -777,44 +705,23 @@ static void remove_device(struct pcie_hp_dev *dev)
 {
     int i;
 
-    if (!dev || !dev->pdev) {
-        pr_warn("mtk-pcie-hotplug: remove_device() - dev or pdev is NULL, skipping\n");
-        return;
-    }
-
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: remove_device() START\n");
-
     /* Apply bus protection before removal */
     if (dev->pd->rp_bus_protect) {
-        dev_info(&dev->pdev->dev, "DEBUG:SCK: Applying bus protection for removal...\n");
-        for (i = 0; i < dev->pd->port_nums; i++) {
-            dev_info(&dev->pdev->dev, "DEBUG:SCK: Bus protect port %d\n", i);
+        for (i = 0; i < dev->pd->port_nums; i++)
             dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_REMOVAL);
-        }
     }
 
     /* Deassert PCIe reset */
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: Deasserting PERST (set to 0)\n");
-    if (dev->pins[PCIE_PIN_PERST].desc)
-        gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 0);
-    else
-        dev_warn(&dev->pdev->dev, "PERST GPIO not available\n");
+    gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 0);
 
     /* Change pinctrl state */
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: Changing pinctrl state to 'default'\n");
     pcie_hp_change_state(dev, "default");
 
     /* Disable clock */
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: Disabling clock (CKM control)\n");
     pcie_hp_ckm_control(dev, true);
 
     /* Power off device */
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: Powering off device (EN GPIO = 0)\n");
-    if (dev->pins[PCIE_PIN_EN].desc)
-        gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
-    else
-        dev_warn(&dev->pdev->dev, "EN GPIO not available\n");
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: remove_device() COMPLETE\n");
+    gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
 }
 
 static int polling_link_to_l0(struct pcie_hp_dev *dev)
@@ -869,164 +776,94 @@ static int rescan_device(struct pcie_hp_dev *dev)
     struct pci_dev *pci_dev;
     int i, err;
 
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: rescan_device() START\n");
-
     /* Change pinctrl state */
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: Changing pinctrl state to 'clkreqn'\n");
     err = pcie_hp_change_state(dev, "clkreqn");
-    if (err) {
-        dev_err(&dev->pdev->dev, "DEBUG:SCK: pcie_hp_change_state() FAILED: %d\n", err);
+    if (err)
         return err;
-    }
 
     /* Enable clock */
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: Enabling clock (CKM control)\n");
     pcie_hp_ckm_control(dev, false);
     usleep_range(PCIE_HP_DELAY_STANDARD_US, PCIE_HP_DELAY_STANDARD_US + 1000);
 
     /* Resume root ports */
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: Resuming root ports...\n");
     for (i = 0; i < dev->pd->port_nums; i++) {
         pci_dev = get_port_root_port(dev, i);
-        if (!pci_dev) {
-            dev_info(&dev->pdev->dev, "DEBUG:SCK: Port %d: No root port found\n", i);
+        if (!pci_dev)
             continue;
-        }
 
-        dev_info(&dev->pdev->dev, "DEBUG:SCK: Port %d: Resuming %s\n", i, pci_name(pci_dev));
         err = pm_runtime_resume_and_get(&pci_dev->dev);
         if (err < 0) {
             dev_err(&dev->pdev->dev,
-                    "DEBUG:SCK: Port %d: Runtime resume FAILED: %d\n", i, err);
-            dev_err(&dev->pdev->dev,
                     "Runtime resume failed for %s: %d\n",
                     pci_name(pci_dev), err);
-        } else {
-            dev_info(&dev->pdev->dev, "DEBUG:SCK: Port %d: Runtime resume OK\n", i);
         }
     }
 
     /* Assert PCIe reset */
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: Asserting PERST (set to 1)\n");
-    if (dev->pins[PCIE_PIN_PERST].desc)
-        gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
-    else
-        dev_warn(&dev->pdev->dev, "PERST GPIO not available\n");
+    gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
 
     /* Apply bus protection */
     if (dev->pd->rp_bus_protect) {
-        dev_info(&dev->pdev->dev, "DEBUG:SCK: Applying bus protection for plug-in...\n");
-        for (i = 0; i < dev->pd->port_nums; i++) {
-            dev_info(&dev->pdev->dev, "DEBUG:SCK: Bus protect port %d\n", i);
+        for (i = 0; i < dev->pd->port_nums; i++)
             dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
-        }
     }
 
     /* Wait for links to reach L0 */
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: Polling for links to reach L0 state...\n");
     err = polling_link_to_l0(dev);
-    if (err) {
-        dev_err(&dev->pdev->dev, "DEBUG:SCK: polling_link_to_l0() FAILED: %d\n", err);
+    if (err)
         return err;
-    }
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: All links reached L0 state\n");
 
     /* Retrain PCIe links */
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: Retraining PCIe links...\n");
     for (i = 0; i < dev->pd->port_nums; i++) {
         pci_dev = get_port_root_port(dev, i);
-        if (pci_dev) {
-            dev_info(&dev->pdev->dev, "DEBUG:SCK: Port %d: Retraining %s\n", i, pci_name(pci_dev));
+        if (pci_dev)
             retrain_pcie_link(pci_dev);
-        }
     }
 
     /* Wait for link stability */
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: Waiting %d ms for link stability...\n", PCIE_HP_DELAY_LINK_STABLE_MS);
     msleep(PCIE_HP_DELAY_LINK_STABLE_MS);
 
-    dev_info(&dev->pdev->dev, "DEBUG:SCK: rescan_device() COMPLETE (success)\n");
     return 0;
 }
  
 static irqreturn_t pcie_hp_work(int irq, void *dev_id)
 {
     struct pcie_hp_gpio_ctx *app_ctx = dev_id;
-    struct pcie_hp_dev *hp_dev;
+    struct pcie_hp_dev *hp_dev = app_ctx->hp_dev;
     enum pcie_hp_state state;
     unsigned long flags;
     int ret;
 
-    if (!app_ctx) {
-        pr_warn("mtk-pcie-hotplug: pcie_hp_work() - app_ctx is NULL, ignoring IRQ %d\n", irq);
-        return IRQ_HANDLED;
-    }
-
-    hp_dev = app_ctx->hp_dev;
-    if (!hp_dev) {
-        pr_warn("mtk-pcie-hotplug: pcie_hp_work() - hp_dev is NULL, ignoring IRQ %d\n", irq);
-        return IRQ_HANDLED;
-    }
-
-    if (!app_ctx->ctx || !app_ctx->ctx->dev) {
-        pr_warn("mtk-pcie-hotplug: pcie_hp_work() - ctx is NULL, ignoring IRQ %d\n", irq);
-        return IRQ_HANDLED;
-    }
-
     spin_lock_irqsave(&hp_dev->lock, flags);
     state = hp_dev->state;
 
-    dev_info(app_ctx->ctx->dev, "DEBUG:SCK: pcie_hp_work() IRQ handler - current state=%d\n", state);
-
     switch (state) {
     case STATE_PLUG_OUT:
-        dev_info(app_ctx->ctx->dev, "DEBUG:SCK: pcie_hp_work() - STATE_PLUG_OUT\n");
         dev_dbg(app_ctx->ctx->dev, "Cable plug out\n");
         remove_device(hp_dev);
         break;
     case STATE_PLUG_IN:
-        dev_info(app_ctx->ctx->dev, "DEBUG:SCK: pcie_hp_work() - STATE_PLUG_IN\n");
         dev_dbg(app_ctx->ctx->dev, "Enable device power\n");
-        dev_info(app_ctx->ctx->dev, "DEBUG:SCK: Setting EN GPIO = 1\n");
-        if (hp_dev->pins[PCIE_PIN_EN].desc)
-            gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
-        else
-            dev_warn(app_ctx->ctx->dev, "EN GPIO not available, cannot power on device\n");
-        dev_info(app_ctx->ctx->dev, "DEBUG:SCK: EN GPIO set, device powering on\n");
+        gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
         break;
     case STATE_DEV_POWER_OFF:
-        dev_info(app_ctx->ctx->dev, "DEBUG:SCK: pcie_hp_work() - STATE_DEV_POWER_OFF\n");
-        dev_dbg(app_ctx->ctx->dev, "Waiting for device to be ready\n");
-        break;
     case STATE_DEV_POWER_ON:
-        dev_info(app_ctx->ctx->dev, "DEBUG:SCK: pcie_hp_work() - STATE_DEV_POWER_ON\n");
-        dev_dbg(app_ctx->ctx->dev, "Waiting for device to be ready\n");
-        break;
     case STATE_DEV_FW_START:
-        dev_info(app_ctx->ctx->dev, "DEBUG:SCK: pcie_hp_work() - STATE_DEV_FW_START\n");
         dev_dbg(app_ctx->ctx->dev, "Waiting for device to be ready\n");
         break;
     case STATE_RESCAN:
-        dev_info(app_ctx->ctx->dev, "DEBUG:SCK: pcie_hp_work() - STATE_RESCAN\n");
         dev_dbg(app_ctx->ctx->dev, "Cable plug in, rescanning\n");
-        dev_info(app_ctx->ctx->dev, "DEBUG:SCK: Calling rescan_device()...\n");
         ret = rescan_device(hp_dev);
-        if (ret) {
-            dev_err(app_ctx->ctx->dev, "DEBUG:SCK: rescan_device() FAILED: %d\n", ret);
+        if (ret)
             dev_err(app_ctx->ctx->dev, "Rescan failed: %d\n", ret);
-        } else {
-            dev_info(app_ctx->ctx->dev, "DEBUG:SCK: rescan_device() SUCCESS\n");
+        else
             hp_dev->state = STATE_READY;
-            dev_info(app_ctx->ctx->dev, "DEBUG:SCK: State changed to STATE_READY\n");
-        }
         break;
     default:
-        dev_err(app_ctx->ctx->dev, "DEBUG:SCK: pcie_hp_work() - UNKNOWN STATE: %d\n", state);
         dev_err(app_ctx->ctx->dev, "Unknown state: %d\n", state);
         break;
     }
 
-    dev_info(app_ctx->ctx->dev, "DEBUG:SCK: pcie_hp_work() COMPLETE\n");
     spin_unlock_irqrestore(&hp_dev->lock, flags);
     return IRQ_HANDLED;
 }
@@ -1034,60 +871,23 @@ static irqreturn_t pcie_hp_work(int irq, void *dev_id)
 static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
 {
     struct pcie_hp_gpio_ctx *app_ctx = dev_id;
-    struct pcie_hp_dev *hp_dev;
-    struct gpio_acpi_context *gpio_ctx;
+    struct pcie_hp_dev *hp_dev = app_ctx->hp_dev;
+    struct gpio_acpi_context *gpio_ctx = app_ctx->ctx;
     unsigned long flags;
     int value;
     enum pcie_hp_state state;
 
-    if (!app_ctx) {
-        pr_warn("mtk-pcie-hotplug: hotplug_irq_handler() - app_ctx is NULL, ignoring IRQ %d\n", irq);
-        return IRQ_HANDLED;
-    }
-
-    if (!app_ctx->desc) {
-        pr_warn("mtk-pcie-hotplug: hotplug_irq_handler() - GPIO descriptor is NULL, ignoring IRQ %d\n", irq);
-        return IRQ_HANDLED;
-    }
-
-    hp_dev = app_ctx->hp_dev;
-    if (!hp_dev) {
-        pr_warn("mtk-pcie-hotplug: hotplug_irq_handler() - hp_dev is NULL, ignoring IRQ %d\n", irq);
-        return IRQ_HANDLED;
-    }
-
-    gpio_ctx = app_ctx->ctx;
-    if (!gpio_ctx || !gpio_ctx->dev) {
-        pr_warn("mtk-pcie-hotplug: hotplug_irq_handler() - gpio_ctx is NULL, ignoring IRQ %d\n", irq);
-        return IRQ_HANDLED;
-    }
-
     value = gpiod_get_value(app_ctx->desc);
-    dev_info(gpio_ctx->dev, "DEBUG:SCK: hotplug_irq_handler() - IRQ %d fired, pin=%d, value=%d\n",
-             irq, gpio_ctx->pin, value);
 
     spin_lock_irqsave(&hp_dev->lock, flags);
-
-    /* Ignore GPIO events during sysfs operations to prevent conflicts */
-    if (hp_dev->suppress_gpio_irq) {
-        dev_info(gpio_ctx->dev, "DEBUG:SCK: IRQ suppressed (sysfs operation active)\n");
-        dev_dbg(gpio_ctx->dev, "IRQ ignored: GPIO suppression active (pin=%d, irq=%d)\n",
-                gpio_ctx->pin, irq);
-        spin_unlock_irqrestore(&hp_dev->lock, flags);
-        return IRQ_HANDLED;
-    }
     state = hp_dev->state;
-    dev_info(gpio_ctx->dev, "DEBUG:SCK: Current state=%d\n", state);
 
-    /* Handle presence pin events */
+    /* Handle presence pin events (compare hardware pin numbers - robust against order changes) */
     if (gpio_ctx->pin == hp_dev->prsnt_pin) {
-        dev_info(gpio_ctx->dev, "DEBUG:SCK: PRSNT pin IRQ - value=%d\n", value);
         if (value) {
-            dev_info(gpio_ctx->dev, "DEBUG:SCK: Cable REMOVAL detected\n");
             dev_dbg(gpio_ctx->dev, "Presence pin: cable removal detected\n");
             pcie_hp_send_uevent(hp_dev, REMOVAL_EVT);
         } else {
-            dev_info(gpio_ctx->dev, "DEBUG:SCK: Cable PLUG-IN detected\n");
             dev_dbg(gpio_ctx->dev, "Presence pin: cable plug-in detected\n");
             pcie_hp_send_uevent(hp_dev, PLUG_IN_EVT);
         }
@@ -1097,47 +897,37 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
         return IRQ_HANDLED;
     }
 
-    /* Handle boot status pin events */
+    /* Handle boot status pin events (compare hardware pin numbers - robust against order changes) */
     if (gpio_ctx->pin == hp_dev->boot_pin) {
-        dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT pin IRQ - value=%d, state=%d\n", value, state);
         if (value && state == STATE_PLUG_IN) {
-            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT high + STATE_PLUG_IN -> STATE_DEV_POWER_ON\n");
             dev_dbg(gpio_ctx->dev, "Boot pin high: device powered on\n");
             hp_dev->state = STATE_DEV_POWER_ON;
         } else if (value && state == STATE_DEV_FW_START) {
-            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT high + STATE_DEV_FW_START -> STATE_RESCAN (device ready!)\n");
             dev_dbg(gpio_ctx->dev, "Boot pin high: device ready\n");
             hp_dev->state = STATE_RESCAN;
         } else if (!value && state == STATE_DEV_POWER_ON) {
-            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT low + STATE_DEV_POWER_ON -> STATE_DEV_FW_START\n");
             dev_dbg(gpio_ctx->dev, "Boot pin low: firmware starting\n");
             hp_dev->state = STATE_DEV_FW_START;
         } else if (!value && state == STATE_PLUG_OUT) {
-            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT low + STATE_PLUG_OUT -> STATE_DEV_POWER_OFF\n");
             dev_dbg(gpio_ctx->dev, "Boot pin low: device powered off\n");
             hp_dev->state = STATE_DEV_POWER_OFF;
         } else {
-            dev_info(gpio_ctx->dev, "DEBUG:SCK: BOOT pin event ignored - value=%d state=%d (no transition)\n",
-                     value, state);
             dev_dbg(gpio_ctx->dev, "Boot pin changed: pin=%d irq=%d value=%d state=%d\n",
                     gpio_ctx->pin, irq, value, state);
             spin_unlock_irqrestore(&hp_dev->lock, flags);
             return IRQ_HANDLED;
         }
-        dev_info(gpio_ctx->dev, "DEBUG:SCK: State transition complete, waking threaded handler\n");
         spin_unlock_irqrestore(&hp_dev->lock, flags);
         return IRQ_WAKE_THREAD;
     }
 
     /* Unknown GPIO pin */
-    dev_warn(gpio_ctx->dev, "DEBUG:SCK: UNKNOWN GPIO pin IRQ - pin=%d, irq=%d, value=%d\n",
-             gpio_ctx->pin, irq, value);
     dev_warn(gpio_ctx->dev, "Unknown GPIO pin event: pin=%d irq=%d value=%d\n",
              gpio_ctx->pin, irq, value);
     spin_unlock_irqrestore(&hp_dev->lock, flags);
     return IRQ_HANDLED;
 }
-
+ 
 static acpi_status acpi_gpio_resource_handler(struct acpi_resource *ares, void *context)
 {
     struct acpi_gpio_parse_context *parse_ctx = context;
@@ -1161,13 +951,13 @@ static acpi_status acpi_gpio_resource_handler(struct acpi_resource *ares, void *
     ctx->polarity = agpio->polarity;
     ctx->connection_type = agpio->connection_type;
 
-    if (agpio->vendor_length) {
+    /* Store vendor data and identify BOOT/PRSNT pins (upstream-friendly) */
+    if (agpio->vendor_length && agpio->vendor_data && hp_dev) {
         length = min_t(int, agpio->vendor_length, MAX_VENDOR_DATA_LEN);
-
         memcpy(&ctx->vendor_data[0], agpio->vendor_data, length);
-        ctx->vendor_data[MAX_VENDOR_DATA_LEN] = 0;
+        ctx->vendor_data[length] = '\0';
 
-        /* Identify special GPIO pins by vendor data */
+        /* Identify BOOT and PRSNT pins by vendor data and store hardware pin numbers */
         if (!strncmp("BOOT", ctx->vendor_data, strlen("BOOT")))
             hp_dev->boot_pin = ctx->pin;
         else if (!strncmp("PRSNT", ctx->vendor_data, strlen("PRSNT")))
@@ -1249,85 +1039,44 @@ static ssize_t debug_state_store(struct device *dev,
 
     spin_lock_irqsave(&hp_dev->lock, flags);
 
-    /* Suppress GPIO interrupts during sysfs-initiated operations */
-    hp_dev->suppress_gpio_irq = true;
-
     switch (val) {
     case PCIE_HP_DEBUG_PLUG_OUT:
-        dev_info(dev, "DEBUG:SCK: ========================================\n");
-        dev_info(dev, "DEBUG:SCK: debug_state_store() - PLUG_OUT Request\n");
-        dev_info(dev, "DEBUG:SCK: ========================================\n");
         dev_info(dev, "Debug: simulating cable removal\n");
         
         /* Safety check: Verify no devices on the bus before hardware shutdown.
          * This prevents silicon bug where CPU access during link down causes
          * system hang. Userspace must remove PCI devices first. */
-        dev_info(dev, "DEBUG:SCK: Checking for PCI devices on managed domains...\n");
         for (i = 0; i < hp_dev->pd->port_nums; i++) {
-            dev_info(dev, "DEBUG:SCK: Checking domain 0x%04x...\n", hp_dev->pd->ports[i].domain);
             if (pci_devices_present_on_domain(hp_dev->pd->ports[i].domain)) {
-                dev_err(dev, "DEBUG:SCK: SAFETY CHECK FAILED - Devices present on domain 0x%04x\n", 
-                        hp_dev->pd->ports[i].domain);
                 dev_err(dev, "PCI devices still present, remove them first\n");
-            hp_dev->suppress_gpio_irq = false;
                 spin_unlock_irqrestore(&hp_dev->lock, flags);
                 return -EBUSY;
+            }
         }
-        }
-        dev_info(dev, "DEBUG:SCK: Safety check PASSED - No devices on bus\n");
         
         /* Safe to proceed - no devices on bus */
-        dev_info(dev, "DEBUG:SCK: Setting state=STATE_PLUG_OUT\n");
         hp_dev->state = STATE_PLUG_OUT;
-        dev_info(dev, "DEBUG:SCK: Calling remove_device()...\n");
         remove_device(hp_dev);
-        dev_info(dev, "DEBUG:SCK: remove_device() completed\n");
-        hp_dev->suppress_gpio_irq = false;  /* Re-enable GPIO interrupt handling */
-        dev_info(dev, "DEBUG:SCK: PLUG_OUT Complete\n");
         break;
 
     case PCIE_HP_DEBUG_PLUG_IN:
-        dev_info(dev, "DEBUG:SCK: ========================================\n");
-        dev_info(dev, "DEBUG:SCK: debug_state_store() - PLUG_IN Request\n");
-        dev_info(dev, "DEBUG:SCK: ========================================\n");
         dev_info(dev, "Debug: simulating cable plug-in\n");
         
-        dev_info(dev, "DEBUG:SCK: Checking for PCI devices on managed domains...\n");
         for (i = 0; i < hp_dev->pd->port_nums; i++) {
-            dev_info(dev, "DEBUG:SCK: Checking domain 0x%04x...\n", hp_dev->pd->ports[i].domain);
             if (pci_devices_present_on_domain(hp_dev->pd->ports[i].domain)) {
-                dev_err(dev, "DEBUG:SCK: SAFETY CHECK FAILED - Devices already present on domain 0x%04x\n",
-                        hp_dev->pd->ports[i].domain);
                 dev_err(dev, "PCI devices already present, cannot reinitialize hardware\n");
-            hp_dev->suppress_gpio_irq = false;
                 spin_unlock_irqrestore(&hp_dev->lock, flags);
                 return -EBUSY;
+            }
         }
-        }
-        dev_info(dev, "DEBUG:SCK: Safety check PASSED - No devices on bus\n");
         
         /* Safe to proceed - no devices on bus */
-        dev_info(dev, "DEBUG:SCK: Setting state=STATE_PLUG_IN\n");
         hp_dev->state = STATE_PLUG_IN;
-        
         /* Enable device power - GPIO IRQ state machine will handle rest */
-        dev_info(dev, "DEBUG:SCK: Checking EN GPIO availability...\n");
-        if (hp_dev->pins[PCIE_PIN_EN].desc) {
-            dev_info(dev, "DEBUG:SCK: EN GPIO available - desc=%p\n", hp_dev->pins[PCIE_PIN_EN].desc);
-            dev_info(dev, "DEBUG:SCK: Setting EN GPIO = 1 (power on)\n");
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
-            dev_info(dev, "DEBUG:SCK: EN GPIO set, waiting for GPIO IRQ state machine\n");
-        } else {
-            dev_warn(dev, "DEBUG:SCK: EN GPIO is NULL - this shouldn't happen with _DSD!\n");
-        }
-        
-        hp_dev->suppress_gpio_irq = false;  /* Re-enable GPIO interrupt handling */
-        dev_info(dev, "DEBUG:SCK: Re-enabled GPIO IRQs\n");
-        dev_info(dev, "DEBUG:SCK: PLUG_IN initiated - waiting for BOOT GPIO transitions\n");
         break;
 
     default:
-        hp_dev->suppress_gpio_irq = false;
         spin_unlock_irqrestore(&hp_dev->lock, flags);
         return -EINVAL;
     }
@@ -1357,6 +1106,7 @@ static struct gpio_acpi_context *gpio_acpi_setup(struct platform_device *pdev,
     struct acpi_gpio_parse_context parse_ctx;
     struct gpio_acpi_context *ctx;
     struct acpi_device *adev;
+    acpi_status status;
 
     adev = ACPI_COMPANION(&pdev->dev);
     if (!adev) {
@@ -1374,8 +1124,13 @@ static struct gpio_acpi_context *gpio_acpi_setup(struct platform_device *pdev,
     parse_ctx.ctx = ctx;
     parse_ctx.hp_dev = hp_dev;
 
-    acpi_walk_resources(adev->handle, METHOD_NAME__CRS,
-                        acpi_gpio_resource_handler, &parse_ctx);
+    /* Parse ACPI _CRS to get GPIO properties and identify special pins */
+    status = acpi_walk_resources(adev->handle, METHOD_NAME__CRS,
+                                 acpi_gpio_resource_handler, &parse_ctx);
+    if (ACPI_FAILURE(status)) {
+        devm_kfree(&pdev->dev, ctx);
+        return NULL;
+    }
 
     if (ctx->valid)
         return ctx;
@@ -1388,11 +1143,6 @@ static int pcie_hp_setup_irq(struct pcie_hp_gpio_ctx *app_ctx)
 {
     struct gpio_acpi_context *ctx = app_ctx->ctx;
     int irq, ret;
-
-    if (!app_ctx->desc) {
-        dev_err(ctx->dev, "GPIO descriptor is NULL\n");
-        return -ENODEV;
-    }
 
     irq = gpiod_to_irq(app_ctx->desc);
     if (irq < 0) {
@@ -1413,962 +1163,48 @@ static int pcie_hp_setup_irq(struct pcie_hp_gpio_ctx *app_ctx)
     return ret;
 }
 
-/*
- * GPIO mapping table - maps ACPI _CRS GPIO indices to connection names
- *
- * This table bypasses kernel 6.17+ GPIO grouping by explicitly telling
- * the kernel which _CRS index corresponds to which GPIO connection name.
- *
- * Format: { crs_index, pin_index_within_resource, active_low }
- *
- * _CRS GPIO resource order (from SSDT):
- *   [0] GpioInt - BOOT (pin 102)
- *   [1] GpioInt - PRSNT (pin 103)
- *   [2] GpioIo OutputOnly - PERST (pin 94)
- *   [3] GpioIo OutputOnly - EN (pin 146)
- *   [4] GpioIo InputOnly - CLQ0 (pin 177)
- *   [5] GpioIo InputOnly - CLQ1 (pin 178)
- */
-/* Structure to hold GPIO resource information from ACPI _CRS */
-struct acpi_gpio_info {
-	unsigned int pin;
-	bool is_interrupt;  /* GpioInt vs GpioIo */
-	bool is_output;     /* IoRestrictionOutputOnly */
-	bool active_low;
-	char name[16];
-};
-
-/* Context for ACPI resource parsing */
-struct gpio_parse_ctx {
-	struct device *dev;
-	struct acpi_gpio_info gpios[PCIE_PIN_MAX];
-	int count;
-};
-
-/**
- * pcie_hp_parse_gpio_resources - ACPI resource callback to extract GPIO info
- * @ares: ACPI resource
- * @data: Pointer to gpio_parse_ctx
- *
- * Extracts GPIO pin numbers, types, and directions from raw ACPI _CRS,
- * bypassing the kernel 6.17+ GPIO grouping bug.
- *
- * Returns: 1 to continue iteration, 0 to stop
- */
-static acpi_status pcie_hp_parse_gpio_resources(struct acpi_resource *ares, void *data)
+static int pcie_hp_probe_io_info(struct platform_device *pdev)
 {
-	struct gpio_parse_ctx *ctx = data;
-	struct acpi_resource_gpio *gpio;
-	struct acpi_gpio_info *info;
+    struct gpio_desc *desc;
+    int count = 0;
 
-	if (ares->type != ACPI_RESOURCE_TYPE_GPIO)
-		return AE_OK;
+    for (;;) {
+        desc = gpiod_get_index(&pdev->dev, NULL, count, GPIOD_ASIS);
+        if (IS_ERR(desc))
+            break;
+        count++;
+        gpiod_put(desc);
+    }
 
-	if (ctx->count >= PCIE_PIN_MAX) {
-		dev_warn(ctx->dev, "Too many GPIO resources, stopping at %d\n", PCIE_PIN_MAX);
-		return AE_OK;
-	}
-
-	gpio = &ares->data.gpio;
-	info = &ctx->gpios[ctx->count];
-
-	/* Extract pin number (first pin in the list) */
-	info->pin = gpio->pin_table[0];
-
-	/* Determine type */
-	info->is_interrupt = (gpio->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT);
-
-	/* Determine direction */
-	info->is_output = (gpio->io_restriction == ACPI_IO_RESTRICT_OUTPUT);
-
-	/* Extract polarity */
-	info->active_low = (gpio->polarity == ACPI_ACTIVE_LOW);
-
-	/* Extract vendor data as name if available */
-	if (gpio->vendor_length > 0 && gpio->vendor_length < sizeof(info->name)) {
-		memcpy(info->name, gpio->vendor_data, gpio->vendor_length);
-		info->name[gpio->vendor_length] = '\0';
-	} else {
-		snprintf(info->name, sizeof(info->name), "gpio%d", ctx->count);
-	}
-
-	dev_info(ctx->dev, "DEBUG:SCK: Raw ACPI GPIO[%d]: pin=%u type=%s dir=%s name=%s\n",
-	         ctx->count, info->pin,
-	         info->is_interrupt ? "GpioInt" : "GpioIo",
-	         info->is_output ? "Output" : "Input",
-	         info->name);
-
-	ctx->count++;
-	return AE_OK;
+    return count;
 }
 
 /**
- * pcie_hp_release_gpios - Release GPIOs allocated by a method
- * @dev: device
- * @pins: GPIO pins array to release
- * @gpio_count: number of GPIOs to release
- *
- * Releases GPIOs that were allocated with devm_gpio_request_one().
- * Since they're devm-managed, we use devres_release_group() to free them.
- */
-static void pcie_hp_release_gpios(struct device *dev,
-                                   struct pcie_hp_gpio_ctx *pins,
-                                   int gpio_count)
-{
-	int i;
-	
-	if (!pins || !dev)
-		return;
-	
-	dev_info(dev, "DEBUG:SCK: Releasing %d GPIOs...\n", gpio_count);
-	
-	/* Release GPIOs - devm_gpio_request_one() uses devres, so we need to
-	 * use devres_release_group() or let them be auto-freed.
-	 * Actually, devm GPIOs can't be manually freed mid-probe easily.
-	 * Instead, we'll just clear the pins array and let the next method
-	 * handle -EBUSY if GPIOs are already allocated.
-	 */
-	for (i = 0; i < gpio_count && i < PCIE_PIN_MAX; i++) {
-		if (pins[i].desc) {
-			dev_info(dev, "DEBUG:SCK:   Releasing GPIO[%d] (desc=%p)\n", i, pins[i].desc);
-			/* Note: devm GPIOs are auto-freed, but we clear the reference */
-			pins[i].desc = NULL;
-		}
-	}
-	
-	/* Free the pins array itself */
-	if (pins) {
-		devm_kfree(dev, pins);
-	}
-	
-	dev_info(dev, "DEBUG:SCK: GPIOs released\n");
-}
-
-/* Forward declarations */
-static int pcie_hp_probe_gpios_fallback_hardcoded(struct platform_device *pdev,
-                                                   struct pcie_hp_dev *hp_dev);
-
-/**
- * pcie_hp_probe_gpios_fallback_get_index - Fallback: Try gpiod_get_index()
+ * pcie_hp_discover_devices - Discover existing PCI devices on managed ports
  * @pdev: platform device
- * @hp_dev: hotplug device context
+ * @pd: platform data
  *
- * Attempts to get GPIOs using gpiod_get_index() with indices 0-5.
- * This is a fallback if ACPI _CRS parsing fails.
+ * Scans for PCI devices matching the vendor/device ID specified in platform data
+ * and verifies they're on one of the managed PCIe domains.
+ * This version can be called before hp_dev is allocated (like 6.14).
  *
- * Returns: 0 on success, negative error code on failure
+ * Returns: 0 on success, -EPROBE_DEFER if devices are still initializing,
+ *         negative error code on failure
  */
-static int pcie_hp_probe_gpios_fallback_get_index(struct platform_device *pdev,
-                                                   struct pcie_hp_dev *hp_dev)
-{
-	struct device *dev = &pdev->dev;
-	struct gpio_desc *desc;
-	int ret, i;
-	
-	dev_warn(dev, "ACPI _CRS parsing failed - trying gpiod_get_index() fallback\n");
-	dev_info(dev, "DEBUG:SCK: Fallback: Using gpiod_get_index() with indices 0-5\n");
-	
-	/* Allocate GPIO context array */
-	hp_dev->pins = devm_kcalloc(dev, PCIE_PIN_MAX,
-	                             sizeof(struct pcie_hp_gpio_ctx),
-	                             GFP_KERNEL);
-	if (!hp_dev->pins) {
-		dev_err(dev, "Failed to allocate GPIO context array\n");
-		return -ENOMEM;
-	}
-	
-	/* Try to get GPIOs by index (0-5) */
-	int method2_success_count = 0;
-	for (i = 0; i < PCIE_PIN_MAX; i++) {
-		desc = devm_gpiod_get_index(dev, NULL, i, GPIOD_ASIS);
-		if (IS_ERR(desc)) {
-			ret = PTR_ERR(desc);
-			if (ret == -EPROBE_DEFER) {
-				dev_info(dev, "GPIO controller not ready, deferring probe...\n");
-				/* Clean up partial GPIOs before deferring */
-				if (method2_success_count > 0) {
-					dev_info(dev, "DEBUG:SCK: [METHOD 2] Cleaning up %d partial GPIOs before deferring\n",
-					         method2_success_count);
-					pcie_hp_release_gpios(dev, hp_dev->pins, method2_success_count);
-					hp_dev->pins = NULL;
-					hp_dev->gpio_count = 0;
-				}
-				return ret;
-			}
-			dev_warn(dev, "gpiod_get_index(dev, NULL, %d) failed: %d\n", i, ret);
-			/* Partial failure - clean up and return error */
-			if (method2_success_count > 0) {
-				dev_info(dev, "DEBUG:SCK: [METHOD 2] Partial success: got %d/%d GPIOs - cleaning up\n",
-				         method2_success_count, PCIE_PIN_MAX);
-				pcie_hp_release_gpios(dev, hp_dev->pins, method2_success_count);
-				hp_dev->pins = NULL;
-				hp_dev->gpio_count = 0;
-			}
-			return ret;
-		}
-		
-		hp_dev->pins[i].desc = desc;
-		hp_dev->pins[i].hp_dev = hp_dev;
-		method2_success_count++;
-		
-		dev_info(dev, "DEBUG:SCK: Fallback: GPIO[%d] via gpiod_get_index() OK\n", i);
-	}
-	
-	hp_dev->gpio_count = PCIE_PIN_MAX;
-	dev_info(dev, "DEBUG:SCK: Fallback gpiod_get_index() SUCCESS - all %d GPIOs\n", PCIE_PIN_MAX);
-	return 0;
-}
-
-/**
- * pcie_hp_probe_gpios_fallback_hardcoded - Fallback: Use hardcoded GPIO pins
- * @pdev: platform device
- * @hp_dev: hotplug device context
- *
- * Uses hardcoded GPIO pin numbers for MediaTek MT8901 SoC on DGX Spark.
- * Detects GPIO chip base dynamically (512 or 0).
- *
- * Hardcoded pins (controller-relative):
- * - BOOT: 102
- * - PRSNT: 103
- * - PERST: 94
- * - EN: 146
- * - CLQ0: 177
- * - CLQ1: 178
- *
- * Returns: 0 on success, negative error code on failure
- */
-static int pcie_hp_probe_gpios_fallback_hardcoded(struct platform_device *pdev,
-                                                   struct pcie_hp_dev *hp_dev)
-{
-	struct device *dev = &pdev->dev;
-	struct gpio_desc *desc;
-	int ret, i, gpio_base = 0;
-	int test_bases[] = {512};  /* Known correct base for MT8901 SoC */
-	int j;
-	
-	/* Hardcoded GPIO pins (controller-relative) for MT8901 SoC */
-	static const unsigned int hardcoded_pins[PCIE_PIN_MAX] = {
-		102,  /* BOOT */
-		103,  /* PRSNT */
-		94,   /* PERST */
-		146,  /* EN */
-		177,  /* CLQ0 */
-		178,  /* CLQ1 */
-	};
-	
-	dev_warn(dev, "gpiod_get_index() failed - trying hardcoded GPIO fallback\n");
-	dev_info(dev, "DEBUG:SCK: Fallback: Using hardcoded GPIO pins\n");
-	dev_info(dev, "DEBUG:SCK: Hardcoded pins: BOOT=102, PRSNT=103, PERST=94, EN=146, CLQ0=177, CLQ1=178\n");
-	
-	/* Allocate GPIO context array */
-	hp_dev->pins = devm_kcalloc(dev, PCIE_PIN_MAX,
-	                             sizeof(struct pcie_hp_gpio_ctx),
-	                             GFP_KERNEL);
-	if (!hp_dev->pins) {
-		dev_err(dev, "Failed to allocate GPIO context array\n");
-		return -ENOMEM;
-	}
-	
-	/* Detect GPIO chip base by trying first GPIO (BOOT) */
-	dev_info(dev, "DEBUG:SCK: Detecting GPIO chip base for hardcoded pins...\n");
-	ret = devm_gpio_request_one(dev, hardcoded_pins[PCIE_PIN_BOOT], GPIOF_IN, "test_base");
-	if (ret == 0) {
-		gpio_base = 0;
-		dev_info(dev, "DEBUG:SCK: Hardcoded pin %u is already global (base=0)\n",
-		         hardcoded_pins[PCIE_PIN_BOOT]);
-	} else if (ret == -EPROBE_DEFER) {
-		dev_info(dev, "GPIO controller not ready, deferring probe...\n");
-		return ret;
-	} else {
-		/* Try known bases */
-		for (j = 0; j < ARRAY_SIZE(test_bases); j++) {
-			unsigned int test_global = test_bases[j] + hardcoded_pins[PCIE_PIN_BOOT];
-			ret = devm_gpio_request_one(dev, test_global, GPIOF_IN, "test_base");
-			if (ret == 0) {
-				gpio_base = test_bases[j];
-				dev_info(dev, "DEBUG:SCK: Found GPIO chip base: %d\n", gpio_base);
-				break;
-			} else if (ret == -EPROBE_DEFER) {
-				return ret;
-			}
-		}
-		
-		if (j == ARRAY_SIZE(test_bases)) {
-			dev_err(dev, "Failed to detect GPIO chip base for hardcoded pins\n");
-			return -ENODEV;
-		}
-	}
-	
-	/* Request all GPIOs with detected base */
-	int method3_success_count = 0;
-	for (i = 0; i < PCIE_PIN_MAX; i++) {
-		unsigned int global_pin = gpio_base + hardcoded_pins[i];
-		unsigned long flags;
-		
-		/* Determine direction and initial value */
-		if (i == PCIE_PIN_PERST) {
-			flags = GPIOF_OUT_INIT_HIGH;
-		} else if (i == PCIE_PIN_EN) {
-			flags = GPIOF_OUT_INIT_LOW;
-		} else {
-			flags = GPIOF_IN;
-		}
-		
-		ret = devm_gpio_request_one(dev, global_pin, flags,
-		                            i == PCIE_PIN_BOOT ? "BOOT" :
-		                            i == PCIE_PIN_PRSNT ? "PRSNT" :
-		                            i == PCIE_PIN_PERST ? "PERST" :
-		                            i == PCIE_PIN_EN ? "EN" :
-		                            i == PCIE_PIN_CLQ0 ? "CLQ0" : "CLQ1");
-		if (ret) {
-			if (ret == -EPROBE_DEFER) {
-				dev_info(dev, "GPIO controller not ready, deferring probe...\n");
-				/* Clean up partial GPIOs before deferring */
-				if (method3_success_count > 0) {
-					dev_info(dev, "DEBUG:SCK: [METHOD 3] Cleaning up %d partial GPIOs before deferring\n",
-					         method3_success_count);
-					pcie_hp_release_gpios(dev, hp_dev->pins, method3_success_count);
-					hp_dev->pins = NULL;
-					hp_dev->gpio_count = 0;
-				}
-				return ret;
-			} else if (ret == -EBUSY) {
-				/* GPIO already requested (from previous method) - reuse it */
-				dev_info(dev, "DEBUG:SCK: GPIO %u already requested (EBUSY), reusing...\n", global_pin);
-				desc = gpio_to_desc(global_pin);
-				if (!desc || IS_ERR(desc)) {
-					dev_err(dev, "Failed to get descriptor for GPIO %u: %ld\n",
-					        global_pin, PTR_ERR(desc));
-					/* Partial failure - clean up and return error */
-					if (method3_success_count > 0) {
-						dev_info(dev, "DEBUG:SCK: [METHOD 3] Partial success: got %d/%d GPIOs - cleaning up\n",
-						         method3_success_count, PCIE_PIN_MAX);
-						pcie_hp_release_gpios(dev, hp_dev->pins, method3_success_count);
-						hp_dev->pins = NULL;
-						hp_dev->gpio_count = 0;
-					}
-					return PTR_ERR(desc) ?: -EINVAL;
-				}
-				hp_dev->pins[i].desc = desc;
-				hp_dev->pins[i].hp_dev = hp_dev;
-				method3_success_count++;
-				continue;
-			} else {
-				dev_err(dev, "Failed to request hardcoded GPIO %u (pin %u + base %d): %d\n",
-				        global_pin, hardcoded_pins[i], gpio_base, ret);
-				/* Partial failure - clean up and return error */
-				if (method3_success_count > 0) {
-					dev_info(dev, "DEBUG:SCK: [METHOD 3] Partial success: got %d/%d GPIOs - cleaning up\n",
-					         method3_success_count, PCIE_PIN_MAX);
-					pcie_hp_release_gpios(dev, hp_dev->pins, method3_success_count);
-					hp_dev->pins = NULL;
-					hp_dev->gpio_count = 0;
-				}
-				return ret;
-			}
-		}
-		
-		desc = gpio_to_desc(global_pin);
-		if (!desc || IS_ERR(desc)) {
-			dev_err(dev, "Failed to get descriptor for GPIO %u: %ld\n",
-			        global_pin, PTR_ERR(desc));
-			/* Partial failure - clean up and return error */
-			if (method3_success_count > 0) {
-				dev_info(dev, "DEBUG:SCK: [METHOD 3] Partial success: got %d/%d GPIOs - cleaning up\n",
-				         method3_success_count, PCIE_PIN_MAX);
-				pcie_hp_release_gpios(dev, hp_dev->pins, method3_success_count);
-				hp_dev->pins = NULL;
-				hp_dev->gpio_count = 0;
-			}
-			return PTR_ERR(desc) ?: -EINVAL;
-		}
-		
-		hp_dev->pins[i].desc = desc;
-		hp_dev->pins[i].hp_dev = hp_dev;
-		method3_success_count++;
-		
-		dev_info(dev, "DEBUG:SCK: Hardcoded GPIO[%d]: pin=%u (global=%u) OK\n",
-		         i, hardcoded_pins[i], global_pin);
-	}
-	
-	/* Check if we got all GPIOs */
-	if (method3_success_count != PCIE_PIN_MAX) {
-		dev_warn(dev, "DEBUG:SCK: [METHOD 3] Partial success: got %d/%d GPIOs - FAILED\n",
-		         method3_success_count, PCIE_PIN_MAX);
-		/* Clean up partial GPIOs and fail */
-		if (method3_success_count > 0) {
-			dev_info(dev, "DEBUG:SCK: [METHOD 3] Cleaning up %d partial GPIOs before failing\n",
-			         method3_success_count);
-			pcie_hp_release_gpios(dev, hp_dev->pins, method3_success_count);
-			hp_dev->pins = NULL;
-			hp_dev->gpio_count = 0;
-		}
-		return -ENODEV; /* Return error to indicate incomplete */
-	}
-	
-	/* Success - got all GPIOs, don't clean up */
-	hp_dev->gpio_count = PCIE_PIN_MAX;
-	dev_info(dev, "DEBUG:SCK: Hardcoded GPIO fallback SUCCESS - all %d GPIOs (base=%d)\n",
-	         PCIE_PIN_MAX, gpio_base);
-	return 0;
-}
-
-/**
- * pcie_hp_probe_gpios - Enumerate and configure GPIO pins via ACPI
- * @pdev: platform device
- * @hp_dev: hotplug device context
- *
- * Manually extracts GPIO pin numbers from ACPI _CRS using acpi_walk_resources(),
- * then converts them to descriptors using gpio_to_desc(). This completely bypasses
- * the kernel 6.17+ GPIO grouping bug that affects the standard gpiod APIs.
- *
- * Fallback strategy:
- * 1. Try ACPI _CRS parsing (primary method)
- * 2. If that fails (non-EPROBE_DEFER), try gpiod_get_index() with indices 0-5
- * 3. If that also fails, use hardcoded GPIO pins with base detection
- *
- * Returns: 0 on success, negative error code on failure
- */
-static int pcie_hp_probe_gpios(struct platform_device *pdev,
-                                struct pcie_hp_dev *hp_dev)
-{
-	struct device *dev = &pdev->dev;
-	struct acpi_device *adev;
-	struct gpio_parse_ctx parse_ctx = { .dev = dev, .count = 0 };
-	struct pcie_hp_gpio_ctx *pin_ctx;
-	struct gpio_desc *desc;
-	struct acpi_gpio_info *first_gpio;
-	struct gpio_device *gdev;
-	acpi_status status;
-	int ret, i, gpio_base = 0;
-	/* Known GPIO chip base for MediaTek MT8901 SoC on DGX Spark */
-	/* Note: base 0 is tested first (as-is), then try 512 */
-	int test_bases[] = {512};  /* Known correct base for MT8901 SoC */
-	int j;
-
-	dev_info(dev, "DEBUG:SCK: ========================================\n");
-	dev_info(dev, "DEBUG:SCK: Testing All 3 GPIO Enumeration Methods\n");
-	dev_info(dev, "DEBUG:SCK: Method 1: ACPI _CRS parsing (raw acpi_walk_resources)\n");
-	dev_info(dev, "DEBUG:SCK: Method 2: gpiod_get_index() with indices 0-5\n");
-	dev_info(dev, "DEBUG:SCK: Method 3: Hardcoded GPIO pins with base detection\n");
-	dev_info(dev, "DEBUG:SCK: ========================================\n");
-
-	/* Initialize method results */
-	int method1_result = -ENODEV;
-	struct pcie_hp_gpio_ctx *method1_pins = NULL;
-	int method1_gpio_count = 0;
-	int ret2 = -ENODEV;
-	int method2_gpio_count = 0;
-	int ret3 = -ENODEV;
-	int method3_gpio_count = 0;
-
-	/* Method 1: Try ACPI _CRS parsing */
-	dev_info(dev, "DEBUG:SCK: [METHOD 1] Testing ACPI _CRS parsing...\n");
-	adev = ACPI_COMPANION(dev);
-	if (!adev) {
-		dev_info(dev, "DEBUG:SCK: [METHOD 1] No ACPI companion - SKIPPED\n");
-		goto try_method_2;
-	}
-
-	status = acpi_walk_resources(adev->handle, METHOD_NAME__CRS,
-	                              pcie_hp_parse_gpio_resources, &parse_ctx);
-	if (ACPI_FAILURE(status)) {
-		dev_info(dev, "DEBUG:SCK: [METHOD 1] acpi_walk_resources() failed: %d - FAILED\n", status);
-		goto try_method_2;
-	}
-
-	if (parse_ctx.count != PCIE_PIN_MAX) {
-		dev_info(dev, "DEBUG:SCK: [METHOD 1] Found %d GPIOs (expected %d) - FAILED\n",
-		         PCIE_PIN_MAX, parse_ctx.count);
-		goto try_method_2;
-	}
-	dev_info(dev, "DEBUG:SCK: [METHOD 1] Found %d GPIO resources in raw _CRS - continuing test...\n",
-	         parse_ctx.count);
-
-	/* Step 1.5: Detect GPIO chip base from first GPIO (if controller-relative)
-	 * ACPI _CRS may provide controller-relative pins (e.g., 102) that need
-	 * GPIO chip base added (e.g., base=512 -> global=614). We detect the base
-	 * by requesting the first GPIO and checking if it worked, then getting
-	 * the chip base from the descriptor.
-	 */
-	dev_info(dev, "DEBUG:SCK: Detecting GPIO chip base...\n");
-	
-	/* Step 2: Allocate GPIO context array */
-	hp_dev->pins = devm_kcalloc(dev, PCIE_PIN_MAX,
-	                             sizeof(struct pcie_hp_gpio_ctx),
-	                             GFP_KERNEL);
-	if (!hp_dev->pins) {
-		dev_err(dev, "Failed to allocate GPIO context array\n");
-		return -ENOMEM;
-	}
-
-	/* Step 3: Request first GPIO to detect chip base */
-	first_gpio = &parse_ctx.gpios[0];
-	
-	dev_info(dev, "DEBUG:SCK: ========================================\n");
-	dev_info(dev, "DEBUG:SCK: GPIO BASE DETECTION START\n");
-	dev_info(dev, "DEBUG:SCK: First GPIO from ACPI _CRS: pin=%u name=%s\n",
-	         first_gpio->pin, first_gpio->name);
-	dev_info(dev, "DEBUG:SCK: Testing if pin %u is already global (base=0)...\n",
-	         first_gpio->pin);
-	
-	/* Try requesting first GPIO as-is (assume global) */
-	ret = devm_gpio_request_one(dev, first_gpio->pin, GPIOF_IN, "test_base");
-	dev_info(dev, "DEBUG:SCK: devm_gpio_request_one(pin=%u) returned: %d\n",
-	         first_gpio->pin, ret);
-	if (ret == 0) {
-		/* Success - pin is already global, no conversion needed */
-		gpio_base = 0;
-		desc = gpio_to_desc(first_gpio->pin);
-		if (desc && !IS_ERR(desc)) {
-			gdev = gpiod_to_gpio_device(desc);
-			if (gdev) {
-				int chip_base = gpio_device_get_base(gdev);
-				dev_info(dev, "DEBUG:SCK: GPIO pin %u is already global (chip base=%d)\n",
-				         first_gpio->pin, chip_base);
-			}
-		}
-		/* Test GPIO will be auto-freed by devm when device is removed */
-	} else {
-		/* Failed or deferred - try known bases in case pin is controller-relative */
-		bool all_deferred = (ret == -EPROBE_DEFER);
-		
-		if (ret == -EPROBE_DEFER) {
-			dev_info(dev, "DEBUG:SCK: GPIO pin %u returned EPROBE_DEFER with base=0\n",
-			         first_gpio->pin);
-			dev_info(dev, "DEBUG:SCK: Trying known base (512) in case pin is controller-relative...\n");
-		} else {
-			dev_warn(dev, "GPIO pin %u failed as-is (error %d), trying common bases...\n",
-			         first_gpio->pin, ret);
-			dev_info(dev, "DEBUG:SCK: Trying GPIO chip base: 512\n");
-		}
-		
-		/* Try GPIO chip base: 512 (known correct for MT8901) */
-		for (j = 0; j < ARRAY_SIZE(test_bases); j++) {
-			unsigned int test_global = test_bases[j] + first_gpio->pin;
-			dev_info(dev, "DEBUG:SCK:   Testing base=%d -> GPIO %u (pin %u + base %d)\n",
-			         test_bases[j], test_global, first_gpio->pin, test_bases[j]);
-			ret = devm_gpio_request_one(dev, test_global, GPIOF_IN, "test_base");
-			dev_info(dev, "DEBUG:SCK:   devm_gpio_request_one(GPIO %u) returned: %d\n",
-			         test_global, ret);
-			if (ret == 0) {
-				gpio_base = test_bases[j];
-				dev_info(dev, "DEBUG:SCK: SUCCESS! Found GPIO chip base: %d\n", gpio_base);
-				dev_info(dev, "DEBUG:SCK: Pin %u (controller-relative) -> GPIO %u (global)\n",
-				         first_gpio->pin, test_global);
-				/* Test GPIO will be auto-freed by devm when device is removed */
-				all_deferred = false;
-				break;
-			} else if (ret == -EPROBE_DEFER) {
-				dev_info(dev, "DEBUG:SCK:   Base %d also returned EPROBE_DEFER\n",
-				         test_bases[j]);
-				/* Continue to next base */
-			} else {
-				dev_info(dev, "DEBUG:SCK:   Base %d failed (error %d), trying next...\n",
-				         test_bases[j], ret);
-				all_deferred = false;
-			}
-		}
-		
-		/* If all attempts returned EPROBE_DEFER, defer the probe */
-		if (all_deferred && ret == -EPROBE_DEFER) {
-			dev_info(dev, "DEBUG:SCK: All base attempts returned EPROBE_DEFER - GPIO controller not ready\n");
-			dev_info(dev, "GPIO controller not ready, deferring probe...\n");
-			return ret;
-		}
-		
-		/* If we didn't find a working base, try fallbacks */
-		if (j == ARRAY_SIZE(test_bases)) {
-			dev_warn(dev, "DEBUG:SCK: GPIO BASE DETECTION FAILED - trying fallbacks\n");
-			dev_warn(dev, "DEBUG:SCK: Tried all bases: 0 (as-is), 512\n");
-			dev_warn(dev, "DEBUG:SCK: First GPIO pin from ACPI: %u\n", first_gpio->pin);
-			/* Fallback 1: Try gpiod_get_index() */
-			ret = pcie_hp_probe_gpios_fallback_get_index(pdev, hp_dev);
-			if (ret == -EPROBE_DEFER)
-				return ret;
-			if (ret == 0)
-				return 0;
-			/* Fallback 2: Try hardcoded GPIOs */
-			return pcie_hp_probe_gpios_fallback_hardcoded(pdev, hp_dev);
-		}
-	}
-	dev_info(dev, "DEBUG:SCK: GPIO BASE DETECTION COMPLETE: base=%d\n", gpio_base);
-	dev_info(dev, "DEBUG:SCK: ========================================\n");
-	
-	/* Convert controller-relative pins to global if needed */
-	if (gpio_base > 0) {
-		dev_info(dev, "DEBUG:SCK: Converting %d controller pins to global (base=%d)\n",
-		         PCIE_PIN_MAX, gpio_base);
-		for (i = 0; i < PCIE_PIN_MAX; i++) {
-			unsigned int old_pin = parse_ctx.gpios[i].pin;
-			parse_ctx.gpios[i].pin = gpio_base + old_pin;
-			dev_info(dev, "DEBUG:SCK:   Pin %u -> GPIO %u\n", old_pin, parse_ctx.gpios[i].pin);
-		}
-	} else {
-		dev_info(dev, "DEBUG:SCK: GPIO pins are already global numbers\n");
-	}
-
-	/* Step 4: Request and configure all GPIOs with correct global numbers */
-	dev_info(dev, "DEBUG:SCK: Requesting all GPIOs with correct global numbers...\n");
-	
-	int method1_success_count = 0;
-	for (i = 0; i < PCIE_PIN_MAX; i++) {
-		struct acpi_gpio_info *gpio_info = &parse_ctx.gpios[i];
-		
-		dev_info(dev, "DEBUG:SCK: [GPIO %d/6] %s: pin=%u type=%s dir=%s\n",
-		         i, gpio_info->name, gpio_info->pin,
-		         gpio_info->is_interrupt ? "GpioInt" : "GpioIo",
-		         gpio_info->is_output ? "Output" : "Input");
-
-		/* Request ownership and configure GPIO direction */
-		/* Note: If this GPIO was already requested for base detection, devm_gpio_request_one
-		 * will return -EBUSY, but that's okay - we'll just get the descriptor and continue.
-		 */
-		if (gpio_info->is_output) {
-			/* Output GPIOs: PERST (high), EN (low) */
-			int init_val = (i == PCIE_PIN_PERST) ? 1 : 0;
-			unsigned long flags = init_val ? GPIOF_OUT_INIT_HIGH : GPIOF_OUT_INIT_LOW;
-			
-			dev_info(dev, "DEBUG:SCK:   Requesting GPIO %u as OUTPUT (init=%d)...\n",
-			         gpio_info->pin, init_val);
-			ret = devm_gpio_request_one(dev, gpio_info->pin, flags, gpio_info->name);
-			dev_info(dev, "DEBUG:SCK:   devm_gpio_request_one(GPIO %u) returned: %d\n",
-			         gpio_info->pin, ret);
-			if (ret == -EBUSY) {
-				/* GPIO already requested (likely from base detection) - reuse it */
-				dev_info(dev, "DEBUG:SCK:   GPIO %u already requested (EBUSY), reusing...\n",
-				         gpio_info->pin);
-				desc = gpio_to_desc(gpio_info->pin);
-				if (!desc || IS_ERR(desc)) {
-					dev_warn(dev, "Failed to get descriptor for GPIO %u: %ld\n",
-					         gpio_info->pin, PTR_ERR(desc));
-					/* Partial failure - will clean up and try next method */
-					break;
-				}
-				/* Reconfigure direction to output */
-				ret = gpiod_direction_output(desc, init_val);
-				if (ret) {
-					dev_warn(dev, "Failed to configure GPIO %u as output: %d\n",
-					         gpio_info->pin, ret);
-					/* Partial failure - will clean up and try next method */
-					break;
-				}
-				dev_info(dev, "DEBUG:SCK:   Configured as OUTPUT, init=%d\n", init_val);
-			} else if (ret) {
-				if (ret == -EPROBE_DEFER) {
-					dev_info(dev, "GPIO controller not ready yet, deferring probe...\n");
-					/* Clean up partial GPIOs before deferring */
-					if (method1_success_count > 0) {
-						dev_info(dev, "DEBUG:SCK: [METHOD 1] Cleaning up %d partial GPIOs before deferring\n",
-						         method1_success_count);
-						pcie_hp_release_gpios(dev, hp_dev->pins, method1_success_count);
-						hp_dev->pins = NULL;
-						hp_dev->gpio_count = 0;
-					}
-					return ret;
-				} else {
-					dev_warn(dev, "Failed to request GPIO pin %u as output: %d\n",
-					         gpio_info->pin, ret);
-					/* Partial failure - will clean up and try next method */
-					break;
-				}
-			} else {
-				dev_info(dev, "DEBUG:SCK:   Configured as OUTPUT, init=%d\n", init_val);
-				desc = gpio_to_desc(gpio_info->pin);
-				if (!desc || IS_ERR(desc)) {
-					dev_warn(dev, "Failed to convert pin %u to descriptor: %ld\n",
-					         gpio_info->pin, PTR_ERR(desc));
-					/* Partial failure - will clean up and try next method */
-					break;
-				}
-			}
-		} else {
-			/* Input GPIOs: BOOT, PRSNT, CLQ0, CLQ1 */
-			dev_info(dev, "DEBUG:SCK:   Requesting GPIO %u as INPUT...\n",
-			         gpio_info->pin);
-			ret = devm_gpio_request_one(dev, gpio_info->pin, GPIOF_IN, gpio_info->name);
-			dev_info(dev, "DEBUG:SCK:   devm_gpio_request_one(GPIO %u) returned: %d\n",
-			         gpio_info->pin, ret);
-			if (ret == -EBUSY) {
-				/* GPIO already requested (likely from base detection) - reuse it */
-				dev_info(dev, "DEBUG:SCK:   GPIO %u already requested (EBUSY), reusing...\n",
-				         gpio_info->pin);
-				desc = gpio_to_desc(gpio_info->pin);
-				if (!desc || IS_ERR(desc)) {
-					dev_warn(dev, "Failed to get descriptor for GPIO %u: %ld\n",
-					         gpio_info->pin, PTR_ERR(desc));
-					/* Partial failure - will clean up and try next method */
-					break;
-				}
-				/* Already configured as INPUT during test */
-				dev_info(dev, "DEBUG:SCK:   Already configured as INPUT\n");
-			} else if (ret) {
-				if (ret == -EPROBE_DEFER) {
-					dev_info(dev, "GPIO controller not ready yet, deferring probe...\n");
-					/* Clean up partial GPIOs before deferring */
-					if (method1_success_count > 0) {
-						dev_info(dev, "DEBUG:SCK: [METHOD 1] Cleaning up %d partial GPIOs before deferring\n",
-						         method1_success_count);
-						pcie_hp_release_gpios(dev, hp_dev->pins, method1_success_count);
-						hp_dev->pins = NULL;
-						hp_dev->gpio_count = 0;
-					}
-					return ret;
-				} else {
-					dev_warn(dev, "Failed to request GPIO pin %u as input: %d\n",
-					         gpio_info->pin, ret);
-					/* Partial failure - will clean up and try next method */
-					break;
-				}
-			} else {
-				dev_info(dev, "DEBUG:SCK:   Configured as INPUT\n");
-				desc = gpio_to_desc(gpio_info->pin);
-				if (!desc || IS_ERR(desc)) {
-					dev_warn(dev, "Failed to convert pin %u to descriptor: %ld\n",
-					         gpio_info->pin, PTR_ERR(desc));
-					/* Partial failure - will clean up and try next method */
-					break;
-				}
-			}
-		}
-
-		/* Store descriptor in context */
-		if (!hp_dev->pins) {
-			dev_err(dev, "GPIO pins array is NULL\n");
-			/* Clean up any GPIOs we got so far */
-			if (method1_success_count > 0) {
-				pcie_hp_release_gpios(dev, hp_dev->pins, method1_success_count);
-			}
-			return -ENOMEM;
-		}
-		pin_ctx = &hp_dev->pins[i];
-		pin_ctx->desc = desc;
-		pin_ctx->hp_dev = hp_dev;
-		method1_success_count++;
-
-		dev_info(dev, "DEBUG:SCK:   SUCCESS: desc=%p global_pin=%u\n",
-		         desc, gpio_info->pin);
-	}
-	
-	/* Check if we got all GPIOs */
-	if (method1_success_count != PCIE_PIN_MAX) {
-		dev_warn(dev, "DEBUG:SCK: [METHOD 1] Partial success: got %d/%d GPIOs - cleaning up and trying next method\n",
-		         method1_success_count, PCIE_PIN_MAX);
-		/* Clean up partial GPIOs before trying next method */
-		if (method1_success_count > 0) {
-			pcie_hp_release_gpios(dev, hp_dev->pins, method1_success_count);
-			hp_dev->pins = NULL;
-			hp_dev->gpio_count = 0;
-		}
-		method1_result = -ENODEV; /* Mark as failed */
-		goto try_method_2;
-	}
-
-	hp_dev->gpio_count = PCIE_PIN_MAX;
-
-	pr_info("mtk-pcie-hotplug: ========================================\n");
-	pr_info("mtk-pcie-hotplug: GPIO ENUMERATION COMPLETE\n");
-	pr_info("mtk-pcie-hotplug: All %d GPIOs successfully configured\n", PCIE_PIN_MAX);
-	dev_info(dev, "DEBUG:SCK: ========================================\n");
-	dev_info(dev, "DEBUG:SCK: GPIO Enumeration COMPLETE\n");
-	dev_info(dev, "DEBUG:SCK:   All %d GPIOs configured via manual conversion\n", PCIE_PIN_MAX);
-	dev_info(dev, "DEBUG:SCK:   GPIO chip base: %d\n", gpio_base);
-	dev_info(dev, "DEBUG:SCK:   BOOT:  pin=%u (GPIO %u)\n", 
-	         parse_ctx.gpios[0].pin - (gpio_base > 0 ? gpio_base : 0),
-	         parse_ctx.gpios[0].pin);
-	dev_info(dev, "DEBUG:SCK:   PRSNT: pin=%u (GPIO %u)\n",
-	         parse_ctx.gpios[1].pin - (gpio_base > 0 ? gpio_base : 0),
-	         parse_ctx.gpios[1].pin);
-	dev_info(dev, "DEBUG:SCK:   PERST: pin=%u (GPIO %u)\n",
-	         parse_ctx.gpios[2].pin - (gpio_base > 0 ? gpio_base : 0),
-	         parse_ctx.gpios[2].pin);
-	dev_info(dev, "DEBUG:SCK:   EN:    pin=%u (GPIO %u)\n",
-	         parse_ctx.gpios[3].pin - (gpio_base > 0 ? gpio_base : 0),
-	         parse_ctx.gpios[3].pin);
-	dev_info(dev, "DEBUG:SCK:   CLQ0:  pin=%u (GPIO %u)\n",
-	         parse_ctx.gpios[4].pin - (gpio_base > 0 ? gpio_base : 0),
-	         parse_ctx.gpios[4].pin);
-	dev_info(dev, "DEBUG:SCK:   CLQ1:  pin=%u (GPIO %u)\n",
-	         parse_ctx.gpios[5].pin - (gpio_base > 0 ? gpio_base : 0),
-	         parse_ctx.gpios[5].pin);
-	dev_info(dev, "DEBUG:SCK: ========================================\n");
-	pr_info("mtk-pcie-hotplug: ========================================\n");
-	dev_info(dev, "DEBUG:SCK: [METHOD 1] ACPI _CRS parsing - SUCCESS\n");
-	dev_info(dev, "Successfully enumerated all %d GPIOs via manual pin-to-desc conversion\n", PCIE_PIN_MAX);
-	
-	/* Save Method 1 result - continue testing other methods */
-	method1_result = 0;
-	method1_pins = hp_dev->pins;
-	method1_gpio_count = hp_dev->gpio_count;
-
-try_method_2:
-	dev_info(dev, "DEBUG:SCK: [METHOD 2] Testing gpiod_get_index()...\n");
-	/* Temporarily clear pins so Method 2 can try (will fail if Method 1 already allocated them) */
-	hp_dev->pins = NULL;
-	hp_dev->gpio_count = 0;
-	
-	ret2 = pcie_hp_probe_gpios_fallback_get_index(pdev, hp_dev);
-	if (ret2 == -EPROBE_DEFER) {
-		dev_info(dev, "DEBUG:SCK: [METHOD 2] GPIO controller not ready - DEFERRED\n");
-		method2_gpio_count = 0;
-		/* Restore Method 1 pins if available */
-		if (method1_result == 0 && method1_pins) {
-			hp_dev->pins = method1_pins;
-			hp_dev->gpio_count = method1_gpio_count;
-		}
-		return ret2;
-	}
-	if (ret2 == 0) {
-		method2_gpio_count = hp_dev->gpio_count; /* Save Method 2 GPIO count */
-		dev_info(dev, "DEBUG:SCK: [METHOD 2] gpiod_get_index() - SUCCESS (got %d GPIOs)\n",
-		         method2_gpio_count);
-		/* Free Method 2's pins - we'll use Method 1 if it succeeded */
-		if (method1_result == 0 && method1_pins) {
-			dev_info(dev, "DEBUG:SCK: [METHOD 2] Method 1 also succeeded - will use Method 1\n");
-			if (hp_dev->pins) {
-				devm_kfree(dev, hp_dev->pins);
-			}
-			hp_dev->pins = method1_pins;
-			hp_dev->gpio_count = method1_gpio_count;
-		}
-	} else {
-		method2_gpio_count = hp_dev->gpio_count; /* Save partial count if any */
-		dev_info(dev, "DEBUG:SCK: [METHOD 2] gpiod_get_index() - FAILED: %d (got %d GPIOs)\n",
-		         ret2, method2_gpio_count);
-		/* Restore Method 1 pins if available */
-		if (method1_result == 0 && method1_pins) {
-			if (hp_dev->pins) {
-				devm_kfree(dev, hp_dev->pins);
-			}
-			hp_dev->pins = method1_pins;
-			hp_dev->gpio_count = method1_gpio_count;
-		}
-	}
-
-	/* Method 3: Try hardcoded GPIOs */
-	dev_info(dev, "DEBUG:SCK: [METHOD 3] Testing hardcoded GPIO pins...\n");
-	/* Temporarily clear pins so Method 3 can try */
-	struct pcie_hp_gpio_ctx *current_pins = hp_dev->pins;
-	int current_gpio_count = hp_dev->gpio_count;
-	hp_dev->pins = NULL;
-	hp_dev->gpio_count = 0;
-	
-	ret3 = pcie_hp_probe_gpios_fallback_hardcoded(pdev, hp_dev);
-	if (ret3 == -EPROBE_DEFER) {
-		dev_info(dev, "DEBUG:SCK: [METHOD 3] GPIO controller not ready - DEFERRED\n");
-		method3_gpio_count = 0;
-		/* Restore previous pins if available */
-		if (current_pins) {
-			hp_dev->pins = current_pins;
-			hp_dev->gpio_count = current_gpio_count;
-		}
-		return ret3;
-	}
-	if (ret3 == 0) {
-		method3_gpio_count = hp_dev->gpio_count; /* Save Method 3 GPIO count */
-		dev_info(dev, "DEBUG:SCK: [METHOD 3] Hardcoded GPIOs - SUCCESS (got %d GPIOs)\n",
-		         method3_gpio_count);
-		/* Use the first successful method (Method 1 if available, else Method 2, else Method 3) */
-		if (method1_result == 0 && method1_pins) {
-			dev_info(dev, "DEBUG:SCK: [METHOD 3] Method 1 also succeeded - will use Method 1\n");
-			if (hp_dev->pins) {
-				devm_kfree(dev, hp_dev->pins);
-			}
-			hp_dev->pins = method1_pins;
-			hp_dev->gpio_count = method1_gpio_count;
-		} else if (ret2 == 0 && current_pins && current_pins != method1_pins) {
-			dev_info(dev, "DEBUG:SCK: [METHOD 3] Method 2 also succeeded - will use Method 2\n");
-			if (hp_dev->pins) {
-				devm_kfree(dev, hp_dev->pins);
-			}
-			hp_dev->pins = current_pins;
-			hp_dev->gpio_count = current_gpio_count;
-		}
-		/* Otherwise use Method 3 (hp_dev->pins already set) */
-	} else {
-		method3_gpio_count = hp_dev->gpio_count; /* Save partial count if any */
-		dev_info(dev, "DEBUG:SCK: [METHOD 3] Hardcoded GPIOs - FAILED: %d (got %d GPIOs)\n",
-		         ret3, method3_gpio_count);
-		/* Restore previous pins if available */
-		if (current_pins) {
-			if (hp_dev->pins) {
-				devm_kfree(dev, hp_dev->pins);
-			}
-			hp_dev->pins = current_pins;
-			hp_dev->gpio_count = current_gpio_count;
-		}
-	}
-
-	/* Summary of all methods */
-	dev_info(dev, "DEBUG:SCK: ========================================\n");
-	dev_info(dev, "DEBUG:SCK: GPIO Enumeration Test Summary:\n");
-	if (method1_result == 0) {
-		dev_info(dev, "DEBUG:SCK:   Method 1 (ACPI _CRS): SUCCESS - got %d/%d GPIOs\n",
-		         method1_gpio_count, PCIE_PIN_MAX);
-	} else {
-		dev_info(dev, "DEBUG:SCK:   Method 1 (ACPI _CRS): FAILED - got %d/%d GPIOs\n",
-		         method1_gpio_count, PCIE_PIN_MAX);
-	}
-	if (ret2 == 0) {
-		dev_info(dev, "DEBUG:SCK:   Method 2 (gpiod_get_index): SUCCESS - got %d/%d GPIOs\n",
-		         method2_gpio_count, PCIE_PIN_MAX);
-	} else {
-		dev_info(dev, "DEBUG:SCK:   Method 2 (gpiod_get_index): FAILED - got %d/%d GPIOs\n",
-		         method2_gpio_count, PCIE_PIN_MAX);
-	}
-	if (ret3 == 0) {
-		dev_info(dev, "DEBUG:SCK:   Method 3 (Hardcoded): SUCCESS - got %d/%d GPIOs\n",
-		         method3_gpio_count, PCIE_PIN_MAX);
-	} else {
-		dev_info(dev, "DEBUG:SCK:   Method 3 (Hardcoded): FAILED - got %d/%d GPIOs\n",
-		         method3_gpio_count, PCIE_PIN_MAX);
-	}
-	dev_info(dev, "DEBUG:SCK: ========================================\n");
-	
-	/* Return success from first successful method */
-	if (method1_result == 0) {
-		dev_info(dev, "DEBUG:SCK: Using Method 1 (ACPI _CRS parsing)\n");
-		return 0;
-	}
-	if (ret2 == 0) {
-		dev_info(dev, "DEBUG:SCK: Using Method 2 (gpiod_get_index)\n");
-		return 0;
-	}
-	if (ret3 == 0) {
-		dev_info(dev, "DEBUG:SCK: Using Method 3 (Hardcoded GPIOs)\n");
-		return 0;
-	}
-
-	dev_err(dev, "DEBUG:SCK: ========================================\n");
-	dev_err(dev, "DEBUG:SCK: ALL 3 GPIO ENUMERATION METHODS FAILED\n");
-	dev_err(dev, "DEBUG:SCK:   Method 1 failed with: %d\n", method1_result);
-	dev_err(dev, "DEBUG:SCK:   Method 2 failed with: %d\n", ret2);
-	dev_err(dev, "DEBUG:SCK:   Method 3 failed with: %d\n", ret3);
-	dev_err(dev, "DEBUG:SCK: Driver will return error gracefully - no boot crash\n");
-	dev_err(dev, "DEBUG:SCK: ========================================\n");
-	/* Return the most specific error code, or -ENODEV if all are generic failures */
-	if (ret3 != -ENODEV)
-		return ret3;
-	if (ret2 != -ENODEV)
-		return ret2;
-	if (method1_result != -ENODEV)
-		return method1_result;
-	return -ENODEV;
-}
- 
-static int pcie_hp_discover_devices(struct pcie_hp_dev *hp_dev)
+static int pcie_hp_discover_devices(struct platform_device *pdev,
+                                     struct pcie_hp_plat_data *pd)
 {
     struct pci_dev *pci_dev = NULL;
     int device_count = 0;
     int i;
 
     /* If no vendor/device ID specified, skip device discovery */
-    if (!hp_dev->pd->vendor_id || !hp_dev->pd->device_id)
+    if (!pd->vendor_id || !pd->device_id)
         return 0;
 
     /* Find all matching PCI devices */
-    while ((pci_dev = pci_get_device(hp_dev->pd->vendor_id,
-                                      hp_dev->pd->device_id,
+    while ((pci_dev = pci_get_device(pd->vendor_id,
+                                      pd->device_id,
                                       pci_dev)) != NULL) {
         /* Wait for device to be initialized */
         if (!pci_dev->state_saved) {
@@ -2377,24 +1213,27 @@ static int pcie_hp_discover_devices(struct pcie_hp_dev *hp_dev)
         }
 
         /* Verify device is on one of our managed ports */
-        for (i = 0; i < hp_dev->pd->port_nums; i++) {
-            if (pci_domain_nr(pci_dev->bus) == hp_dev->pd->ports[i].domain)
+        for (i = 0; i < pd->port_nums; i++) {
+            if (pci_domain_nr(pci_dev->bus) == pd->ports[i].domain)
                 break;
         }
 
-        if (i == hp_dev->pd->port_nums) {
-            dev_warn(&hp_dev->pdev->dev,
-                     "Device %s found on unexpected domain %d\n",
-                     pci_name(pci_dev), pci_domain_nr(pci_dev->bus));
+        if (i == pd->port_nums) {
+            dev_err(&pdev->dev,
+                    "Device %s found on unexpected domain %d\n",
+                    pci_name(pci_dev), pci_domain_nr(pci_dev->bus));
+            pci_dev_put(pci_dev);
+            return -ENODEV;
         }
 
         device_count++;
     }
 
-    if (hp_dev->pd->num_devices && device_count != hp_dev->pd->num_devices) {
-        dev_info(&hp_dev->pdev->dev,
-                 "Expected %d devices, found %d (may be hot-unplugged)\n",
-                 hp_dev->pd->num_devices, device_count);
+    if (pd->num_devices && device_count != pd->num_devices) {
+        dev_err(&pdev->dev,
+                "Required number of devices not found. Expected=%d Actual=%d\n",
+                pd->num_devices, device_count);
+        return -ENODEV;
     }
 
     return 0;
@@ -2406,11 +1245,6 @@ static int pcie_hp_probe(struct platform_device *pdev)
     struct pcie_hp_gpio_ctx *app_ctx;
     struct pcie_hp_dev *hp_dev;
     int ret, i;
-
-    pr_info("mtk-pcie-hotplug: ========================================\n");
-    pr_info("mtk-pcie-hotplug: Driver PROBE STARTED\n");
-    pr_info("mtk-pcie-hotplug: Device: %s\n", dev_name(&pdev->dev));
-    pr_info("mtk-pcie-hotplug: ========================================\n");
 
     pd = (struct pcie_hp_plat_data *)device_get_match_data(&pdev->dev);
     if (!pd) {
@@ -2424,135 +1258,77 @@ static int pcie_hp_probe(struct platform_device *pdev)
         return -EINVAL;
     }
 
+    /* Discover existing PCI devices (like 6.14's device discovery in probe) */
+    ret = pcie_hp_discover_devices(pdev, pd);
+    if (ret) {
+        dev_err(&pdev->dev, "Device discovery failed: %d\n", ret);
+        return ret;
+    }
+
     hp_dev = devm_kzalloc(&pdev->dev, sizeof(*hp_dev), GFP_KERNEL);
-    if (!hp_dev)
+    if (!hp_dev) {
+        dev_err(&pdev->dev, "Failed to allocate memory for hotplug device\n");
         return -ENOMEM;
+    }
+
+    /* Discover GPIO pins */
+    hp_dev->gpio_count = pcie_hp_probe_io_info(pdev);
+    if (!hp_dev->gpio_count) {
+        dev_err(&pdev->dev, "Failed to get gpio descriptors\n");
+        return -ENODEV;
+    }
+
+    hp_dev->pins = devm_kzalloc(&pdev->dev,
+                                 sizeof(struct pcie_hp_gpio_ctx) * hp_dev->gpio_count,
+                                 GFP_KERNEL);
+    if (!hp_dev->pins) {
+        dev_err(&pdev->dev, "Failed to allocate memory for GPIOs\n");
+        return -ENOMEM;
+    }
 
     hp_dev->pdev = pdev;
     hp_dev->pd = pd;
+    hp_dev->state = STATE_READY;
     hp_dev->boot_pin = -1;
     hp_dev->prsnt_pin = -1;
-    hp_dev->state = STATE_READY;
-    hp_dev->suppress_gpio_irq = false;  /* GPIO interrupt handling enabled by default */
     spin_lock_init(&hp_dev->lock);
     
     /* Initialize cached root port pointers */
     for (i = 0; i < HP_PORT_MAX; i++)
         hp_dev->cached_root_ports[i] = NULL;
 
-    /* Note: Bus protection initialization is deferred until after MMIO mapping
-     * because it requires MMIO regions to be mapped first.
-     */
-
-    /* Enumerate all GPIOs using ACPI _DSD named connections */
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: Starting GPIO Enumeration (ACPI _DSD)\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    pr_info("mtk-pcie-hotplug: Starting GPIO enumeration...\n");
-    ret = pcie_hp_probe_gpios(pdev, hp_dev);
-    if (ret) {
-        if (ret == -EPROBE_DEFER) {
-            dev_info(&pdev->dev, "GPIO controller not ready, deferring probe...\n");
-            return ret;
-        }
-        dev_err(&pdev->dev, "mtk-pcie-hotplug: GPIO enumeration FAILED: %d\n", ret);
-        dev_err(&pdev->dev, "DEBUG:SCK: pcie_hp_probe_gpios() FAILED with error %d\n", ret);
-        dev_err(&pdev->dev, "Failed to enumerate GPIOs: %d (all fallbacks exhausted)\n", ret);
-        dev_err(&pdev->dev, "Driver will not load - PCIe hotplug functionality unavailable\n");
-        return ret;
-    }
-    pr_info("mtk-pcie-hotplug: GPIO enumeration SUCCESS - all 6 GPIOs configured\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: pcie_hp_probe_gpios() returned SUCCESS\n");
-
-    /* Verify GPIOs were successfully enumerated */
-    if (!hp_dev->pins) {
-        dev_err(&pdev->dev, "DEBUG:SCK: CRITICAL: GPIO pins array is NULL after enumeration\n");
-        dev_err(&pdev->dev, "GPIO enumeration returned success but pins array is NULL\n");
-        dev_err(&pdev->dev, "Driver will not load - PCIe hotplug functionality unavailable\n");
-        return -ENODEV;
-    }
-    
-    hp_dev->gpio_count = PCIE_PIN_MAX;
-    dev_info(&pdev->dev, "DEBUG:SCK: Set gpio_count = %d\n", hp_dev->gpio_count);
-    dev_info(&pdev->dev, "DEBUG:SCK: GPIO pins array verified: %p\n", hp_dev->pins);
-
-    /* Setup ACPI context and IRQs for interrupt-capable GPIOs */
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: Setting up ACPI context and IRQs\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    for (i = 0; i < PCIE_PIN_MAX; i++) {
-        if (!hp_dev->pins) {
-            dev_err(&pdev->dev, "DEBUG:SCK: CRITICAL: GPIO pins array became NULL during setup (i=%d)\n", i);
-            dev_err(&pdev->dev, "Driver will not load - PCIe hotplug functionality unavailable\n");
-            return -ENODEV;
-        }
+    /* Setup GPIO pins and IRQs */
+    for (i = 0; i < hp_dev->gpio_count; i++) {
         app_ctx = &hp_dev->pins[i];
-        
-        if (!app_ctx->desc) {
-            dev_warn(&pdev->dev, "DEBUG:SCK: GPIO %d: desc is NULL, skipping\n", i);
-            continue;
+        app_ctx->desc = gpiod_get_index(&pdev->dev, NULL, i, GPIOD_ASIS);
+        if (IS_ERR(app_ctx->desc)) {
+            dev_err(&pdev->dev, "Failed to get GPIO %d: %ld\n",
+                    i, PTR_ERR(app_ctx->desc));
+            ret = PTR_ERR(app_ctx->desc);
+            app_ctx->desc = NULL;
+            goto gpio_release;
         }
 
-        dev_info(&pdev->dev, "DEBUG:SCK: GPIO %d: Setting up ACPI context...\n", i);
-        /* Setup ACPI GPIO context for metadata */
+        app_ctx->hp_dev = hp_dev;
         app_ctx->ctx = gpio_acpi_setup(pdev, app_ctx->desc, hp_dev);
         if (!app_ctx->ctx) {
-            dev_warn(&pdev->dev, "DEBUG:SCK: GPIO %d: gpio_acpi_setup() FAILED - GPIO may still work without ACPI context\n", i);
-            dev_warn(&pdev->dev, "Failed to setup ACPI context for GPIO %d (non-critical, continuing)\n", i);
-            /* Continue without ACPI context - GPIO may still work */
-            continue;
+            dev_err(&pdev->dev, "Failed to setup GPIO %d\n", i);
+            ret = -ENODEV;
+            goto gpio_release;
         }
-        dev_info(&pdev->dev, "DEBUG:SCK: GPIO %d: ACPI context OK - pin=%d, type=%s\n", 
-                 i, app_ctx->ctx->pin,
-                 app_ctx->ctx->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT ? "GpioInt" : "GpioIo");
 
-        /* Configure debouncing */
         gpiod_set_debounce(app_ctx->desc, app_ctx->ctx->debounce_timeout_us);
 
-        /* Setup IRQ only for GpioInt resources (BOOT and PRSNT) */
+        /* Setup IRQ for interrupt-type GPIOs */
         if (app_ctx->ctx->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT) {
-            dev_info(&pdev->dev, "DEBUG:SCK: GPIO %d: Is GpioInt, setting up IRQ...\n", i);
-            dev_info(&pdev->dev, "Setting up IRQ for %s GPIO (pin %d)\n",
-                     i == PCIE_PIN_BOOT ? "BOOT" :
-                     i == PCIE_PIN_PRSNT ? "PRSNT" : "UNKNOWN",
-                     app_ctx->ctx->pin);
-            
+            dev_info(&pdev->dev, "Setting up IRQ for GPIO %d (pin %d)\n", i, app_ctx->ctx->pin);
             ret = pcie_hp_setup_irq(app_ctx);
             if (ret) {
-                dev_err(&pdev->dev, "DEBUG:SCK: GPIO %d: pcie_hp_setup_irq() FAILED: %d\n", i, ret);
-                dev_err(&pdev->dev, "Failed to setup IRQ for GPIO %d: %d\n", i, ret);
-                return ret;
+                dev_err(&pdev->dev, "Failed to setup IRQ for GPIO %d\n", i);
+                goto gpio_release;
             }
-            if (app_ctx->desc) {
-                dev_info(&pdev->dev, "DEBUG:SCK: GPIO %d: IRQ setup SUCCESS - IRQ %d\n", i, gpiod_to_irq(app_ctx->desc));
-                dev_info(&pdev->dev, "IRQ %d registered for GPIO %d\n", 
-                         gpiod_to_irq(app_ctx->desc), i);
-            }
-        } else {
-            dev_info(&pdev->dev, "DEBUG:SCK: GPIO %d: Is GpioIo, no IRQ needed\n", i);
+            dev_info(&pdev->dev, "IRQ %d registered for GPIO %d\n", gpiod_to_irq(app_ctx->desc), i);
         }
-    }
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ACPI context and IRQ setup COMPLETE\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-
-    /* Check that we found the required pins */
-    if (hp_dev->boot_pin < 0 || hp_dev->prsnt_pin < 0) {
-        dev_err(&pdev->dev, "DEBUG:SCK: ========================================\n");
-        dev_err(&pdev->dev, "DEBUG:SCK: CRITICAL GPIOs MISSING\n");
-        dev_err(&pdev->dev, "DEBUG:SCK:   boot_pin=%d (required: >= 0)\n", hp_dev->boot_pin);
-        dev_err(&pdev->dev, "DEBUG:SCK:   prsnt_pin=%d (required: >= 0)\n", hp_dev->prsnt_pin);
-        dev_err(&pdev->dev, "DEBUG:SCK:   GPIO pins array: %p\n", hp_dev->pins);
-        if (hp_dev->pins) {
-            dev_err(&pdev->dev, "DEBUG:SCK:   BOOT GPIO desc: %p\n", hp_dev->pins[PCIE_PIN_BOOT].desc);
-            dev_err(&pdev->dev, "DEBUG:SCK:   PRSNT GPIO desc: %p\n", hp_dev->pins[PCIE_PIN_PRSNT].desc);
-        }
-        dev_err(&pdev->dev, "DEBUG:SCK: ========================================\n");
-        dev_err(&pdev->dev, "Critical GPIOs missing: boot_pin=%d prsnt_pin=%d\n",
-                hp_dev->boot_pin, hp_dev->prsnt_pin);
-        dev_err(&pdev->dev, "BOOT and PRSNT GPIOs are required for hotplug functionality\n");
-        dev_err(&pdev->dev, "Driver will not load - PCIe hotplug functionality unavailable\n");
-        return -ENODEV;
     }
 
     platform_set_drvdata(pdev, hp_dev);
@@ -2560,8 +1336,8 @@ static int pcie_hp_probe(struct platform_device *pdev)
     /* Initialize pinctrl */
     ret = pcie_hp_pinctrl_init(hp_dev);
     if (ret) {
-        dev_err(&pdev->dev, "Pinctrl init failed: %d\n", ret);
-        return ret;
+        dev_err(&pdev->dev, "Pinmux init failed, ret: %d\n", ret);
+        goto gpio_release;
     }
 
     /* Create sysfs interface */
@@ -2571,141 +1347,33 @@ static int pcie_hp_probe(struct platform_device *pdev)
         goto pinctrl_remove;
     }
 
-    /* GPIO enumeration checkpoint - verify all GPIOs are ready */
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: GPIO ENUMERATION CHECKPOINT\n");
-    dev_info(&pdev->dev, "DEBUG:SCK:   Total GPIOs enumerated: %d/%d\n", hp_dev->gpio_count, PCIE_PIN_MAX);
-    if (hp_dev->pins) {
-        dev_info(&pdev->dev, "DEBUG:SCK:   BOOT pin:  %d (IRQ: %d)\n", hp_dev->boot_pin, 
-                 (hp_dev->boot_pin >= 0 && hp_dev->pins[PCIE_PIN_BOOT].desc) ? 
-                 gpiod_to_irq(hp_dev->pins[PCIE_PIN_BOOT].desc) : -1);
-        dev_info(&pdev->dev, "DEBUG:SCK:   PRSNT pin: %d (IRQ: %d)\n", hp_dev->prsnt_pin,
-                 (hp_dev->prsnt_pin >= 0 && hp_dev->pins[PCIE_PIN_PRSNT].desc) ? 
-                 gpiod_to_irq(hp_dev->pins[PCIE_PIN_PRSNT].desc) : -1);
-        for (i = 0; i < PCIE_PIN_MAX; i++) {
-            if (hp_dev->pins[i].desc) {
-                dev_info(&pdev->dev, "DEBUG:SCK:   GPIO[%d]: desc=%p (READY)\n", i, hp_dev->pins[i].desc);
-            } else {
-                dev_warn(&pdev->dev, "DEBUG:SCK:   GPIO[%d]: desc=NULL (MISSING!)\n", i);
-            }
-        }
-    } else {
-        dev_warn(&pdev->dev, "DEBUG:SCK:   GPIO pins array is NULL\n");
-    }
-    dev_info(&pdev->dev, "DEBUG:SCK: GPIO ENUMERATION COMPLETE - Proceeding to MMIO\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-
-    /* Map MMIO regions from platform resources */
-    pr_info("mtk-pcie-hotplug: Starting MMIO resource mapping...\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: Starting MMIO Resource Mapping\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    ret = pcie_hp_map_resources(hp_dev);
-    if (ret) {
-        pr_err("mtk-pcie-hotplug: MMIO mapping FAILED: %d\n", ret);
-        dev_err(&pdev->dev, "DEBUG:SCK: ========================================\n");
-        dev_err(&pdev->dev, "DEBUG:SCK: MMIO MAPPING FAILED\n");
-        dev_err(&pdev->dev, "DEBUG:SCK:   Error code: %d\n", ret);
-        dev_err(&pdev->dev, "DEBUG:SCK:   Driver will not load - MMIO resources unavailable\n");
-        dev_err(&pdev->dev, "DEBUG:SCK: ========================================\n");
-        dev_err(&pdev->dev, "Failed to map MMIO resources: %d\n", ret);
-        dev_err(&pdev->dev, "Driver will not load - PCIe hotplug functionality unavailable\n");
-        goto sysfs_remove;
-    }
-    pr_info("mtk-pcie-hotplug: MMIO mapping SUCCESS - all regions mapped\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: MMIO MAPPING COMPLETE\n");
-    dev_info(&pdev->dev, "DEBUG:SCK:   All 5 MMIO regions successfully mapped\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    
-    /* Verify MMIO regions were successfully mapped */
-    if (!hp_dev->mmio.top_base || !hp_dev->mmio.protect_base || 
-        !hp_dev->mmio.ckm_base || !hp_dev->mmio.mac_port_base[0] || 
-        !hp_dev->mmio.mac_port_base[1]) {
-        dev_err(&pdev->dev, "DEBUG:SCK: ========================================\n");
-        dev_err(&pdev->dev, "DEBUG:SCK: CRITICAL: One or more MMIO regions are NULL\n");
-        dev_err(&pdev->dev, "DEBUG:SCK:   top_base: %p\n", hp_dev->mmio.top_base);
-        dev_err(&pdev->dev, "DEBUG:SCK:   protect_base: %p\n", hp_dev->mmio.protect_base);
-        dev_err(&pdev->dev, "DEBUG:SCK:   ckm_base: %p\n", hp_dev->mmio.ckm_base);
-        dev_err(&pdev->dev, "DEBUG:SCK:   mac_port_base[0]: %p\n", hp_dev->mmio.mac_port_base[0]);
-        dev_err(&pdev->dev, "DEBUG:SCK:   mac_port_base[1]: %p\n", hp_dev->mmio.mac_port_base[1]);
-        dev_err(&pdev->dev, "DEBUG:SCK: ========================================\n");
-        dev_err(&pdev->dev, "MMIO mapping returned success but one or more regions are NULL\n");
-        dev_err(&pdev->dev, "Driver will not load - PCIe hotplug functionality unavailable\n");
-        ret = -ENODEV;
-        goto sysfs_remove;
-    }
-
-    /* Initialize bus protection now that MMIO is mapped */
-    if (pd->rp_bus_protect) {
-        dev_info(&pdev->dev, "DEBUG:SCK: Initializing bus protection...\n");
-        /* Verify MMIO regions are valid before calling bus protection */
-        if (!hp_dev->mmio.top_base || !hp_dev->mmio.protect_base) {
-            dev_err(&pdev->dev, "DEBUG:SCK: CRITICAL: MMIO regions NULL before bus protection init\n");
-            dev_err(&pdev->dev, "Cannot initialize bus protection without MMIO regions\n");
-            ret = -ENODEV;
-            goto sysfs_remove;
-        }
-        for (i = 0; i < pd->port_nums; i++) {
-            dev_info(&pdev->dev, "DEBUG:SCK: Initializing bus protection for port %d...\n", i);
-            pd->rp_bus_protect(hp_dev, i, BUS_PROTECT_INIT);
-        }
-        dev_info(&pdev->dev, "DEBUG:SCK: Bus protection initialized for %d ports\n", pd->port_nums);
-    } else {
-        dev_warn(&pdev->dev, "DEBUG:SCK: Bus protection function not available (pd->rp_bus_protect is NULL)\n");
-    }
-
-    /* Discover existing PCI devices */
-    dev_info(&pdev->dev, "DEBUG:SCK: Discovering existing PCI devices...\n");
-    ret = pcie_hp_discover_devices(hp_dev);
-    if (ret) {
-        dev_warn(&pdev->dev, "DEBUG:SCK: Device discovery failed: %d (non-critical, continuing)\n", ret);
-        dev_warn(&pdev->dev, "Failed to discover existing PCI devices: %d (non-critical)\n", ret);
-        /* Continue - device discovery failure is not critical for driver operation */
-    } else {
-        dev_info(&pdev->dev, "DEBUG:SCK: Device discovery completed successfully\n");
+    /* Initialize bus protection (like 6.14's rp_bus_prepare during probe)
+     * This handles MMIO mapping and device discovery - call once for first port only
+     * since MMIO mapping and device discovery are per-device, not per-port */
+    if (hp_dev->pd->rp_bus_protect) {
+        hp_dev->pd->rp_bus_protect(hp_dev, 0, BUS_PROTECT_INIT);
     }
 
     /* Send initial state uevent */
-    dev_info(&pdev->dev, "DEBUG:SCK: Reading PRSNT pin for initial state...\n");
-    if (!hp_dev->pins) {
-        dev_warn(&pdev->dev, "DEBUG:SCK: GPIO pins array is NULL, skipping initial state\n");
-        dev_warn(&pdev->dev, "PRSNT GPIO not available, skipping initial state\n");
-    } else if (!hp_dev->pins[PCIE_PIN_PRSNT].desc) {
-        dev_warn(&pdev->dev, "DEBUG:SCK: PRSNT GPIO descriptor is NULL, skipping initial state\n");
-        dev_warn(&pdev->dev, "PRSNT GPIO not available, skipping initial state\n");
+    if (gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc)) {
+        hp_dev->debug_state = PCIE_HP_DEBUG_PLUG_OUT;
+        pcie_hp_send_uevent(hp_dev, REMOVAL_EVT);
     } else {
-        int prsnt_value = gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc);
-        dev_info(&pdev->dev, "DEBUG:SCK: PRSNT pin value: %d\n", prsnt_value);
-        if (prsnt_value) {
-            dev_info(&pdev->dev, "DEBUG:SCK: PRSNT=1 (cable removed), sending REMOVAL_EVT\n");
-            hp_dev->debug_state = PCIE_HP_DEBUG_PLUG_OUT;
-            pcie_hp_send_uevent(hp_dev, REMOVAL_EVT);
-        } else {
-            dev_info(&pdev->dev, "DEBUG:SCK: PRSNT=0 (cable present), sending PLUG_IN_EVT\n");
-            hp_dev->debug_state = PCIE_HP_DEBUG_PLUG_IN;
-            pcie_hp_send_uevent(hp_dev, PLUG_IN_EVT);
-        }
+        hp_dev->debug_state = PCIE_HP_DEBUG_PLUG_IN;
+        pcie_hp_send_uevent(hp_dev, PLUG_IN_EVT);
     }
 
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: Driver Initialization Summary:\n");
-    dev_info(&pdev->dev, "DEBUG:SCK:   GPIOs enumerated: %d (via ACPI _DSD)\n", hp_dev->gpio_count);
-    dev_info(&pdev->dev, "DEBUG:SCK:   BOOT pin: %d (IRQ enabled)\n", hp_dev->boot_pin);
-    dev_info(&pdev->dev, "DEBUG:SCK:   PRSNT pin: %d (IRQ enabled)\n", hp_dev->prsnt_pin);
-    dev_info(&pdev->dev, "DEBUG:SCK:   MMIO regions: 5 (TOP, PROTECT, CKM, MAC0, MAC1)\n");
-    dev_info(&pdev->dev, "DEBUG:SCK:   Initial state: %s\n", 
-             hp_dev->debug_state == PCIE_HP_DEBUG_PLUG_OUT ? "PLUG_OUT" : "PLUG_IN");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
     dev_info(&pdev->dev, "PCIe hotplug driver initialized successfully\n");
     return 0;
 
-sysfs_remove:
-    sysfs_remove_group(&pdev->dev.kobj, &pcie_hp_attr_group);
 pinctrl_remove:
     pcie_hp_pinctrl_remove(hp_dev);
-    /* GPIOs are managed by devm_gpio_request_one(), no manual cleanup needed */
-    /* devm framework will automatically release them on device removal */
+gpio_release:
+    for (i = 0; i < hp_dev->gpio_count; i++) {
+        app_ctx = &hp_dev->pins[i];
+        if (app_ctx->desc)
+            gpiod_put(app_ctx->desc);
+    }
 
     return ret;
 }
@@ -2713,17 +1381,11 @@ pinctrl_remove:
 static void pcie_hp_remove(struct platform_device *pdev)
 {
     struct pcie_hp_dev *hp_dev = platform_get_drvdata(pdev);
+    struct pcie_hp_gpio_ctx *app_ctx;
     int i;
 
-    pr_info("mtk-pcie-hotplug: Driver REMOVE STARTED\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: Driver REMOVE STARTED\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-
-    if (!hp_dev) {
-        dev_warn(&pdev->dev, "DEBUG:SCK: hp_dev is NULL, nothing to remove\n");
+    if (!hp_dev)
         return;
-    }
 
     /* Remove sysfs interface */
     sysfs_remove_group(&pdev->dev.kobj, &pcie_hp_attr_group);
@@ -2731,29 +1393,20 @@ static void pcie_hp_remove(struct platform_device *pdev)
     /* Remove pinctrl */
     pcie_hp_pinctrl_remove(hp_dev);
 
-    /* GPIO pins are managed by devm_gpio_request_one(), no manual cleanup needed */
-    /* devm framework will automatically release them on device removal */
+    /* Release GPIO pins */
+    for (i = 0; i < hp_dev->gpio_count; i++) {
+        app_ctx = &hp_dev->pins[i];
+        if (app_ctx->desc)
+            gpiod_put(app_ctx->desc);
+    }
 
     /* Release cached PCI device references */
-    if (hp_dev->pd) {
-        dev_info(&pdev->dev, "DEBUG:SCK: Releasing cached PCI device references...\n");
-        for (i = 0; i < hp_dev->pd->port_nums && i < HP_PORT_MAX; i++) {
-            if (hp_dev->cached_root_ports[i]) {
-                dev_info(&pdev->dev, "DEBUG:SCK: Releasing root port %d\n", i);
-                pci_dev_put(hp_dev->cached_root_ports[i]);
-                hp_dev->cached_root_ports[i] = NULL;
-            }
-        }
-    } else {
-        dev_warn(&pdev->dev, "DEBUG:SCK: hp_dev->pd is NULL, skipping PCI device cleanup\n");
+    for (i = 0; i < hp_dev->pd->port_nums; i++) {
+        if (hp_dev->cached_root_ports[i])
+            pci_dev_put(hp_dev->cached_root_ports[i]);
     }
 
     platform_set_drvdata(pdev, NULL);
-
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: Driver REMOVE COMPLETE\n");
-    dev_info(&pdev->dev, "DEBUG:SCK: ========================================\n");
-    pr_info("mtk-pcie-hotplug: Driver REMOVE COMPLETE\n");
 
     /* MMIO regions are automatically unmapped via devm_* */
 }
