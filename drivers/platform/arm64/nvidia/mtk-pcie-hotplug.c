@@ -38,7 +38,7 @@
 #include <linux/of.h>
 #include <linux/property.h>
 
-#define HP_PORT_MAX		8
+#define HP_PORT_MAX		3
 #define HP_POLL_CNT_MAX		200
 #define PCIE_REG_SIZE		0x1000
 #define MAX_VENDOR_DATA_LEN	16
@@ -202,6 +202,21 @@ struct pcie_hp_dev {
     struct pcie_hp_mmio_runtime mmio; /* Runtime mapped MMIO base addresses */
 };
  
+/**
+ * pcie_hp_pinctrl_init - Register pinctrl mappings for the device
+ * @hp_dev: hotplug device
+ *
+ * Registers platform-specific pinctrl mappings for GPIO pin multiplexing
+ * states (default, clkreqn) for the MediaTek PCIe hotplug controller.
+ * These mappings are SoC-specific and define pin names and mux functions.
+ *
+ * Note: These mappings are registered unconditionally (no ACPI check).
+ * When pcie_hp_change_state() calls devm_pinctrl_get(), the pinctrl subsystem
+ * will prefer ACPI/DT-provided pinctrl configuration if present, otherwise
+ * it will use these registered hardcoded mappings as a fallback.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
 static int pcie_hp_pinctrl_init(struct pcie_hp_dev *hp_dev)
 {
     int ret;
@@ -230,6 +245,8 @@ static int pcie_hp_change_state(struct pcie_hp_dev *hp_dev, const char *new_stat
     struct pinctrl_state *state;
     int ret;
 
+    /* devm_pinctrl_get() prefers ACPI/DT-provided pinctrl if available,
+     * otherwise falls back to hardcoded mappings registered in pcie_hp_pinctrl_init() */
     pinctrl = devm_pinctrl_get(&hp_dev->pdev->dev);
     if (IS_ERR(pinctrl)) {
         dev_err(&hp_dev->pdev->dev, "Failed to get pinctrl\n");
@@ -408,8 +425,9 @@ static acpi_status pcie_hp_parse_acpi_resources(struct acpi_resource *ares, void
  * pcie_hp_map_hardcoded_mmio - Map MMIO regions using hardcoded addresses
  * @dev: hotplug device
  *
- * TEMPORARY: Fallback function to map MMIO regions using hardcoded addresses
- * when ACPI parsing fails or is unavailable.
+ * Fallback function to map MMIO regions using SoC-specific hardcoded addresses
+ * when ACPI _CRS resources are not available. These addresses are fixed for
+ * MediaTek MT8901 SoC and do not vary between boards.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -429,7 +447,7 @@ static int pcie_hp_map_hardcoded_mmio(struct pcie_hp_dev *dev)
 	};
 	int i;
 
-	dev_warn(&pdev->dev, "Using hardcoded MMIO addresses (TEMPORARY FOR TESTING)\n");
+	dev_warn(&pdev->dev, "ACPI _CRS not available, using SoC-specific MMIO addresses\n");
 	dev_info(&pdev->dev, "Mapping MMIO regions using hardcoded addresses...\n");
 
 	for (i = 0; i < 5; i++) {
@@ -502,7 +520,8 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 
 	dev_info(&pdev->dev, "Parsing MMIO regions from ACPI _CRS\n");
 
-	/* Get ACPI companion device */
+	/* Prefer ACPI-provided MMIO addresses if available, otherwise fall back
+	 * to hardcoded SoC-specific addresses.*/
 	adev = ACPI_COMPANION(&pdev->dev);
 	if (!adev) {
 		dev_warn(&pdev->dev, "No ACPI companion device found, falling back to hardcoded addresses\n");
@@ -1461,6 +1480,9 @@ static const struct pcie_hp_plat_data mt8901_plat_data = {
     .rp_bus_protect = mt8901_rp_bus_protect,
     .ltssm_reg = 0x728,
     .ltssm_l0_state = 0x11,
+    /* Pinctrl mappings: Platform-specific GPIO pin multiplexing configuration
+     * for PCIe clock request signals. These define SoC-specific pin names
+     * and mux functions for the MediaTek MT8901 platform. */
     .pin_nums = 4,
     .pinmap = {
         PIN_MAP_MUX_GROUP("MTKP0001:00", "default", "NVDA9221:00", "GPIO177", "func0"),
