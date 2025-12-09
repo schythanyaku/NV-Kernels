@@ -8,20 +8,6 @@
  * resources. It supports cable insertion/removal detection and device power
  * management.
  *
- * MMIO Resource Requirements (via platform_device resources):
- *   Resource 0: TOP region    - PCIe top-level control registers
- *   Resource 1: PROTECT region - Bus protection control registers  
- *   Resource 2: CKM region     - Clock management registers
- *   Resource 3+: MAC regions   - Per-port MAC control registers
- *
- * Example ACPI resource definition:
- *   Name (_CRS, ResourceTemplate() {
- *       Memory32Fixed(ReadWrite, 0x1d600000, 0x1000)  // TOP
- *       Memory32Fixed(ReadWrite, 0x1d640000, 0x1000)  // PROTECT
- *       Memory32Fixed(ReadWrite, 0x16bd0000, 0x1000)  // CKM
- *       Memory32Fixed(ReadWrite, 0x1d790000, 0x1000)  // MAC port 0
- *       Memory32Fixed(ReadWrite, 0x1d690000, 0x1000)  // MAC port 1
- *   })
  */
 
 #include <linux/acpi.h>
@@ -42,6 +28,7 @@
 #define HP_POLL_CNT_MAX		200
 #define PCIE_REG_SIZE		0x1000
 #define MAX_VENDOR_DATA_LEN	16
+#define PCIE_HP_MMIO_REGION_COUNT	5	/* TOP, PROTECT, CKM, MAC Port 0, MAC Port 1 */
 
 /* Hardware timing requirements (in microseconds unless noted) */
 #define PCIE_HP_DELAY_SHORT_US		10	/* Short delay for register writes */
@@ -63,6 +50,7 @@
 #define BUS_PROTECT_INIT		0
 #define BUS_PROTECT_CABLE_REMOVAL	1
 #define BUS_PROTECT_CABLE_PLUGIN	2
+#define BUS_PROTECT_CLEANUP		3	/* Cleanup stage (for remove) */
  
 enum pcie_hp_state {
     STATE_READY = 0,
@@ -93,24 +81,28 @@ struct pcie_port_info {
 };
 
 struct rp_bus_mmio_top {
+    u32 addr;		/* MMIO base address */
     u32 ctrl;
     u32 port_bits[HP_PORT_MAX];
     u32 update_bit;
 };
 
 struct rp_bus_mmio_protect {
+    u32 addr;		/* MMIO base address */
     u32 mode;
     u32 enable;
     u32 port_bits[HP_PORT_MAX];
 };
 
 struct rp_bus_mmio_mac {
+    u32 addr[HP_PORT_MAX];	/* MMIO base addresses per port */
     u32 init_ctrl;
     u32 ltssm_bit;
     u32 phy_rst_bit;
 };
 
 struct rp_bus_mmio_ckm {
+    u32 addr;		/* MMIO base address */
     u32 ctrl;
     u32 disable_bit;
 };
@@ -165,6 +157,21 @@ struct acpi_gpio_parse_context {
     struct pcie_hp_dev *hp_dev;
 };
 
+/**
+ * struct pcie_hp_acpi_mmio - Container for parsed ACPI MMIO resources
+ * @mmio_regions: array of Memory32Fixed resources from ACPI _CRS
+ * @count: number of MMIO regions found
+ * @dev: device pointer for logging
+ *
+ * This structure is used to collect MMIO resources during ACPI _CRS parsing.
+ * The callback function populates this as it walks through the ACPI resources.
+ */
+struct pcie_hp_acpi_mmio {
+	struct acpi_resource_fixed_memory32 mmio_regions[PCIE_HP_MMIO_REGION_COUNT];
+	int count;
+	struct device *dev;
+};
+
 enum pcie_hp_debug_val {
     PCIE_HP_DEBUG_PLUG_OUT = 0,
     PCIE_HP_DEBUG_PLUG_IN,
@@ -209,11 +216,6 @@ struct pcie_hp_dev {
  * Registers platform-specific pinctrl mappings for GPIO pin multiplexing
  * states (default, clkreqn) for the MediaTek PCIe hotplug controller.
  * These mappings are SoC-specific and define pin names and mux functions.
- *
- * Note: These mappings are registered unconditionally (no ACPI check).
- * When pcie_hp_change_state() calls devm_pinctrl_get(), the pinctrl subsystem
- * will prefer ACPI/DT-provided pinctrl configuration if present, otherwise
- * it will use these registered hardcoded mappings as a fallback.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -370,21 +372,6 @@ static void pcie_hp_ckm_control(struct pcie_hp_dev *dev, bool disable)
 }
 
 /**
- * struct pcie_hp_acpi_mmio - Container for parsed ACPI MMIO resources
- * @mmio_regions: array of Memory32Fixed resources from ACPI _CRS
- * @count: number of MMIO regions found
- * @dev: device pointer for logging
- *
- * This structure is used to collect MMIO resources during ACPI _CRS parsing.
- * The callback function populates this as it walks through the ACPI resources.
- */
-struct pcie_hp_acpi_mmio {
-	struct acpi_resource_fixed_memory32 mmio_regions[5];
-	int count;
-	struct device *dev;
-};
-
-/**
  * pcie_hp_parse_acpi_resources - ACPI resource callback for parsing _CRS
  * @ares: ACPI resource being processed
  * @data: pointer to pcie_hp_acpi_mmio structure
@@ -401,8 +388,9 @@ static acpi_status pcie_hp_parse_acpi_resources(struct acpi_resource *ares, void
 
 	switch (ares->type) {
 	case ACPI_RESOURCE_TYPE_FIXED_MEMORY32:
-		if (parsed->count >= 5) {
-			dev_warn(parsed->dev, "More than 5 MMIO regions found, ignoring extras\n");
+		if (parsed->count >= PCIE_HP_MMIO_REGION_COUNT) {
+			dev_warn(parsed->dev, "More than %d MMIO regions found, ignoring extras\n",
+				 PCIE_HP_MMIO_REGION_COUNT);
 			break;
 		}
 		/* Store the Memory32Fixed resource */
@@ -422,71 +410,77 @@ static acpi_status pcie_hp_parse_acpi_resources(struct acpi_resource *ares, void
 }
 
 /**
- * pcie_hp_map_hardcoded_mmio - Map MMIO regions using hardcoded addresses
+ * pcie_hp_map_platform_mmio - Map MMIO regions using platform data addresses
  * @dev: hotplug device
  *
- * Fallback function to map MMIO regions using SoC-specific hardcoded addresses
- * when ACPI _CRS resources are not available. These addresses are fixed for
- * MediaTek MT8901 SoC and do not vary between boards.
+ * Fallback function to map MMIO regions using SoC-specific addresses from
+ * platform data when ACPI _CRS resources are not available. These addresses
+ * are defined in the platform data structure and are fixed for MediaTek MT8901 SoC.
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int pcie_hp_map_hardcoded_mmio(struct pcie_hp_dev *dev)
+static int pcie_hp_map_platform_mmio(struct pcie_hp_dev *dev)
 {
 	struct platform_device *pdev = dev->pdev;
-	struct {
-		u32 addr;
-		u32 size;
-		const char *name;
-	} hardcoded_mmio[] = {
-		{ 0x1d600000, 0x1000, "TOP" },
-		{ 0x1d640000, 0x1000, "PROTECT" },
-		{ 0x16bd0000, 0x1000, "CKM" },
-		{ 0x1d790000, 0x1000, "MAC Port 0" },
-		{ 0x1d690000, 0x1000, "MAC Port 1" },
-	};
+	struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
+	void __iomem *base;
 	int i;
 
-	dev_warn(&pdev->dev, "ACPI _CRS not available, using SoC-specific MMIO addresses\n");
-	dev_info(&pdev->dev, "Mapping MMIO regions using hardcoded addresses...\n");
+	dev_warn(&pdev->dev, "ACPI _CRS not available, using SoC-specific MMIO addresses from platform data\n");
+	dev_info(&pdev->dev, "Mapping MMIO regions using platform data addresses...\n");
 
-	for (i = 0; i < 5; i++) {
-		void __iomem *base;
-
-		base = devm_ioremap(&pdev->dev, hardcoded_mmio[i].addr, hardcoded_mmio[i].size);
+	/* Map TOP region */
+	if (mmio_info->top.addr) {
+		base = devm_ioremap(&pdev->dev, mmio_info->top.addr, PCIE_REG_SIZE);
 		if (!base) {
-			dev_err(&pdev->dev, "Failed to map %s region (0x%08x)\n",
-				hardcoded_mmio[i].name, hardcoded_mmio[i].addr);
+			dev_err(&pdev->dev, "Failed to map TOP region (0x%08x)\n",
+				mmio_info->top.addr);
 			return -ENOMEM;
 		}
+		dev->mmio.top_base = base;
+		dev_info(&pdev->dev, "Mapped TOP: 0x%08x -> %p\n", mmio_info->top.addr, base);
+	}
 
-		dev_info(&pdev->dev, "Mapped %s: 0x%08x (size 0x%x) -> %p\n",
-			 hardcoded_mmio[i].name, hardcoded_mmio[i].addr,
-			 hardcoded_mmio[i].size, base);
+	/* Map PROTECT region */
+	if (mmio_info->protect.addr) {
+		base = devm_ioremap(&pdev->dev, mmio_info->protect.addr, PCIE_REG_SIZE);
+		if (!base) {
+			dev_err(&pdev->dev, "Failed to map PROTECT region (0x%08x)\n",
+				mmio_info->protect.addr);
+			return -ENOMEM;
+		}
+		dev->mmio.protect_base = base;
+		dev_info(&pdev->dev, "Mapped PROTECT: 0x%08x -> %p\n", mmio_info->protect.addr, base);
+	}
 
-		/* Store the mapped address in the runtime structure */
-		switch (i) {
-		case 0:
-			dev->mmio.top_base = base;
-			break;
-		case 1:
-			dev->mmio.protect_base = base;
-			break;
-		case 2:
-			dev->mmio.ckm_base = base;
-			break;
-		case 3:
-			if (dev->pd->port_nums > 0)
-				dev->mmio.mac_port_base[0] = base;
-			break;
-		case 4:
-			if (dev->pd->port_nums > 1)
-				dev->mmio.mac_port_base[1] = base;
-			break;
+	/* Map CKM region */
+	if (mmio_info->ckm.addr) {
+		base = devm_ioremap(&pdev->dev, mmio_info->ckm.addr, PCIE_REG_SIZE);
+		if (!base) {
+			dev_err(&pdev->dev, "Failed to map CKM region (0x%08x)\n",
+				mmio_info->ckm.addr);
+			return -ENOMEM;
+		}
+		dev->mmio.ckm_base = base;
+		dev_info(&pdev->dev, "Mapped CKM: 0x%08x -> %p\n", mmio_info->ckm.addr, base);
+	}
+
+	/* Map MAC port regions */
+	for (i = 0; i < dev->pd->port_nums && i < HP_PORT_MAX; i++) {
+		if (mmio_info->mac.addr[i]) {
+			base = devm_ioremap(&pdev->dev, mmio_info->mac.addr[i], PCIE_REG_SIZE);
+			if (!base) {
+				dev_err(&pdev->dev, "Failed to map MAC Port %d region (0x%08x)\n",
+					i, mmio_info->mac.addr[i]);
+				return -ENOMEM;
+			}
+			dev->mmio.mac_port_base[i] = base;
+			dev_info(&pdev->dev, "Mapped MAC Port %d: 0x%08x -> %p\n",
+				 i, mmio_info->mac.addr[i], base);
 		}
 	}
 
-	dev_info(&pdev->dev, "Successfully mapped all MMIO regions using hardcoded addresses\n");
+	dev_info(&pdev->dev, "Successfully mapped all MMIO regions using platform data addresses\n");
 	return 0;
 }
 
@@ -498,12 +492,15 @@ static int pcie_hp_map_hardcoded_mmio(struct pcie_hp_dev *dev)
  * then maps each region using devm_ioremap(). This is the upstream-friendly
  * method for ARM64 ACPI platforms where platform_get_resource() may not work.
  *
- * Expected MMIO order in _CRS:
- *   0: TOP region (PCIe control)
- *   1: PROTECT region (bus protection)
- *   2: CKM region (clock management)
- *   3: MAC Port 0 (per-port MAC)
- *   4: MAC Port 1 (per-port MAC)
+ * Expected MMIO regions in _CRS:
+ *   - TOP region (PCIe control) - typically 0x1d600000
+ *   - PROTECT region (bus protection) - typically 0x1d640000
+ *   - CKM region (clock management) - typically 0x16bd0000
+ *   - MAC Port 0 (per-port MAC) - typically 0x1d790000
+ *   - MAC Port 1 (per-port MAC) - typically 0x1d690000
+ *
+ * Regions are matched by address (comparing with platform data addresses)
+ * rather than index, as ACPI doesn't guarantee resource order.
  *
  * Falls back to hardcoded addresses if ACPI is unavailable or parsing fails.
  *
@@ -525,7 +522,7 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 	adev = ACPI_COMPANION(&pdev->dev);
 	if (!adev) {
 		dev_warn(&pdev->dev, "No ACPI companion device found, falling back to hardcoded addresses\n");
-		return pcie_hp_map_hardcoded_mmio(dev);
+		return pcie_hp_map_platform_mmio(dev);
 	}
 
 	/* Walk through ACPI _CRS resources to find Memory32Fixed entries */
@@ -534,65 +531,115 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
 	if (ACPI_FAILURE(status)) {
 		dev_warn(&pdev->dev, "Failed to walk ACPI resources: %s, falling back to hardcoded addresses\n",
 			 acpi_format_exception(status));
-		return pcie_hp_map_hardcoded_mmio(dev);
+		return pcie_hp_map_platform_mmio(dev);
 	}
 
 	/* Verify we found all required MMIO regions */
-	if (parsed.count < 5) {
-		dev_warn(&pdev->dev, "Expected 5 MMIO regions, found %d, falling back to hardcoded addresses\n",
-			 parsed.count);
-		return pcie_hp_map_hardcoded_mmio(dev);
+	if (parsed.count < PCIE_HP_MMIO_REGION_COUNT) {
+		dev_warn(&pdev->dev, "Expected %d MMIO regions, found %d, falling back to hardcoded addresses\n",
+			 PCIE_HP_MMIO_REGION_COUNT, parsed.count);
+		return pcie_hp_map_platform_mmio(dev);
 	}
 
 	dev_info(&pdev->dev, "Found %d MMIO regions in _CRS, mapping...\n", parsed.count);
 
-	/* Map each MMIO region using the addresses from ACPI */
+	/* Map each MMIO region using the addresses from ACPI.
+	 * Match regions by address (comparing with platform data addresses) rather than
+	 * index. While firmware may follow conventions, the ACPI spec doesn't guarantee
+	 * resource order, so address matching is more robust. This approach is acceptable
+	 * for SoC-specific drivers where MMIO addresses are fixed hardware addresses.
+	 * If ACPI provides addresses that don't match platform data, we fall back
+	 * to platform data addresses immediately (which are the authoritative SoC-specific values). */
+	int mapped_count = 0;
 	for (i = 0; i < parsed.count; i++) {
 		void __iomem *base;
 		u32 addr = parsed.mmio_regions[i].address;
 		u32 size = parsed.mmio_regions[i].address_length;
-		const char *name;
+		const char *name = "Unknown";
+		bool mapped = false;
 
-		/* Determine region name based on index */
-		switch (i) {
-		case 0: name = "TOP"; break;
-		case 1: name = "PROTECT"; break;
-		case 2: name = "CKM"; break;
-		case 3: name = "MAC Port 0"; break;
-		case 4: name = "MAC Port 1"; break;
-		default: name = "Unknown"; break;
-		}
-
-		/* Map the region (devm handles cleanup automatically) */
-		base = devm_ioremap(&pdev->dev, addr, size);
-		if (!base) {
-			dev_err(&pdev->dev, "Failed to map %s region (0x%08x)\n", name, addr);
-			return -ENOMEM;
-		}
-
-		dev_info(&pdev->dev, "Mapped %s: 0x%08x (size 0x%x) -> %p\n",
-			 name, addr, size, base);
-
-		/* Store the mapped address in the runtime structure */
-		switch (i) {
-		case 0:
+		/* Match region by address (compare with platform data addresses) */
+		if (mmio->top.addr && addr == mmio->top.addr) {
+			name = "TOP";
+			base = devm_ioremap(&pdev->dev, addr, size);
+			if (!base) {
+				dev_err(&pdev->dev, "Failed to map %s region (0x%08x)\n", name, addr);
+				return -ENOMEM;
+			}
 			dev->mmio.top_base = base;
-			break;
-		case 1:
+			mapped = true;
+		} else if (mmio->protect.addr && addr == mmio->protect.addr) {
+			name = "PROTECT";
+			base = devm_ioremap(&pdev->dev, addr, size);
+			if (!base) {
+				dev_err(&pdev->dev, "Failed to map %s region (0x%08x)\n", name, addr);
+				return -ENOMEM;
+			}
 			dev->mmio.protect_base = base;
-			break;
-		case 2:
+			mapped = true;
+		} else if (mmio->ckm.addr && addr == mmio->ckm.addr) {
+			name = "CKM";
+			base = devm_ioremap(&pdev->dev, addr, size);
+			if (!base) {
+				dev_err(&pdev->dev, "Failed to map %s region (0x%08x)\n", name, addr);
+				return -ENOMEM;
+			}
 			dev->mmio.ckm_base = base;
-			break;
-		case 3:
-			if (dev->pd->port_nums > 0)
-				dev->mmio.mac_port_base[0] = base;
-			break;
-		case 4:
-			if (dev->pd->port_nums > 1)
-				dev->mmio.mac_port_base[1] = base;
-			break;
+			mapped = true;
+		} else if (dev->pd->port_nums >= 1 && mmio->mac.addr[0] && addr == mmio->mac.addr[0]) {
+			name = "MAC Port 0";
+			base = devm_ioremap(&pdev->dev, addr, size);
+			if (!base) {
+				dev_err(&pdev->dev, "Failed to map %s region (0x%08x)\n", name, addr);
+				return -ENOMEM;
+			}
+			dev->mmio.mac_port_base[0] = base;
+			mapped = true;
+		} else if (dev->pd->port_nums >= 2 && mmio->mac.addr[1] && addr == mmio->mac.addr[1]) {
+			name = "MAC Port 1";
+			base = devm_ioremap(&pdev->dev, addr, size);
+			if (!base) {
+				dev_err(&pdev->dev, "Failed to map %s region (0x%08x)\n", name, addr);
+				return -ENOMEM;
+			}
+			dev->mmio.mac_port_base[1] = base;
+			mapped = true;
 		}
+
+		if (mapped) {
+			mapped_count++;
+			dev_info(&pdev->dev, "Mapped %s: 0x%08x (size 0x%x) -> %p\n",
+				 name, addr, size, base);
+		} else {
+			/* ACPI provided an address that doesn't match platform data.
+			 * This indicates ACPI may be incomplete or incorrect, so fall back
+			 * to platform data addresses immediately. */
+			dev_warn(&pdev->dev, "Unknown MMIO region at 0x%08x (size 0x%x) in ACPI, falling back to platform data addresses\n",
+				 addr, size);
+			/* Clear any partially mapped regions (devm_ioremap will clean up automatically) */
+			dev->mmio.top_base = NULL;
+			dev->mmio.protect_base = NULL;
+			dev->mmio.ckm_base = NULL;
+			for (i = 0; i < HP_PORT_MAX; i++)
+				dev->mmio.mac_port_base[i] = NULL;
+			return pcie_hp_map_platform_mmio(dev);
+		}
+	}
+
+	/* Verify all required regions were successfully mapped.
+	 * We explicitly check critical regions (TOP, PROTECT, CKM) are mapped,
+	 * as these are essential for driver operation. MAC ports are optional
+	 * based on port_nums, but if ACPI provides them, they should be mapped. */
+	if (!dev->mmio.top_base || !dev->mmio.protect_base || !dev->mmio.ckm_base) {
+		dev_warn(&pdev->dev, "Not all required MMIO regions mapped from ACPI (mapped %d), falling back to platform data addresses\n",
+			 mapped_count);
+		/* Clear any partially mapped regions (devm_ioremap will clean up automatically) */
+		dev->mmio.top_base = NULL;
+		dev->mmio.protect_base = NULL;
+		dev->mmio.ckm_base = NULL;
+		for (i = 0; i < HP_PORT_MAX; i++)
+			dev->mmio.mac_port_base[i] = NULL;
+		return pcie_hp_map_platform_mmio(dev);
 	}
 
 	dev_info(&pdev->dev, "Successfully mapped all MMIO regions from ACPI _CRS\n");
@@ -601,68 +648,102 @@ static int pcie_hp_map_resources(struct pcie_hp_dev *dev)
  
 static void mt8901_rp_bus_protect(struct pcie_hp_dev *dev, int port_idx, int stage)
 {
-    if (stage == BUS_PROTECT_INIT) {
+    switch (stage) {
+    case BUS_PROTECT_INIT:
         /* Initialize bus protection during probe - map MMIO regions (like 6.14's rp_bus_prepare) */
-        int ret;
-        
-        /* Map MMIO regions if not already mapped */
-        if (!dev->mmio.top_base) {
-            ret = pcie_hp_map_resources(dev);
-            if (ret) {
-                dev_err(&dev->pdev->dev, "Failed to map MMIO resources during bus init: %d\n", ret);
-                return;
+        {
+            int ret;
+            
+            /* Map MMIO regions if not already mapped (check critical regions) */
+            if (!dev->mmio.top_base || !dev->mmio.protect_base || !dev->mmio.ckm_base) {
+                ret = pcie_hp_map_resources(dev);
+                if (ret) {
+                    dev_err(&dev->pdev->dev, "Failed to map MMIO resources during bus init: %d\n", ret);
+                    return;
+                }
             }
         }
-        
-        return;
-    }
-
-    struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
-    void __iomem *mac_base;
-
-    if (port_idx >= dev->pd->port_nums)
         return;
 
-    mac_base = dev->mmio.mac_port_base[port_idx];
-    if (!mac_base)
+    case BUS_PROTECT_CLEANUP:
+        /* Cleanup stage (called during remove) - matches 6.14's rp_bus_prepare(pdev, false).
+         * Note: Both ACPI and platform data paths use devm_ioremap(), which automatically
+         * cleans up, so no manual iounmap() is needed (and calling it would cause a
+         * double-free bug). This cleanup clears pointers regardless of whether addresses
+         * came from ACPI _CRS or platform data. */
+        {
+            int i;
+
+            /* Clear MMIO base pointers (mappings are automatically cleaned up by devm_ioremap) */
+            for (i = 0; i < HP_PORT_MAX; i++) {
+                if (dev->mmio.mac_port_base[i])
+                    dev->mmio.mac_port_base[i] = NULL;
+            }
+            if (dev->mmio.top_base)
+                dev->mmio.top_base = NULL;
+            if (dev->mmio.protect_base)
+                dev->mmio.protect_base = NULL;
+            if (dev->mmio.ckm_base)
+                dev->mmio.ckm_base = NULL;
+        }
         return;
 
-    if (stage == BUS_PROTECT_CABLE_REMOVAL) {
-        /* Deassert LTSSM enable and PHY reset */
-        pcie_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
-                                 mmio_info->mac.ltssm_bit, false);
-        pcie_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
-                                 mmio_info->mac.phy_rst_bit, false);
-    }
+    case BUS_PROTECT_CABLE_REMOVAL:
+    case BUS_PROTECT_CABLE_PLUGIN:
+        {
+            struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
+            void __iomem *mac_base;
 
-    if (stage == BUS_PROTECT_CABLE_PLUGIN) {
-        if (!dev->mmio.top_base || !dev->mmio.protect_base)
-            return;
+            if (port_idx >= dev->pd->port_nums)
+                return;
 
-        /* Deassert way_en */
-        pcie_hp_toggle_update_bit(dev->mmio.top_base, mmio_info->top.ctrl,
-                                   mmio_info->top.port_bits[port_idx],
-                                   mmio_info->top.update_bit, false);
-        udelay(PCIE_HP_DELAY_SHORT_US);
+            mac_base = dev->mmio.mac_port_base[port_idx];
+            if (!mac_base)
+                return;
 
-        /* Enable bus protection */
-        pcie_hp_bus_protect_enable(dev, port_idx);
-        usleep_range(PCIE_HP_DELAY_BUS_PROTECT_US, PCIE_HP_DELAY_BUS_PROTECT_US + 1000);
+            if (stage == BUS_PROTECT_CABLE_REMOVAL) {
+                /* Deassert LTSSM enable and PHY reset */
+                pcie_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
+                                         mmio_info->mac.ltssm_bit, false);
+                pcie_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
+                                         mmio_info->mac.phy_rst_bit, false);
+                return;
+            }
 
-        /* Assert LTSSM enable and PHY reset */
-        pcie_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
-                                 mmio_info->mac.phy_rst_bit, true);
-        pcie_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
-                                 mmio_info->mac.ltssm_bit, true);
-        usleep_range(PCIE_HP_DELAY_PHY_RESET_US, PCIE_HP_DELAY_PHY_RESET_US + 1000);
+            /* BUS_PROTECT_CABLE_PLUGIN */
+            if (!dev->mmio.top_base || !dev->mmio.protect_base)
+                return;
 
-        /* Disable bus protection */
-        pcie_hp_bus_protect_disable(dev, port_idx);
+            /* Deassert way_en */
+            pcie_hp_toggle_update_bit(dev->mmio.top_base, mmio_info->top.ctrl,
+                                       mmio_info->top.port_bits[port_idx],
+                                       mmio_info->top.update_bit, false);
+            udelay(PCIE_HP_DELAY_SHORT_US);
 
-        /* Assert way_en */
-        pcie_hp_toggle_update_bit(dev->mmio.top_base, mmio_info->top.ctrl,
-                                   mmio_info->top.port_bits[port_idx],
-                                   mmio_info->top.update_bit, true);
+            /* Enable bus protection */
+            pcie_hp_bus_protect_enable(dev, port_idx);
+            usleep_range(PCIE_HP_DELAY_BUS_PROTECT_US, PCIE_HP_DELAY_BUS_PROTECT_US + 1000);
+
+            /* Assert LTSSM enable and PHY reset */
+            pcie_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
+                                     mmio_info->mac.phy_rst_bit, true);
+            pcie_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
+                                     mmio_info->mac.ltssm_bit, true);
+            usleep_range(PCIE_HP_DELAY_PHY_RESET_US, PCIE_HP_DELAY_PHY_RESET_US + 1000);
+
+            /* Disable bus protection */
+            pcie_hp_bus_protect_disable(dev, port_idx);
+
+            /* Assert way_en */
+            pcie_hp_toggle_update_bit(dev->mmio.top_base, mmio_info->top.ctrl,
+                                       mmio_info->top.port_bits[port_idx],
+                                       mmio_info->top.update_bit, true);
+        }
+        break;
+
+    default:
+        dev_warn(&dev->pdev->dev, "Unknown bus protect stage: %d\n", stage);
+        break;
     }
 }
  
@@ -748,42 +829,45 @@ static int polling_link_to_l0(struct pcie_hp_dev *dev)
     struct pci_dev *pci_dev;
     u32 ltssm_reg = dev->pd->ltssm_reg;
     u32 l0_state = dev->pd->ltssm_l0_state;
-    u32 *ltssm_vals;
+    u32 ltssm_vals[HP_PORT_MAX] = {0}; /* Stack array like 6.14's individual variables */
     int count = 0;
-    int i, all_ready;
+    int i;
+    bool all_l0;
 
     if (!ltssm_reg || !l0_state)
         return 0; /* Skip if not configured */
 
-    ltssm_vals = kcalloc(dev->pd->port_nums, sizeof(u32), GFP_KERNEL);
-    if (!ltssm_vals)
-        return -ENOMEM;
-
-    /* Poll until all ports reach L0 state */
-    while (count < HP_POLL_CNT_MAX) {
-        all_ready = 1;
+    /* Poll until all ports reach L0 state (matching 6.14's while condition logic)
+     * Initialize to ensure we enter the loop at least once */
+    all_l0 = false;
+    while (!all_l0) {
+        all_l0 = true;
         
-        for (i = 0; i < dev->pd->port_nums; i++) {
+        for (i = 0; i < dev->pd->port_nums && i < HP_PORT_MAX; i++) {
             pci_dev = get_port_root_port(dev, i);
-            if (!pci_dev)
+            if (!pci_dev) {
+                all_l0 = false;
                 continue;
+            }
 
             pci_read_config_dword(pci_dev, ltssm_reg, &ltssm_vals[i]);
             if ((ltssm_vals[i] & l0_state) != l0_state)
-                all_ready = 0;
+                all_l0 = false;
         }
 
-        if (all_ready)
+        if (all_l0)
             break;
 
         usleep_range(PCIE_HP_POLL_SLEEP_US, PCIE_HP_POLL_SLEEP_US + 1000);
         count++;
+
+        if (count > HP_POLL_CNT_MAX) {
+            dev_err(&dev->pdev->dev, "Timeout waiting for link to reach L0 (reached max count)\n");
+            break;
+        }
     }
 
-    kfree(ltssm_vals);
-
-    if (count >= HP_POLL_CNT_MAX) {
-        dev_err(&dev->pdev->dev, "Timeout waiting for link to reach L0\n");
+    if (count > HP_POLL_CNT_MAX) {
         return -ETIMEDOUT;
     }
 
@@ -941,7 +1025,7 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
     }
 
     /* Unknown GPIO pin */
-    dev_warn(gpio_ctx->dev, "Unknown GPIO pin event: pin=%d irq=%d value=%d\n",
+    dev_err(gpio_ctx->dev, "Unknown GPIO pin event: pin=%d irq=%d value=%d\n",
              gpio_ctx->pin, irq, value);
     spin_unlock_irqrestore(&hp_dev->lock, flags);
     return IRQ_HANDLED;
@@ -1409,6 +1493,10 @@ static void pcie_hp_remove(struct platform_device *pdev)
     /* Remove sysfs interface */
     sysfs_remove_group(&pdev->dev.kobj, &pcie_hp_attr_group);
 
+    /* Cleanup bus protection (matches 6.14's rp_bus_prepare(pdev, false)) */
+    if (hp_dev->pd->rp_bus_protect)
+        hp_dev->pd->rp_bus_protect(hp_dev, 0, BUS_PROTECT_CLEANUP);
+
     /* Remove pinctrl */
     pcie_hp_pinctrl_remove(hp_dev);
 
@@ -1458,21 +1546,25 @@ static const struct pcie_hp_plat_data mt8901_plat_data = {
     .num_devices = 4,
     .rp_bus_mmio = {
         .top = {
+            .addr = 0x1d600000,
             .ctrl = 0x400,
             .update_bit = BIT(24),
             .port_bits = {BIT(6), BIT(2)},
         },
         .protect = {
+            .addr = 0x1d640000,
             .mode = 0x38,
             .enable = 0x40,
             .port_bits = {BIT(20), BIT(16)},
         },
         .mac = {
+            .addr = {0x1d790000, 0x1d690000},
             .init_ctrl = 0x008,
             .ltssm_bit = BIT(0),
             .phy_rst_bit = BIT(8),
         },
         .ckm = {
+            .addr = 0x16bd0000,
             .ctrl = 0xa8,
             .disable_bit = BIT(5) | BIT(7),
         },
