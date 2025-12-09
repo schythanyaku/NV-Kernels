@@ -4,4 +4,3 @@
 #
 
 obj-$(CONFIG_MTK_PCIE_HOTPLUG) += mtk-pcie-hotplug.o
-
