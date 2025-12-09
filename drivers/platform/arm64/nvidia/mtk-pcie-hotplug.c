@@ -29,6 +29,7 @@
 #define PCIE_REG_SIZE		0x1000
 #define MAX_VENDOR_DATA_LEN	16
 #define PCIE_HP_MMIO_REGION_COUNT	5	/* TOP, PROTECT, CKM, MAC Port 0, MAC Port 1 */
+#define PCIE_HP_MIN_GPIO_COUNT	4	/* Minimum required: BOOT, PRSNT, PERST, EN */
 
 /* Hardware timing requirements (in microseconds unless noted) */
 #define PCIE_HP_DELAY_SHORT_US		10	/* Short delay for register writes */
@@ -1378,6 +1379,15 @@ static int pcie_hp_probe(struct platform_device *pdev)
     hp_dev->gpio_count = pcie_hp_probe_io_info(pdev);
     if (!hp_dev->gpio_count) {
         dev_err(&pdev->dev, "Failed to get gpio descriptors\n");
+        return -ENODEV;
+    }
+
+    /* TEMPORARY: Verify we have at least the minimum required GPIOs (BOOT, PRSNT, PERST, EN)
+     * This check is for testing purposes to ensure graceful failure during probe
+     * if required GPIOs are not available */
+    if (hp_dev->gpio_count < PCIE_HP_MIN_GPIO_COUNT) {
+        dev_err(&pdev->dev, "Insufficient GPIOs: required at least %d (BOOT, PRSNT, PERST, EN), got %d\n",
+                PCIE_HP_MIN_GPIO_COUNT, hp_dev->gpio_count);
         return -ENODEV;
     }
 
