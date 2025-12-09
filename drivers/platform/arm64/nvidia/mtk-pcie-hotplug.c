@@ -1205,7 +1205,8 @@ static const struct attribute_group pcie_hp_attr_group = {
  
 static struct gpio_acpi_context *gpio_acpi_setup(struct platform_device *pdev,
                                                    struct gpio_desc *desc,
-                                                   struct pcie_hp_dev *hp_dev)
+                                                   struct pcie_hp_dev *hp_dev,
+                                                   int gpio_index)
 {
     struct acpi_gpio_parse_context parse_ctx;
     struct gpio_acpi_context *ctx;
@@ -1236,8 +1237,18 @@ static struct gpio_acpi_context *gpio_acpi_setup(struct platform_device *pdev,
         return NULL;
     }
 
-    if (ctx->valid)
+    if (ctx->valid) {
+        /* Fallback: If vendor data missing, identify BOOT/PRSNT pins by array index
+         * This ensures compatibility with DSDT that doesn't have vendor data  */
+        if (gpio_index == PCIE_PIN_BOOT && hp_dev->boot_pin == -1) {
+            hp_dev->boot_pin = ctx->pin;
+            dev_info(&pdev->dev, "BOOT pin identified by index: hardware pin %d\n", hp_dev->boot_pin);
+        } else if (gpio_index == PCIE_PIN_PRSNT && hp_dev->prsnt_pin == -1) {
+            hp_dev->prsnt_pin = ctx->pin;
+            dev_info(&pdev->dev, "PRSNT pin identified by index: hardware pin %d\n", hp_dev->prsnt_pin);
+        }
         return ctx;
+    }
 
     devm_kfree(&pdev->dev, ctx);
     return NULL;
@@ -1423,7 +1434,7 @@ static int pcie_hp_probe(struct platform_device *pdev)
         }
 
         app_ctx->hp_dev = hp_dev;
-        app_ctx->ctx = gpio_acpi_setup(pdev, app_ctx->desc, hp_dev);
+        app_ctx->ctx = gpio_acpi_setup(pdev, app_ctx->desc, hp_dev, i);
         if (!app_ctx->ctx) {
             dev_err(&pdev->dev, "Failed to setup GPIO %d\n", i);
             ret = -ENODEV;
