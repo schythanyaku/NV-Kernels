@@ -131,21 +131,24 @@
  /* Forward declaration */
  struct pcie_hp_dev;
  
- struct pcie_hp_plat_data {
-     int port_nums;
-     struct pcie_port_info ports[HP_PORT_MAX];
-     u32 vendor_id;
-     u32 device_id;
-     int num_devices;
-     /* Platform-specific MMIO configuration */
-     struct rp_bus_mmio_info rp_bus_mmio;
-     void (*rp_bus_protect)(struct pcie_hp_dev *dev, int port_idx, int stage);
-     u32 ltssm_reg;
-     u32 ltssm_l0_state;
-     /* Pinctrl configuration */
-     int pin_nums;
-     struct pinctrl_map pinmap[];
- };
+struct pcie_hp_plat_data {
+    int port_nums;
+    struct pcie_port_info ports[HP_PORT_MAX];
+    u32 vendor_id;
+    u32 device_id;
+    int num_devices;
+    /* Platform-specific MMIO configuration */
+    struct rp_bus_mmio_info rp_bus_mmio;
+    void (*rp_bus_protect)(struct pcie_hp_dev *dev, int port_idx, int stage);
+    u32 ltssm_reg;
+    u32 ltssm_l0_state;
+    /* GPIO pin numbers (fallback for kernel 6.17 GPIO grouping workaround) */
+    unsigned int gpio_pins[PCIE_PIN_MAX];
+    int gpio_pin_count;
+    /* Pinctrl configuration */
+    int pin_nums;
+    struct pinctrl_map pinmap[];
+};
  
  struct pcie_hp_gpio_ctx {
      struct gpio_desc *desc;
@@ -1386,21 +1389,25 @@
          return -ENOMEM;
      }
  
-     /* Discover GPIO pins */
-     hp_dev->gpio_count = pcie_hp_probe_io_info(pdev);
-     if (!hp_dev->gpio_count) {
-         dev_err(&pdev->dev, "Failed to get gpio descriptors\n");
-         return -ENODEV;
-     }
- 
-     /* TEMPORARY: Verify we have at least the minimum required GPIOs (BOOT, PRSNT, PERST, EN)
-      * This check is for testing purposes to ensure graceful failure during probe
-      * if required GPIOs are not available */
-     if (hp_dev->gpio_count < PCIE_HP_MIN_GPIO_COUNT) {
-         dev_err(&pdev->dev, "Insufficient GPIOs: required at least %d (BOOT, PRSNT, PERST, EN), got %d\n",
-                 PCIE_HP_MIN_GPIO_COUNT, hp_dev->gpio_count);
-         return -ENODEV;
-     }
+    /* Discover GPIO pins via ACPI */
+    int acpi_gpio_count = pcie_hp_probe_io_info(pdev);
+    if (!acpi_gpio_count) {
+        dev_err(&pdev->dev, "Failed to get gpio descriptors\n");
+        return -ENODEV;
+    }
+    
+    /* Use platform data fallback only for EN (index 3) if ACPI enumeration returns fewer GPIOs
+     * due to kernel 6.17 bug. CLQ0/CLQ1 are handled via pinctrl, not GPIO descriptors */
+    if (acpi_gpio_count >= PCIE_HP_MIN_GPIO_COUNT) {
+        /* ACPI provided all required GPIOs including EN */
+        hp_dev->gpio_count = acpi_gpio_count;
+    } else {
+        /* ACPI enumeration insufficient (< 4 GPIOs) but provides at least 1 GPIO for base calculation
+         * - use platform data fallback for minimum required GPIOs (EN) */
+        dev_warn(&pdev->dev, "ACPI GPIO enumeration returned %d GPIOs (required %d), using platform data fallback for EN\n",
+                 acpi_gpio_count, PCIE_HP_MIN_GPIO_COUNT);
+        hp_dev->gpio_count = PCIE_HP_MIN_GPIO_COUNT;
+    }
  
      hp_dev->pins = devm_kzalloc(&pdev->dev,
                                   sizeof(struct pcie_hp_gpio_ctx) * hp_dev->gpio_count,
@@ -1421,17 +1428,59 @@
      for (i = 0; i < HP_PORT_MAX; i++)
          hp_dev->cached_root_ports[i] = NULL;
  
-     /* Setup GPIO pins and IRQs */
-     for (i = 0; i < hp_dev->gpio_count; i++) {
-         app_ctx = &hp_dev->pins[i];
-         app_ctx->desc = gpiod_get_index(&pdev->dev, NULL, i, GPIOD_ASIS);
-         if (IS_ERR(app_ctx->desc)) {
-             dev_err(&pdev->dev, "Failed to get GPIO %d: %ld\n",
-                     i, PTR_ERR(app_ctx->desc));
-             ret = PTR_ERR(app_ctx->desc);
-             app_ctx->desc = NULL;
-             goto gpio_release;
-         }
+    /* Setup GPIO pins and IRQs */
+    /* Calculate GPIO chip base from first GPIO (BOOT pin, index 0) - needed for platform data fallback */
+    unsigned int gpio_chip_base = 0;
+    bool gpio_chip_base_valid = false;
+    if (acpi_gpio_count > 0) {
+        struct gpio_desc *first_desc = gpiod_get_index(&pdev->dev, NULL, 0, GPIOD_ASIS);
+        if (!IS_ERR(first_desc)) {
+            gpio_chip_base = gpio_device_get_base(gpiod_to_gpio_device(first_desc));
+            gpiod_put(first_desc);
+            gpio_chip_base_valid = true;
+            dev_info(&pdev->dev, "GPIO chip base: %u (calculated from ACPI GPIO 0, BOOT pin)\n", gpio_chip_base);
+        } else {
+            dev_warn(&pdev->dev, "Failed to get BOOT pin (GPIO 0) for chip base calculation: %ld\n",
+                     PTR_ERR(first_desc));
+        }
+    }
+    
+    for (i = 0; i < hp_dev->gpio_count; i++) {
+        app_ctx = &hp_dev->pins[i];
+        
+        /* Use platform data GPIO pins only for EN (index 3) if ACPI enumeration didn't provide it
+         * (kernel 6.17 GPIO grouping bug workaround). CLQ0/CLQ1 are handled via pinctrl, not GPIO descriptors */
+        if (i == PCIE_PIN_EN && i >= acpi_gpio_count) {
+            if (!gpio_chip_base_valid) {
+                dev_err(&pdev->dev, "Cannot use platform data fallback for EN: GPIO chip base not available\n");
+                ret = -ENODEV;
+                goto gpio_release;
+            }
+            /* Fallback: Convert ACPI pin number to global GPIO number and use gpio_to_desc()
+             * ACPI pin numbers are chip-relative, so add GPIO chip base to get global GPIO number */
+            unsigned int global_gpio = gpio_chip_base + pd->gpio_pins[i];
+            app_ctx->desc = gpio_to_desc(global_gpio);
+            if (!app_ctx->desc) {
+                dev_err(&pdev->dev, "Failed to get GPIO descriptor for EN (power enable) pin: ACPI pin %u (global GPIO %u)\n",
+                        pd->gpio_pins[i], global_gpio);
+                ret = -ENODEV;
+                app_ctx->desc = NULL;
+                goto gpio_release;
+            }
+            dev_info(&pdev->dev, "Using platform data GPIO: ACPI pin %u -> global GPIO %u for index %d (%s)\n",
+                     pd->gpio_pins[i], global_gpio, i,
+                     i == PCIE_PIN_EN ? "EN" : (i == PCIE_PIN_CLQ0 ? "CLQ0" : "CLQ1"));
+        } else {
+            /* Normal ACPI GPIO access for BOOT, PRSNT, PERST (indices 0-2) */
+            app_ctx->desc = gpiod_get_index(&pdev->dev, NULL, i, GPIOD_ASIS);
+            if (IS_ERR(app_ctx->desc)) {
+                dev_err(&pdev->dev, "Failed to get GPIO %d: %ld\n",
+                        i, PTR_ERR(app_ctx->desc));
+                ret = PTR_ERR(app_ctx->desc);
+                app_ctx->desc = NULL;
+                goto gpio_release;
+            }
+        }
  
          app_ctx->hp_dev = hp_dev;
          app_ctx->ctx = gpio_acpi_setup(pdev, app_ctx->desc, hp_dev, i);
@@ -1451,11 +1500,11 @@
                  dev_err(&pdev->dev, "Failed to setup IRQ for GPIO %d\n", i);
                  goto gpio_release;
              }
-             dev_info(&pdev->dev, "IRQ %d registered for GPIO %d\n", gpiod_to_irq(app_ctx->desc), i);
-         }
-     }
- 
-     platform_set_drvdata(pdev, hp_dev);
+            dev_info(&pdev->dev, "IRQ %d registered for GPIO %d\n", gpiod_to_irq(app_ctx->desc), i);
+        }
+    }
+
+    platform_set_drvdata(pdev, hp_dev);
  
      /* Initialize pinctrl */
      ret = pcie_hp_pinctrl_init(hp_dev);
@@ -1492,14 +1541,16 @@
  
  pinctrl_remove:
      pcie_hp_pinctrl_remove(hp_dev);
- gpio_release:
-     for (i = 0; i < hp_dev->gpio_count; i++) {
-         app_ctx = &hp_dev->pins[i];
-         if (app_ctx->desc)
-             gpiod_put(app_ctx->desc);
-     }
- 
-     return ret;
+gpio_release:
+    if (hp_dev && hp_dev->pins) {
+        for (i = 0; i < hp_dev->gpio_count; i++) {
+            app_ctx = &hp_dev->pins[i];
+            if (app_ctx->desc)
+                gpiod_put(app_ctx->desc);
+        }
+    }
+
+    return ret;
  }
  
  static void pcie_hp_remove(struct platform_device *pdev)
@@ -1590,13 +1641,17 @@
              .disable_bit = BIT(5) | BIT(7),
          },
      },
-     .rp_bus_protect = mt8901_rp_bus_protect,
-     .ltssm_reg = 0x728,
-     .ltssm_l0_state = 0x11,
-     /* Pinctrl mappings: Platform-specific GPIO pin multiplexing configuration
-      * for PCIe clock request signals. These define SoC-specific pin names
-      * and mux functions for the MediaTek MT8901 platform. */
-     .pin_nums = 4,
+    .rp_bus_protect = mt8901_rp_bus_protect,
+    .ltssm_reg = 0x728,
+    .ltssm_l0_state = 0x11,
+    /* GPIO pin numbers from DSDT (fallback for kernel 6.17 GPIO grouping workaround)
+     * Order: BOOT, PRSNT, PERST, EN, CLQ0, CLQ1 */
+    .gpio_pins = {102, 103, 94, 146, 177, 178},
+    .gpio_pin_count = 6,
+    /* Pinctrl mappings: Platform-specific GPIO pin multiplexing configuration
+     * for PCIe clock request signals. These define SoC-specific pin names
+     * and mux functions for the MediaTek MT8901 platform. */
+    .pin_nums = 4,
      .pinmap = {
          PIN_MAP_MUX_GROUP("MTKP0001:00", "default", "NVDA9221:00", "GPIO177", "func0"),
          PIN_MAP_MUX_GROUP("MTKP0001:00", "default", "NVDA9221:00", "GPIO178", "func0"),
