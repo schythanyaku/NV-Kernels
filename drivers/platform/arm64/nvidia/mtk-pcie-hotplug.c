@@ -142,9 +142,8 @@ struct pcie_hp_plat_data {
     void (*rp_bus_protect)(struct pcie_hp_dev *dev, int port_idx, int stage);
     u32 ltssm_reg;
     u32 ltssm_l0_state;
-    /* GPIO pin numbers (fallback for kernel 6.17 GPIO grouping workaround) */
-    unsigned int gpio_pins[PCIE_PIN_MAX];
-    int gpio_pin_count;
+    /* GPIO pin number for EN (fallback for kernel 6.17 GPIO grouping workaround) */
+    unsigned int gpio_pin_en;
     /* Pinctrl configuration */
     int pin_nums;
     struct pinctrl_map pinmap[];
@@ -1458,18 +1457,17 @@ struct pcie_hp_plat_data {
             }
             /* Fallback: Convert ACPI pin number to global GPIO number and use gpio_to_desc()
              * ACPI pin numbers are chip-relative, so add GPIO chip base to get global GPIO number */
-            unsigned int global_gpio = gpio_chip_base + pd->gpio_pins[i];
+            unsigned int global_gpio = gpio_chip_base + pd->gpio_pin_en;
             app_ctx->desc = gpio_to_desc(global_gpio);
             if (!app_ctx->desc) {
                 dev_err(&pdev->dev, "Failed to get GPIO descriptor for EN (power enable) pin: ACPI pin %u (global GPIO %u)\n",
-                        pd->gpio_pins[i], global_gpio);
+                        pd->gpio_pin_en, global_gpio);
                 ret = -ENODEV;
                 app_ctx->desc = NULL;
                 goto gpio_release;
             }
-            dev_info(&pdev->dev, "Using platform data GPIO: ACPI pin %u -> global GPIO %u for index %d (%s)\n",
-                     pd->gpio_pins[i], global_gpio, i,
-                     i == PCIE_PIN_EN ? "EN" : (i == PCIE_PIN_CLQ0 ? "CLQ0" : "CLQ1"));
+            dev_info(&pdev->dev, "Using platform data GPIO: ACPI pin %u -> global GPIO %u for EN (index %d)\n",
+                     pd->gpio_pin_en, global_gpio, i);
         } else {
             /* Normal ACPI GPIO access for BOOT, PRSNT, PERST (indices 0-2) */
             app_ctx->desc = gpiod_get_index(&pdev->dev, NULL, i, GPIOD_ASIS);
@@ -1644,10 +1642,8 @@ gpio_release:
     .rp_bus_protect = mt8901_rp_bus_protect,
     .ltssm_reg = 0x728,
     .ltssm_l0_state = 0x11,
-    /* GPIO pin numbers from DSDT (fallback for kernel 6.17 GPIO grouping workaround)
-     * Order: BOOT, PRSNT, PERST, EN, CLQ0, CLQ1 */
-    .gpio_pins = {102, 103, 94, 146, 177, 178},
-    .gpio_pin_count = 6,
+    /* GPIO pin number for EN from DSDT (fallback for kernel 6.17 GPIO grouping workaround) */
+    .gpio_pin_en = 146,
     /* Pinctrl mappings: Platform-specific GPIO pin multiplexing configuration
      * for PCIe clock request signals. These define SoC-specific pin names
      * and mux functions for the MediaTek MT8901 platform. */
