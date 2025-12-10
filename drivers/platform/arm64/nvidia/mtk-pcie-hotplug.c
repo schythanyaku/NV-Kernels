@@ -932,47 +932,49 @@ struct pcie_hp_plat_data {
      return 0;
  }
  
- static irqreturn_t pcie_hp_work(int irq, void *dev_id)
- {
-     struct pcie_hp_gpio_ctx *app_ctx = dev_id;
-     struct pcie_hp_dev *hp_dev = app_ctx->hp_dev;
-     enum pcie_hp_state state;
-     unsigned long flags;
-     int ret;
- 
-     spin_lock_irqsave(&hp_dev->lock, flags);
-     state = hp_dev->state;
- 
-     switch (state) {
-     case STATE_PLUG_OUT:
-         dev_dbg(app_ctx->ctx->dev, "Cable plug out\n");
-         remove_device(hp_dev);
-         break;
-     case STATE_PLUG_IN:
-         dev_dbg(app_ctx->ctx->dev, "Enable device power\n");
-         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
-         break;
-     case STATE_DEV_POWER_OFF:
-     case STATE_DEV_POWER_ON:
-     case STATE_DEV_FW_START:
-         dev_dbg(app_ctx->ctx->dev, "Waiting for device to be ready\n");
-         break;
-     case STATE_RESCAN:
-         dev_dbg(app_ctx->ctx->dev, "Cable plug in, rescanning\n");
-         ret = rescan_device(hp_dev);
-         if (ret)
-             dev_err(app_ctx->ctx->dev, "Rescan failed: %d\n", ret);
-         else
-             hp_dev->state = STATE_READY;
-         break;
-     default:
-         dev_err(app_ctx->ctx->dev, "Unknown state: %d\n", state);
-         break;
-     }
- 
-     spin_unlock_irqrestore(&hp_dev->lock, flags);
-     return IRQ_HANDLED;
- }
+static irqreturn_t pcie_hp_work(int irq, void *dev_id)
+{
+    struct pcie_hp_gpio_ctx *app_ctx = dev_id;
+    struct pcie_hp_dev *hp_dev = app_ctx->hp_dev;
+    enum pcie_hp_state state;
+    unsigned long flags;
+    int ret;
+
+    spin_lock_irqsave(&hp_dev->lock, flags);
+    state = hp_dev->state;
+    spin_unlock_irqrestore(&hp_dev->lock, flags);
+
+    switch (state) {
+    case STATE_PLUG_OUT:
+        dev_dbg(app_ctx->ctx->dev, "Cable plug out\n");
+        remove_device(hp_dev);
+        break;
+    case STATE_PLUG_IN:
+        dev_dbg(app_ctx->ctx->dev, "Enable device power\n");
+        gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+        break;
+    case STATE_DEV_POWER_OFF:
+    case STATE_DEV_POWER_ON:
+    case STATE_DEV_FW_START:
+        dev_dbg(app_ctx->ctx->dev, "Waiting for device to be ready\n");
+        break;
+    case STATE_RESCAN:
+        dev_dbg(app_ctx->ctx->dev, "Cable plug in, rescanning\n");
+        ret = rescan_device(hp_dev);
+        spin_lock_irqsave(&hp_dev->lock, flags);
+        if (ret)
+            dev_err(app_ctx->ctx->dev, "Rescan failed: %d\n", ret);
+        else
+            hp_dev->state = STATE_READY;
+        spin_unlock_irqrestore(&hp_dev->lock, flags);
+        break;
+    default:
+        dev_err(app_ctx->ctx->dev, "Unknown state: %d\n", state);
+        break;
+    }
+
+    return IRQ_HANDLED;
+}
  
  static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
  {
@@ -985,23 +987,22 @@ struct pcie_hp_plat_data {
  
      value = gpiod_get_value(app_ctx->desc);
  
-     spin_lock_irqsave(&hp_dev->lock, flags);
-     state = hp_dev->state;
- 
-     /* Handle presence pin events (compare hardware pin numbers - robust against order changes) */
-     if (gpio_ctx->pin == hp_dev->prsnt_pin) {
-         if (value) {
-             dev_dbg(gpio_ctx->dev, "Presence pin: cable removal detected\n");
-             pcie_hp_send_uevent(hp_dev, REMOVAL_EVT);
-         } else {
-             dev_dbg(gpio_ctx->dev, "Presence pin: cable plug-in detected\n");
-             pcie_hp_send_uevent(hp_dev, PLUG_IN_EVT);
-         }
-         spin_unlock_irqrestore(&hp_dev->lock, flags);
-         /* For physical hotplug, let userspace handle device management
-          * to avoid potential deadlocks when hardware is in transition */
-         return IRQ_HANDLED;
-     }
+    /* Handle presence pin events first - no lock needed as prsnt_pin is read-only */
+    if (gpio_ctx->pin == hp_dev->prsnt_pin) {
+        if (value) {
+            dev_dbg(gpio_ctx->dev, "Presence pin: cable removal detected\n");
+            pcie_hp_send_uevent(hp_dev, REMOVAL_EVT);
+        } else {
+            dev_dbg(gpio_ctx->dev, "Presence pin: cable plug-in detected\n");
+            pcie_hp_send_uevent(hp_dev, PLUG_IN_EVT);
+        }
+        /* For physical hotplug, let userspace handle device management
+         * to avoid potential deadlocks when hardware is in transition */
+        return IRQ_HANDLED;
+    }
+
+    spin_lock_irqsave(&hp_dev->lock, flags);
+    state = hp_dev->state;
  
      /* Handle boot status pin events (compare hardware pin numbers - robust against order changes) */
      if (gpio_ctx->pin == hp_dev->boot_pin) {
@@ -1143,52 +1144,54 @@ struct pcie_hp_plat_data {
      if (err)
          return err;
  
-     spin_lock_irqsave(&hp_dev->lock, flags);
- 
-     switch (val) {
-     case PCIE_HP_DEBUG_PLUG_OUT:
-         dev_info(dev, "Debug: simulating cable removal\n");
- 
-         /* Safety check: Verify no devices on the bus before hardware shutdown.
-          * This prevents silicon bug where CPU access during link down causes
-          * system hang. Userspace must remove PCI devices first. */
-         for (i = 0; i < hp_dev->pd->port_nums; i++) {
-             if (pci_devices_present_on_domain(hp_dev->pd->ports[i].domain)) {
-                 dev_err(dev, "PCI devices still present, remove them first\n");
-                 spin_unlock_irqrestore(&hp_dev->lock, flags);
-                 return -EBUSY;
-             }
-         }
- 
-         /* Safe to proceed - no devices on bus */
-         hp_dev->state = STATE_PLUG_OUT;
-         remove_device(hp_dev);
-         break;
- 
-     case PCIE_HP_DEBUG_PLUG_IN:
-         dev_info(dev, "Debug: simulating cable plug-in\n");
- 
-         for (i = 0; i < hp_dev->pd->port_nums; i++) {
-             if (pci_devices_present_on_domain(hp_dev->pd->ports[i].domain)) {
-                 dev_err(dev, "PCI devices already present, cannot reinitialize hardware\n");
-                 spin_unlock_irqrestore(&hp_dev->lock, flags);
-                 return -EBUSY;
-             }
-         }
- 
-         /* Safe to proceed - no devices on bus */
-         hp_dev->state = STATE_PLUG_IN;
-         /* Enable device power - GPIO IRQ state machine will handle rest */
-         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
-         break;
- 
-     default:
-         spin_unlock_irqrestore(&hp_dev->lock, flags);
-         return -EINVAL;
-     }
- 
-     hp_dev->debug_state = val;
-     spin_unlock_irqrestore(&hp_dev->lock, flags);
+    switch (val) {
+    case PCIE_HP_DEBUG_PLUG_OUT:
+        dev_info(dev, "Debug: simulating cable removal\n");
+
+        /* Safety check: Verify no devices on the bus before hardware shutdown.
+         * This prevents silicon bug where CPU access during link down causes
+         * system hang. Userspace must remove PCI devices first.
+         * Release lock before calling sleep-capable function (pci_find_bus can sleep) */
+        for (i = 0; i < hp_dev->pd->port_nums; i++) {
+            if (pci_devices_present_on_domain(hp_dev->pd->ports[i].domain)) {
+                dev_err(dev, "PCI devices still present, remove them first\n");
+                return -EBUSY;
+            }
+        }
+
+        /* Safe to proceed - no devices on bus */
+        spin_lock_irqsave(&hp_dev->lock, flags);
+        hp_dev->state = STATE_PLUG_OUT;
+        hp_dev->debug_state = val;
+        spin_unlock_irqrestore(&hp_dev->lock, flags);
+        /* Release lock before calling sleep-capable function */
+        remove_device(hp_dev);
+        return count;
+
+    case PCIE_HP_DEBUG_PLUG_IN:
+        dev_info(dev, "Debug: simulating cable plug-in\n");
+
+        /* Release lock before calling sleep-capable function (pci_find_bus can sleep) */
+        for (i = 0; i < hp_dev->pd->port_nums; i++) {
+            if (pci_devices_present_on_domain(hp_dev->pd->ports[i].domain)) {
+                dev_err(dev, "PCI devices already present, cannot reinitialize hardware\n");
+                return -EBUSY;
+            }
+        }
+
+        /* Safe to proceed - no devices on bus */
+        spin_lock_irqsave(&hp_dev->lock, flags);
+        hp_dev->state = STATE_PLUG_IN;
+        hp_dev->debug_state = val;
+        spin_unlock_irqrestore(&hp_dev->lock, flags);
+        /* Release lock before calling sleep-capable function */
+        /* Enable device power - GPIO IRQ state machine will handle rest */
+        gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+        return count;
+
+    default:
+        return -EINVAL;
+    }
  
      return count;
  }
