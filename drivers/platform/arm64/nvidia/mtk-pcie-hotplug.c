@@ -858,8 +858,8 @@ struct acpi_gpio_walk_context {
      /* Disable clock */
      pcie_hp_ckm_control(dev, true);
  
-     /* Power off device */
-     gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
+    /* Power off device */
+    gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
  }
  
  static int polling_link_to_l0(struct pcie_hp_dev *dev)
@@ -1036,18 +1036,23 @@ static int polling_boot_complete(struct pcie_hp_dev *dev)
     int stable_high_count = 0;
     bool seen_low_after_power = false;
     unsigned long low_wait_start_jiffies;
-    unsigned long high_wait_start_jiffies;
-    const int DEBOUNCE_READS = (BOOT_DEBOUNCE_HIGH_MS * 1000) / PCIE_HP_POLL_SLEEP_US;
+    unsigned long high_wait_start_jiffies = 0; /* Initialize to avoid uninitialized use */
+    int debounce_reads;
     bool bias_configured = false;
 
-    if (!dev->pins[PCIE_PIN_BOOT].desc) {
-        dev_warn(&dev->pdev->dev, "BOOT pin not available, skipping firmware boot check\n");
-        return 0; /* Skip if boot pin not configured */
+    /* Calculate debounce reads - ensure no division by zero */
+    if (PCIE_HP_POLL_SLEEP_US == 0) {
+        dev_err(&dev->pdev->dev, "PCIE_HP_POLL_SLEEP_US is zero - invalid configuration\n");
+        return -EINVAL;
+    }
+    debounce_reads = (BOOT_DEBOUNCE_HIGH_MS * 1000) / PCIE_HP_POLL_SLEEP_US;
+    if (debounce_reads < 1) {
+        debounce_reads = 1; /* Minimum 1 read for debounce */
     }
 
     dev_info(&dev->pdev->dev, "=== Starting BOOT_COMP polling (GP77: 0→1 transition) ===\n");
-    dev_info(&dev->pdev->dev, "Timeout settings: low_wait=%dms, high_wait=%dms, debounce=%dms\n",
-             BOOT_LOW_WAIT_TIMEOUT_MS, BOOT_HIGH_WAIT_TIMEOUT_MS, BOOT_DEBOUNCE_HIGH_MS);
+    dev_info(&dev->pdev->dev, "Timeout settings: low_wait=%dms, high_wait=%dms, debounce=%dms (%d reads)\n",
+             BOOT_LOW_WAIT_TIMEOUT_MS, BOOT_HIGH_WAIT_TIMEOUT_MS, BOOT_DEBOUNCE_HIGH_MS, debounce_reads);
 
     /* Make GPIO bias explicit: If PullDefault=PullUp, attempt to disable pull-up */
     boot_value = gpiod_get_value(dev->pins[PCIE_PIN_BOOT].desc);
@@ -1119,13 +1124,13 @@ static int polling_boot_complete(struct pcie_hp_dev *dev)
         boot_value = gpiod_get_value(dev->pins[PCIE_PIN_BOOT].desc);
         
         dev_dbg(&dev->pdev->dev, "Phase 2: BOOT_COMP=%d, stable_high_count=%d/%d (elapsed: %lums)\n",
-                boot_value, stable_high_count, DEBOUNCE_READS,
+                boot_value, stable_high_count, debounce_reads,
                 jiffies_to_msecs(jiffies - high_wait_start_jiffies));
 
         if (boot_value == 1) {
             /* Phase 3: Require BOOT to stay high for debounce window (5-10ms) */
             stable_high_count++;
-            if (stable_high_count >= DEBOUNCE_READS) {
+            if (stable_high_count >= debounce_reads) {
                 dev_info(&dev->pdev->dev, "✓✓✓ Phase 2 SUCCESS: CX7 firmware boot complete!\n");
                 dev_info(&dev->pdev->dev, "   BOOT_COMP GP77: 0→1 transition detected\n");
                 dev_info(&dev->pdev->dev, "   Stable HIGH for %d reads (~%dms)\n",
@@ -1137,7 +1142,7 @@ static int polling_boot_complete(struct pcie_hp_dev *dev)
                 return 0; /* Success - valid rising edge detected */
             } else {
                 dev_dbg(&dev->pdev->dev, "Phase 2: BOOT_COMP HIGH, debouncing (%d/%d)\n",
-                        stable_high_count, DEBOUNCE_READS);
+                        stable_high_count, debounce_reads);
             }
         } else {
             /* Signal went low again - reset debounce counter */
@@ -1159,7 +1164,7 @@ static int polling_boot_complete(struct pcie_hp_dev *dev)
     dev_err(&dev->pdev->dev, "   Total elapsed time: %lums\n", total_elapsed_ms);
     dev_err(&dev->pdev->dev, "   Last BOOT_COMP value: %d\n", boot_value);
     dev_err(&dev->pdev->dev, "   Stable high count: %d/%d (need %d for debounce)\n",
-            stable_high_count, DEBOUNCE_READS, DEBOUNCE_READS);
+            stable_high_count, debounce_reads, debounce_reads);
     dev_err(&dev->pdev->dev, "\nCRITICAL: BOOT_COMP never asserted HIGH within %dms!\n", BOOT_HIGH_WAIT_TIMEOUT_MS);
     dev_err(&dev->pdev->dev, "FW did not signal ready - BOOT_COMP went LOW but never transitioned to HIGH.\n\n");
     dev_err(&dev->pdev->dev, "Possible causes:\n");
@@ -1207,8 +1212,11 @@ static int rescan_device(struct pcie_hp_dev *dev)
     /* Step 3: Enable REFCLK - Change pinctrl state to clkreqn (enables clock request) */
     dev_info(&dev->pdev->dev, "Step 3: Enabling REFCLK (pinctrl: clkreqn)\n");
     err = pcie_hp_change_state(dev, "clkreqn");
-    if (err)
+    if (err) {
+        dev_err(&dev->pdev->dev, "Failed to enable REFCLK: %d\n", err);
+        /* PERST is already asserted, which is safe - device stays in reset */
         return err;
+    }
 
     /* Step 4: Enable clock control */
     dev_info(&dev->pdev->dev, "Step 4: Enabling clock control\n");
@@ -1244,6 +1252,7 @@ static int rescan_device(struct pcie_hp_dev *dev)
      err = polling_link_to_l0(dev);
      if (err) {
          dev_err(&dev->pdev->dev, "PCIe link failed to reach L0\n");
+         /* PERST is already deasserted - leave it as-is for retry */
          return err;
      }
      dev_info(&dev->pdev->dev, "PCIe link reached L0 state\n");
