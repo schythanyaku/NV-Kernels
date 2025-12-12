@@ -18,8 +18,9 @@
  #include <linux/kernel.h>
  #include <linux/module.h>
  #include <linux/pci.h>
- #include <linux/pinctrl/consumer.h>
- #include <linux/platform_device.h>
+#include <linux/pinctrl/consumer.h>
+#include <linux/pinctrl/pinconf.h>
+#include <linux/platform_device.h>
  #include <linux/pm_runtime.h>
  #include <linux/of.h>
  #include <linux/property.h>
@@ -31,13 +32,27 @@
  #define PCIE_HP_MMIO_REGION_COUNT	5	/* TOP, PROTECT, CKM, MAC Port 0, MAC Port 1 */
  #define PCIE_HP_MIN_GPIO_COUNT	4	/* Minimum required: BOOT, PRSNT, PERST, EN */
  
- /* Hardware timing requirements (in microseconds unless noted) */
- #define PCIE_HP_DELAY_SHORT_US		10	/* Short delay for register writes */
- #define PCIE_HP_DELAY_STANDARD_US	10000	/* Standard delay (10ms) */
- #define PCIE_HP_DELAY_BUS_PROTECT_US	5000	/* Bus protection setup delay */
- #define PCIE_HP_DELAY_PHY_RESET_US	3000	/* PHY reset delay */
- #define PCIE_HP_DELAY_LINK_STABLE_MS	100	/* Link stabilization delay (ms) */
- #define PCIE_HP_POLL_SLEEP_US		10000	/* Polling loop sleep interval */
+/* Hardware timing requirements (in microseconds unless noted) */
+#define PCIE_HP_DELAY_SHORT_US		10	/* Short delay for register writes */
+#define PCIE_HP_DELAY_STANDARD_US	10000	/* Standard delay (10ms) */
+#define PCIE_HP_DELAY_BUS_PROTECT_US	5000	/* Bus protection setup delay */
+#define PCIE_HP_DELAY_PHY_RESET_US	3000	/* PHY reset delay */
+#define PCIE_HP_DELAY_LINK_STABLE_MS	100	/* Link stabilization delay (ms) */
+#define PCIE_HP_POLL_SLEEP_US		10000	/* Polling loop sleep interval */
+
+/* BOOT_COMP polling timeouts (in milliseconds)
+ * Note: These are initial values based on recommended approach examples.
+ * Actual firmware boot timing may vary - adjust based on hardware testing.
+ * 
+ * low_wait: Device should start driving BOOT_COMP signal quickly after power-on.
+ *           If pull-up masking is present, we want fast failure detection.
+ * high_wait: Firmware boot time varies. This timeout should cover typical boot
+ *            duration while preventing indefinite waits.
+ * debounce: Short stability check to prevent false positives from glitches.
+ */
+#define BOOT_LOW_WAIT_TIMEOUT_MS	2000	/* Timeout to see BOOT go low after power enable */
+#define BOOT_HIGH_WAIT_TIMEOUT_MS	10000	/* Timeout to see BOOT go high after seeing low */
+#define BOOT_DEBOUNCE_HIGH_MS		10	/* Debounce window for stable high (5-10ms) */
  
  #define PLUG_IN_EVT "HOTPLUG_STATE=plugin"
  #define REMOVAL_EVT "HOTPLUG_STATE=removal"
@@ -897,58 +912,356 @@ struct acpi_gpio_walk_context {
      return 0;
  }
  
- static int rescan_device(struct pcie_hp_dev *dev)
- {
-     struct pci_dev *pci_dev;
-     int i, err;
+/**
+ * verify_boot_transition_stable - Verify BOOT_COMP transition is stable with debounce
+ * @dev: PCIe hotplug device
+ * @expected_value: Expected value after transition (0 or 1)
+ * @transition_name: Human-readable name for logging (e.g., "0→1", "1→0")
+ *
+ * Verifies that BOOT_COMP has transitioned to expected_value and stays stable
+ * for a debounce period. This prevents false positives from glitches or pull-up/down.
+ *
+ * Returns: 0 if stable transition verified, -EIO if not stable
+ */
+static int verify_boot_transition_stable(struct pcie_hp_dev *dev, int expected_value,
+                                         const char *transition_name)
+{
+    int i;
+    int boot_value;
+    const int DEBOUNCE_READS = 5; /* Require 5 consecutive reads */
+    const int DEBOUNCE_DELAY_US = 2000; /* 2ms between reads = 10ms total */
+
+    if (!dev->pins[PCIE_PIN_BOOT].desc) {
+        dev_warn(&dev->pdev->dev, "BOOT pin not available, skipping stability check\n");
+        return 0; /* Skip if boot pin not configured */
+    }
+
+    /* Verify BOOT_COMP stays at expected_value for debounce period */
+    for (i = 0; i < DEBOUNCE_READS; i++) {
+        boot_value = gpiod_get_value(dev->pins[PCIE_PIN_BOOT].desc);
+        if (boot_value != expected_value) {
+            dev_dbg(&dev->pdev->dev, "BOOT_COMP %s transition not stable "
+                    "(read %d, expected %d at check %d)\n",
+                    transition_name, boot_value, expected_value, i + 1);
+            return -EIO;
+        }
+        if (i < DEBOUNCE_READS - 1) {
+            usleep_range(DEBOUNCE_DELAY_US, DEBOUNCE_DELAY_US + 500);
+        }
+    }
+
+    dev_info(&dev->pdev->dev, "BOOT_COMP GP77 %s transition stable "
+            "(verified for %dms)\n",
+            transition_name, DEBOUNCE_READS * DEBOUNCE_DELAY_US / 1000);
+    return 0;
+}
+
+/**
+ * configure_boot_gpio_bias - Configure BOOT_COMP GPIO bias to disable pull-up
+ * @dev: PCIe hotplug device
+ *
+ * Attempts to reconfigure BOOT_COMP GPIO bias to disable pull-up/pull-down
+ * at runtime. This is a fallback when DSDT has PullDefault=PullUp which masks
+ * the true signal level.
+ *
+ * Returns: 0 on success (or if not supported), negative on error
+ */
+static int configure_boot_gpio_bias(struct pcie_hp_dev *dev)
+{
+    struct pinctrl *pinctrl;
+    struct pinctrl_state *state;
+    int ret;
+
+    if (!dev->pins[PCIE_PIN_BOOT].desc) {
+        return 0; /* Skip if boot pin not configured */
+    }
+
+    /* Try to get pinctrl for this GPIO */
+    pinctrl = devm_pinctrl_get(&dev->pdev->dev);
+    if (IS_ERR(pinctrl)) {
+        dev_dbg(&dev->pdev->dev, "No pinctrl available for GPIO bias configuration\n");
+        return 0; /* Not an error - pinctrl might not be available */
+    }
+
+    /* Try to configure bias-disable state */
+    state = pinctrl_lookup_state(pinctrl, "boot-bias-disable");
+    if (IS_ERR(state)) {
+        /* Fallback: GPIO bias configuration via pinctrl might not be available
+         * This is a best-effort attempt - if it fails, we'll proceed anyway
+         * and rely on the timeout/edge detection logic */
+        dev_dbg(&dev->pdev->dev, "GPIO bias configuration via pinctrl not available\n");
+        ret = 0; /* Not an error - continue without bias configuration */
+    } else {
+        ret = pinctrl_select_state(pinctrl, state);
+        if (ret) {
+            /* Log loudly when bias reconfiguration fails - this is important for debugging */
+            WARN_ONCE(ret, "mtk-pcie-hotplug: Failed to disable BOOT_COMP GPIO pull-up (ret=%d). "
+                      "Phase-1 timeout may occur if GPIO is pulled up by hardware.\n", ret);
+            dev_warn(&dev->pdev->dev, "Failed to select bias-disable state: %d\n", ret);
+        } else {
+            dev_info(&dev->pdev->dev, "BOOT_COMP GPIO bias disabled via pinctrl state\n");
+        }
+    }
+
+    devm_pinctrl_put(pinctrl);
+    return ret;
+}
+
+/**
+ * polling_boot_complete - Poll for BOOT_COMP 0→1 transition (firmware ready)
+ * @dev: PCIe hotplug device
+ *
+ * According to CX7 driver partition design, we MUST wait for BOOT_COMP GP77
+ * to transition from 0 to 1 before proceeding with PCIe negotiation. This
+ * indicates CX7 firmware has finished booting and is ready.
+ *
+ * Implements the recommended approach with separate timeouts for each phase:
+ * 1. Phase 1 (low_wait): Wait up to BOOT_LOW_WAIT_TIMEOUT_MS to see BOOT go low
+ *    - Fast failure (1-3s) if pull-up masking prevents seeing low
+ * 2. Phase 2 (high_wait): After seeing low, wait up to BOOT_HIGH_WAIT_TIMEOUT_MS for 0→1
+ *    - Longer timeout (5-15s) for firmware boot completion
+ * 3. Phase 3 (debounce): Require stable high for BOOT_DEBOUNCE_HIGH_MS
+ *    - Prevents false positives from glitches
+ * 
+ * If any timeout expires, abort bring-up and don't enumerate PCIe.
+ *
+ * If BOOT_COMP reads as 1 immediately after power-enable, attempts to disable
+ * GPIO pull-up at runtime (fallback if DSDT can't be modified).
+ *
+ * Returns: 0 if 0→1 transition detected and stable, -ETIMEDOUT if timeout
+ */
+static int polling_boot_complete(struct pcie_hp_dev *dev)
+{
+    int boot_value;
+    int stable_high_count = 0;
+    bool seen_low_after_power = false;
+    unsigned long low_wait_start_jiffies;
+    unsigned long high_wait_start_jiffies;
+    const int DEBOUNCE_READS = (BOOT_DEBOUNCE_HIGH_MS * 1000) / PCIE_HP_POLL_SLEEP_US;
+    bool bias_configured = false;
+
+    if (!dev->pins[PCIE_PIN_BOOT].desc) {
+        dev_warn(&dev->pdev->dev, "BOOT pin not available, skipping firmware boot check\n");
+        return 0; /* Skip if boot pin not configured */
+    }
+
+    dev_info(&dev->pdev->dev, "=== Starting BOOT_COMP polling (GP77: 0→1 transition) ===\n");
+    dev_info(&dev->pdev->dev, "Timeout settings: low_wait=%dms, high_wait=%dms, debounce=%dms\n",
+             BOOT_LOW_WAIT_TIMEOUT_MS, BOOT_HIGH_WAIT_TIMEOUT_MS, BOOT_DEBOUNCE_HIGH_MS);
+
+    /* Make GPIO bias explicit: If PullDefault=PullUp, attempt to disable pull-up */
+    boot_value = gpiod_get_value(dev->pins[PCIE_PIN_BOOT].desc);
+    dev_info(&dev->pdev->dev, "Initial BOOT_COMP read: %d (after power-on)\n", boot_value);
+    
+    if (boot_value == 1) {
+        dev_info(&dev->pdev->dev, "BOOT_COMP reads HIGH initially - attempting to disable GPIO pull-up\n");
+        configure_boot_gpio_bias(dev);
+        bias_configured = true;
+        /* Small delay to allow bias change to take effect */
+        msleep(10);
+        boot_value = gpiod_get_value(dev->pins[PCIE_PIN_BOOT].desc);
+        dev_info(&dev->pdev->dev, "BOOT_COMP after bias config attempt: %d\n", boot_value);
+        if (boot_value == 1) {
+            dev_warn(&dev->pdev->dev, "BOOT_COMP still HIGH after bias configuration - pull-up may be hardware-level\n");
+        }
+    } else {
+        dev_info(&dev->pdev->dev, "BOOT_COMP reads LOW initially - device is driving signal\n");
+    }
+
+    low_wait_start_jiffies = jiffies;
+    dev_info(&dev->pdev->dev, "=== Phase 1: Waiting for BOOT_COMP to go LOW (timeout: %dms) ===\n",
+             BOOT_LOW_WAIT_TIMEOUT_MS);
+
+    /* Phase 1: low_wait_timeout (1-3s) - Force observation of BOOT=0 after device power-on */
+    while (time_before(jiffies, low_wait_start_jiffies + msecs_to_jiffies(BOOT_LOW_WAIT_TIMEOUT_MS))) {
+        boot_value = gpiod_get_value(dev->pins[PCIE_PIN_BOOT].desc);
+        
+        dev_dbg(&dev->pdev->dev, "Phase 1: BOOT_COMP=%d (elapsed: %lums)\n",
+                boot_value, jiffies_to_msecs(jiffies - low_wait_start_jiffies));
+
+        if (boot_value == 0) {
+            seen_low_after_power = true;
+            stable_high_count = 0;
+            high_wait_start_jiffies = jiffies;
+            dev_info(&dev->pdev->dev, "✓ Phase 1 SUCCESS: BOOT_COMP went LOW (elapsed: %lums)\n",
+                     jiffies_to_msecs(jiffies - low_wait_start_jiffies));
+            dev_info(&dev->pdev->dev, "=== Phase 2: Waiting for BOOT_COMP 0→1 transition (timeout: %dms) ===\n",
+                     BOOT_HIGH_WAIT_TIMEOUT_MS);
+            break; /* Exit Phase 1, proceed to Phase 2 */
+        }
+
+        usleep_range(PCIE_HP_POLL_SLEEP_US, PCIE_HP_POLL_SLEEP_US + 1000);
+    }
+
+    /* If any timeout expires, abort bring-up and don't enumerate PCIe */
+    if (!seen_low_after_power) {
+        unsigned long elapsed_ms = jiffies_to_msecs(jiffies - low_wait_start_jiffies);
+        dev_err(&dev->pdev->dev, "✗✗✗ Phase 1 FAILED: Timeout waiting for BOOT_COMP to go LOW\n");
+        dev_err(&dev->pdev->dev, "   Timeout: %dms, Elapsed: %lums\n", BOOT_LOW_WAIT_TIMEOUT_MS, elapsed_ms);
+        dev_err(&dev->pdev->dev, "   Last BOOT_COMP value: %d\n", boot_value);
+        dev_err(&dev->pdev->dev, "   Bias configuration attempted: %s\n",
+                bias_configured ? "YES" : "NO");
+        dev_err(&dev->pdev->dev, "\nCRITICAL: BOOT_COMP never went LOW after power-enable!\n");
+        dev_err(&dev->pdev->dev, "Cannot verify 0→1 transition without seeing LOW state.\n\n");
+        dev_err(&dev->pdev->dev, "This is a GPIO configuration / board issue, NOT a firmware timeout.\n");
+        dev_err(&dev->pdev->dev, "\nPossible causes:\n");
+        dev_err(&dev->pdev->dev, "  1. GPIO pull-up (PullDefault=PullUp) masking true level%s\n",
+                bias_configured ? " (runtime bias disable attempted but failed)" : "");
+        dev_err(&dev->pdev->dev, "  2. Device not driving BOOT_COMP signal\n");
+        dev_err(&dev->pdev->dev, "  3. Incorrect GPIO mapping/polarity\n");
+        dev_err(&dev->pdev->dev, "\nACTION: Check DSDT GPIO pull configuration or verify hardware.\n");
+        dev_err(&dev->pdev->dev, "=== ABORTING PCIe initialization - GPIO/board configuration issue ===\n");
+        return -ETIMEDOUT; /* Abort - don't enumerate PCIe */
+    }
+
+    /* Phase 2: high_wait_timeout (5-15s) - Wait for BOOT to transition to 1 */
+    while (time_before(jiffies, high_wait_start_jiffies + msecs_to_jiffies(BOOT_HIGH_WAIT_TIMEOUT_MS))) {
+        boot_value = gpiod_get_value(dev->pins[PCIE_PIN_BOOT].desc);
+        
+        dev_dbg(&dev->pdev->dev, "Phase 2: BOOT_COMP=%d, stable_high_count=%d/%d (elapsed: %lums)\n",
+                boot_value, stable_high_count, DEBOUNCE_READS,
+                jiffies_to_msecs(jiffies - high_wait_start_jiffies));
+
+        if (boot_value == 1) {
+            /* Phase 3: Require BOOT to stay high for debounce window (5-10ms) */
+            stable_high_count++;
+            if (stable_high_count >= DEBOUNCE_READS) {
+                dev_info(&dev->pdev->dev, "✓✓✓ Phase 2 SUCCESS: CX7 firmware boot complete!\n");
+                dev_info(&dev->pdev->dev, "   BOOT_COMP GP77: 0→1 transition detected\n");
+                dev_info(&dev->pdev->dev, "   Stable HIGH for %d reads (~%dms)\n",
+                        stable_high_count,
+                        stable_high_count * (PCIE_HP_POLL_SLEEP_US / 1000));
+                dev_info(&dev->pdev->dev, "   Total elapsed time: %lums\n",
+                        jiffies_to_msecs(jiffies - low_wait_start_jiffies));
+                dev_info(&dev->pdev->dev, "=== BOOT_COMP polling complete - proceeding with PCIe initialization ===\n");
+                return 0; /* Success - valid rising edge detected */
+            } else {
+                dev_dbg(&dev->pdev->dev, "Phase 2: BOOT_COMP HIGH, debouncing (%d/%d)\n",
+                        stable_high_count, DEBOUNCE_READS);
+            }
+        } else {
+            /* Signal went low again - reset debounce counter */
+            if (stable_high_count > 0) {
+                dev_dbg(&dev->pdev->dev, "Phase 2: BOOT_COMP went LOW again, resetting debounce counter\n");
+            }
+            stable_high_count = 0;
+        }
+
+        usleep_range(PCIE_HP_POLL_SLEEP_US, PCIE_HP_POLL_SLEEP_US + 1000);
+    }
+
+    /* Timeout in Phase 2 - saw low but never got stable high */
+    unsigned long total_elapsed_ms = jiffies_to_msecs(jiffies - low_wait_start_jiffies);
+    unsigned long phase2_elapsed_ms = jiffies_to_msecs(jiffies - high_wait_start_jiffies);
+    dev_err(&dev->pdev->dev, "✗✗✗ Phase 2 FAILED: Timeout waiting for BOOT_COMP 0→1 transition\n");
+    dev_err(&dev->pdev->dev, "   Phase 2 timeout: %dms, Elapsed: %lums\n",
+            BOOT_HIGH_WAIT_TIMEOUT_MS, phase2_elapsed_ms);
+    dev_err(&dev->pdev->dev, "   Total elapsed time: %lums\n", total_elapsed_ms);
+    dev_err(&dev->pdev->dev, "   Last BOOT_COMP value: %d\n", boot_value);
+    dev_err(&dev->pdev->dev, "   Stable high count: %d/%d (need %d for debounce)\n",
+            stable_high_count, DEBOUNCE_READS, DEBOUNCE_READS);
+    dev_err(&dev->pdev->dev, "\nCRITICAL: BOOT_COMP never asserted HIGH within %dms!\n", BOOT_HIGH_WAIT_TIMEOUT_MS);
+    dev_err(&dev->pdev->dev, "FW did not signal ready - BOOT_COMP went LOW but never transitioned to HIGH.\n\n");
+    dev_err(&dev->pdev->dev, "Possible causes:\n");
+    dev_err(&dev->pdev->dev, "  1. CX7 firmware boot failure\n");
+    dev_err(&dev->pdev->dev, "  2. Firmware boot takes longer than %dms (may need timeout adjustment)\n", BOOT_HIGH_WAIT_TIMEOUT_MS);
+    dev_err(&dev->pdev->dev, "  3. BOOT_COMP signal issue (hardware problem)\n");
+    dev_err(&dev->pdev->dev, "\nACTION: Check CX7 firmware status, increase timeout, or verify hardware.\n");
+    dev_err(&dev->pdev->dev, "=== ABORTING PCIe initialization - firmware boot incomplete ===\n");
+    return -ETIMEDOUT; /* Abort - don't enumerate PCIe */
+}
+
+static int rescan_device(struct pcie_hp_dev *dev)
+{
+    struct pci_dev *pci_dev;
+    int i, err;
+
+    /* IMPORTANT: This function is ONLY called after polling_boot_complete() succeeds.
+     * BOOT_COMP GP77 0→1 transition has been verified, firmware is ready.
+     * 
+     * Correct sequence per CX7 spec:
+     * 1. Power CX7 (GP251=1) ✓ (done before polling_boot_complete)
+     * 2. Wait for BOOT_COMP 0→1 ✓ (polling_boot_complete)
+     * 3. Assert PERST# (put device in reset)
+     * 4. Enable REFCLK
+     * 5. Wait for REFCLK stable
+     * 6. Deassert PERST# (release reset, link can train)
+     * 7. Wait for link-up
+     * 8. Rescan devices
+     */
+
+    dev_info(&dev->pdev->dev, "=== Starting PCIe initialization (BOOT_COMP verified) ===\n");
+
+    /* Step 1: Assert PCIe reset (PERST# = 1 means reset asserted)
+     * Must be done BEFORE enabling REFCLK per PCIe spec */
+    dev_info(&dev->pdev->dev, "Step 1: Asserting PCIe reset (PERST#) - device in reset\n");
+    gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
+
+    /* Step 2: Apply bus protection */
+    dev_info(&dev->pdev->dev, "Step 2: Applying bus protection\n");
+    if (dev->pd->rp_bus_protect) {
+        for (i = 0; i < dev->pd->port_nums; i++)
+            dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
+    }
+
+    /* Step 3: Enable REFCLK - Change pinctrl state to clkreqn (enables clock request) */
+    dev_info(&dev->pdev->dev, "Step 3: Enabling REFCLK (pinctrl: clkreqn)\n");
+    err = pcie_hp_change_state(dev, "clkreqn");
+    if (err)
+        return err;
+
+    /* Step 4: Enable clock control */
+    dev_info(&dev->pdev->dev, "Step 4: Enabling clock control\n");
+    pcie_hp_ckm_control(dev, false);
+    
+    /* Step 5: Wait for REFCLK stable (after REFCLK is stable, deassert PERST#) */
+    dev_info(&dev->pdev->dev, "Step 5: Waiting for REFCLK stable (%dms)\n",
+             PCIE_HP_DELAY_STANDARD_US / 1000);
+    usleep_range(PCIE_HP_DELAY_STANDARD_US, PCIE_HP_DELAY_STANDARD_US + 1000);
+
+    /* Step 6: Resume root ports */
+    dev_info(&dev->pdev->dev, "Step 6: Resuming root ports\n");
+    for (i = 0; i < dev->pd->port_nums; i++) {
+        pci_dev = get_port_root_port(dev, i);
+        if (!pci_dev)
+            continue;
+
+        err = pm_runtime_resume_and_get(&pci_dev->dev);
+        if (err < 0) {
+            dev_err(&dev->pdev->dev,
+                    "Runtime resume failed for %s: %d\n",
+                    pci_name(pci_dev), err);
+        }
+    }
+
+    /* Step 7: Deassert PERST# (PERST# = 0 means reset deasserted, link can train)
+     * This is done AFTER REFCLK is stable, per CX7 spec */
+    dev_info(&dev->pdev->dev, "Step 7: Deasserting PCIe reset (PERST#) - link training can begin\n");
+    gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 0);
  
-     /* Change pinctrl state */
-     err = pcie_hp_change_state(dev, "clkreqn");
-     if (err)
-         return err;
- 
-     /* Enable clock */
-     pcie_hp_ckm_control(dev, false);
-     usleep_range(PCIE_HP_DELAY_STANDARD_US, PCIE_HP_DELAY_STANDARD_US + 1000);
- 
-     /* Resume root ports */
-     for (i = 0; i < dev->pd->port_nums; i++) {
-         pci_dev = get_port_root_port(dev, i);
-         if (!pci_dev)
-             continue;
- 
-         err = pm_runtime_resume_and_get(&pci_dev->dev);
-         if (err < 0) {
-             dev_err(&dev->pdev->dev,
-                     "Runtime resume failed for %s: %d\n",
-                     pci_name(pci_dev), err);
-         }
-     }
- 
-     /* Assert PCIe reset */
-     gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
- 
-     /* Apply bus protection */
-     if (dev->pd->rp_bus_protect) {
-         for (i = 0; i < dev->pd->port_nums; i++)
-             dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
-     }
- 
-     /* Wait for links to reach L0 */
+     /* Step 8: Wait for links to reach L0 */
+     dev_info(&dev->pdev->dev, "Step 8: Waiting for PCIe link to reach L0\n");
      err = polling_link_to_l0(dev);
-     if (err)
+     if (err) {
+         dev_err(&dev->pdev->dev, "PCIe link failed to reach L0\n");
          return err;
+     }
+     dev_info(&dev->pdev->dev, "PCIe link reached L0 state\n");
  
-     /* Retrain PCIe links */
+     /* Step 9: Retrain PCIe links to Gen5 */
+     dev_info(&dev->pdev->dev, "Step 9: Retraining PCIe links to Gen5\n");
      for (i = 0; i < dev->pd->port_nums; i++) {
          pci_dev = get_port_root_port(dev, i);
          if (pci_dev)
              retrain_pcie_link(pci_dev);
      }
  
-     /* Wait for link stability */
+     /* Step 10: Wait for link stability */
+     dev_info(&dev->pdev->dev, "Step 10: Waiting for link stability (%dms)\n",
+              PCIE_HP_DELAY_LINK_STABLE_MS);
      msleep(PCIE_HP_DELAY_LINK_STABLE_MS);
  
+     dev_info(&dev->pdev->dev, "=== PCIe initialization complete - ready for device rescan ===\n");
      return 0;
  }
  
@@ -974,12 +1287,59 @@ static irqreturn_t pcie_hp_work(int irq, void *dev_id)
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
         break;
     case STATE_DEV_POWER_OFF:
-    case STATE_DEV_POWER_ON:
-    case STATE_DEV_FW_START:
-        dev_dbg(app_ctx->ctx->dev, "Waiting for device to be ready\n");
+        /* BOOT_COMP went low (1→0 transition) during power-down - verify it's stable.
+         * This ensures clean power-down state and prevents stale state issues
+         * if we try to power on again.
+         */
+        dev_dbg(app_ctx->ctx->dev, "BOOT_COMP low detected (power-down), verifying stability\n");
+        ret = verify_boot_transition_stable(hp_dev, 0, "1→0 (power-down)");
+        if (ret == 0) {
+            dev_dbg(app_ctx->ctx->dev, "BOOT_COMP 1→0 transition verified, device powered off cleanly\n");
+        } else {
+            /* Not stable - might indicate issue, but device is already powered off */
+            dev_warn(app_ctx->ctx->dev, "BOOT_COMP 1→0 transition not stable during power-down\n");
+        }
         break;
+    case STATE_DEV_POWER_ON:
+        /* BOOT_COMP went low (1→0 transition) - verify firmware is starting boot.
+         * Verify the 1→0 transition is stable before proceeding.
+         */
+        dev_dbg(app_ctx->ctx->dev, "BOOT_COMP low detected (firmware starting), verifying stability\n");
+        ret = verify_boot_transition_stable(hp_dev, 0, "1→0");
+        if (ret == 0) {
+            /* Stable low - firmware is starting boot */
+            spin_lock_irqsave(&hp_dev->lock, flags);
+            hp_dev->state = STATE_DEV_FW_START;
+            spin_unlock_irqrestore(&hp_dev->lock, flags);
+            dev_dbg(app_ctx->ctx->dev, "BOOT_COMP 1→0 transition verified, firmware boot started\n");
+        } else {
+            /* Not stable - might be glitch, stay in STATE_DEV_POWER_ON */
+            dev_dbg(app_ctx->ctx->dev, "BOOT_COMP 1→0 transition not stable, will retry\n");
+        }
+        break;
+    case STATE_DEV_FW_START:
+        /* BOOT_COMP interrupt fired - verify 0→1 transition (firmware ready).
+         * The IRQ handler detected BOOT_COMP=1, but we need to verify:
+         * 1. We actually saw the 0→1 transition (not just pull-up masking)
+         * 2. It's stable before proceeding to PCIe initialization.
+         */
+        dev_info(app_ctx->ctx->dev, ">>> STATE_DEV_FW_START: BOOT_COMP interrupt detected, verifying 0→1 transition\n");
+        ret = polling_boot_complete(hp_dev);
+        if (ret == 0) {
+            /* Valid 0→1 transition detected and stable - firmware is ready */
+            dev_info(app_ctx->ctx->dev, ">>> BOOT_COMP verification SUCCESS - transitioning to STATE_RESCAN\n");
+            spin_lock_irqsave(&hp_dev->lock, flags);
+            hp_dev->state = STATE_RESCAN;
+            spin_unlock_irqrestore(&hp_dev->lock, flags);
+            /* Fall through to STATE_RESCAN case */
+        } else {
+            /* No valid 0→1 transition or not stable - stay in STATE_DEV_FW_START */
+            dev_warn(app_ctx->ctx->dev, ">>> BOOT_COMP verification FAILED (ret=%d) - staying in STATE_DEV_FW_START, will retry\n", ret);
+            break;
+        }
+        /* fall through */
     case STATE_RESCAN:
-        dev_dbg(app_ctx->ctx->dev, "Cable plug in, rescanning\n");
+        dev_info(app_ctx->ctx->dev, ">>> STATE_RESCAN: Starting PCIe device rescan (BOOT_COMP verified)\n");
         ret = rescan_device(hp_dev);
         spin_lock_irqsave(&hp_dev->lock, flags);
         if (ret)
@@ -1030,8 +1390,12 @@ static irqreturn_t pcie_hp_work(int irq, void *dev_id)
              dev_dbg(gpio_ctx->dev, "Boot pin high: device powered on\n");
              hp_dev->state = STATE_DEV_POWER_ON;
          } else if (value && state == STATE_DEV_FW_START) {
-             dev_dbg(gpio_ctx->dev, "Boot pin high: device ready\n");
-             hp_dev->state = STATE_RESCAN;
+             /* BOOT_COMP=1 detected - wake work function to verify stability.
+              * Don't transition to STATE_RESCAN immediately - let work function
+              * verify BOOT_COMP is stable high before proceeding.
+              */
+             dev_dbg(gpio_ctx->dev, "Boot pin high: device ready (will verify stability)\n");
+             /* Stay in STATE_DEV_FW_START - work function will verify and transition */
          } else if (!value && state == STATE_DEV_POWER_ON) {
              dev_dbg(gpio_ctx->dev, "Boot pin low: firmware starting\n");
              hp_dev->state = STATE_DEV_FW_START;
