@@ -1111,7 +1111,7 @@ static acpi_status acpi_gpio_walk_handler(struct acpi_resource *ares, void *cont
     } else {
         walk_ctx->gpios[walk_ctx->count].resource_source[0] = '\0';
     }
-    walk_ctx->gpios[walk_ctx->count].resource_source_index = agpio->resource_source.resource_source_index;
+    walk_ctx->gpios[walk_ctx->count].resource_source_index = agpio->resource_source.index;
 
     dev_dbg(walk_ctx->dev, "ACPI walk GPIO[%d]: pin=%u, type=%s, resource_source=%s, index=%u\n",
             walk_ctx->count,
