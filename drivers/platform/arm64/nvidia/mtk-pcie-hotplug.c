@@ -1113,6 +1113,13 @@ static acpi_status acpi_gpio_walk_handler(struct acpi_resource *ares, void *cont
     }
     walk_ctx->gpios[walk_ctx->count].resource_source_index = agpio->resource_source.resource_source_index;
 
+    dev_dbg(walk_ctx->dev, "ACPI walk GPIO[%d]: pin=%u, type=%s, resource_source=%s, index=%u\n",
+            walk_ctx->count,
+            walk_ctx->gpios[walk_ctx->count].pin,
+            agpio->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT ? "GpioInt" : "GpioIo",
+            walk_ctx->gpios[walk_ctx->count].resource_source[0] ? walk_ctx->gpios[walk_ctx->count].resource_source : "<none>",
+            walk_ctx->gpios[walk_ctx->count].resource_source_index);
+
     walk_ctx->count++;
     return AE_OK;
 }
@@ -1533,10 +1540,12 @@ static int pcie_hp_enumerate_gpios(struct platform_device *pdev,
         
         /* Find GPIO device using resource_source from first GPIO */
         if (walk_ctx.count > 0 && walk_ctx.gpios[0].resource_source[0] != '\0') {
+            dev_info(&pdev->dev, "Looking up GPIO controller: %s\n", walk_ctx.gpios[0].resource_source);
             status = acpi_get_handle(NULL, walk_ctx.gpios[0].resource_source, &gpio_handle);
             if (ACPI_SUCCESS(status)) {
                 gpio_adev = acpi_fetch_acpi_dev(gpio_handle);
                 if (gpio_adev) {
+                    dev_info(&pdev->dev, "Found ACPI GPIO device: %s\n", acpi_device_name(gpio_adev));
                     gpio_fwnode = acpi_fwnode_handle(gpio_adev);
                     hp_dev->gdev = gpio_device_find_by_fwnode(gpio_fwnode);
                     if (hp_dev->gdev) {
@@ -1639,8 +1648,9 @@ static int pcie_hp_enumerate_gpios(struct platform_device *pdev,
                             walk_ctx.gpios[i].pin, i, PTR_ERR(app_ctx->desc));
                     return PTR_ERR(app_ctx->desc);
                 }
-                dev_info(&pdev->dev, "Using ACPI walk GPIO: pin %u (index %d) via gpio_device_get_desc\n",
-                         walk_ctx.gpios[i].pin, i);
+                dev_info(&pdev->dev, "Using ACPI walk GPIO[%d]: pin %u (chip-relative) -> global GPIO %u via gpio_device_get_desc\n",
+                         i, walk_ctx.gpios[i].pin,
+                         gpio_device_get_base(hp_dev->gdev) + walk_ctx.gpios[i].pin);
             } else {
                 /* GPIO device not available - this should not happen if we got here */
                 dev_err(&pdev->dev, "GPIO device not available for ACPI walk path (index %d)\n", i);
