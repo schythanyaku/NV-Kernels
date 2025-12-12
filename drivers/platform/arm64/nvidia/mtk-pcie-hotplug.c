@@ -1197,38 +1197,19 @@ static int rescan_device(struct pcie_hp_dev *dev)
 
     dev_info(&dev->pdev->dev, "=== Starting PCIe initialization (BOOT_COMP verified) ===\n");
 
-    /* Step 1: Assert PCIe reset (PERST# = 1 means reset asserted)
-     * Must be done BEFORE enabling REFCLK per PCIe spec */
-    dev_info(&dev->pdev->dev, "Step 1: Asserting PCIe reset (PERST#) - device in reset\n");
-    gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
-
-    /* Step 2: Apply bus protection */
-    dev_info(&dev->pdev->dev, "Step 2: Applying bus protection\n");
-    if (dev->pd->rp_bus_protect) {
-        for (i = 0; i < dev->pd->port_nums; i++)
-            dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
-    }
-
-    /* Step 3: Enable REFCLK - Change pinctrl state to clkreqn (enables clock request) */
-    dev_info(&dev->pdev->dev, "Step 3: Enabling REFCLK (pinctrl: clkreqn)\n");
+    /* Step 1: Enable REFCLK - Change pinctrl state to clkreqn (enables clock request) */
+    dev_info(&dev->pdev->dev, "Step 1: Enabling REFCLK (pinctrl: clkreqn)\n");
     err = pcie_hp_change_state(dev, "clkreqn");
-    if (err) {
-        dev_err(&dev->pdev->dev, "Failed to enable REFCLK: %d\n", err);
-        /* PERST is already asserted, which is safe - device stays in reset */
+    if (err)
         return err;
-    }
 
-    /* Step 4: Enable clock control */
-    dev_info(&dev->pdev->dev, "Step 4: Enabling clock control\n");
+    /* Step 2: Enable clock control */
+    dev_info(&dev->pdev->dev, "Step 2: Enabling clock control\n");
     pcie_hp_ckm_control(dev, false);
-    
-    /* Step 5: Wait for REFCLK stable (after REFCLK is stable, deassert PERST#) */
-    dev_info(&dev->pdev->dev, "Step 5: Waiting for REFCLK stable (%dms)\n",
-             PCIE_HP_DELAY_STANDARD_US / 1000);
     usleep_range(PCIE_HP_DELAY_STANDARD_US, PCIE_HP_DELAY_STANDARD_US + 1000);
 
-    /* Step 6: Resume root ports */
-    dev_info(&dev->pdev->dev, "Step 6: Resuming root ports\n");
+    /* Step 3: Resume root ports */
+    dev_info(&dev->pdev->dev, "Step 3: Resuming root ports\n");
     for (i = 0; i < dev->pd->port_nums; i++) {
         pci_dev = get_port_root_port(dev, i);
         if (!pci_dev)
@@ -1242,33 +1223,38 @@ static int rescan_device(struct pcie_hp_dev *dev)
         }
     }
 
-    /* Step 7: Deassert PERST# (PERST# = 0 means reset deasserted, link can train)
-     * This is done AFTER REFCLK is stable, per CX7 spec */
-    dev_info(&dev->pdev->dev, "Step 7: Deasserting PCIe reset (PERST#) - link training can begin\n");
-    gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 0);
+    /* Step 4: Assert PCIe reset */
+    dev_info(&dev->pdev->dev, "Step 4: Asserting PCIe reset (PERST#)\n");
+    gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
+
+    /* Step 5: Apply bus protection */
+    dev_info(&dev->pdev->dev, "Step 5: Applying bus protection\n");
+    if (dev->pd->rp_bus_protect) {
+        for (i = 0; i < dev->pd->port_nums; i++)
+            dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
+    }
+
+    /* Step 6: Wait for links to reach L0 */
+    dev_info(&dev->pdev->dev, "Step 6: Waiting for PCIe link to reach L0\n");
+    err = polling_link_to_l0(dev);
+    if (err) {
+        dev_err(&dev->pdev->dev, "PCIe link failed to reach L0\n");
+        return err;
+    }
+    dev_info(&dev->pdev->dev, "PCIe link reached L0 state\n");
  
-     /* Step 8: Wait for links to reach L0 */
-     dev_info(&dev->pdev->dev, "Step 8: Waiting for PCIe link to reach L0\n");
-     err = polling_link_to_l0(dev);
-     if (err) {
-         dev_err(&dev->pdev->dev, "PCIe link failed to reach L0\n");
-         /* PERST is already deasserted - leave it as-is for retry */
-         return err;
-     }
-     dev_info(&dev->pdev->dev, "PCIe link reached L0 state\n");
+    /* Step 7: Retrain PCIe links to Gen5 */
+    dev_info(&dev->pdev->dev, "Step 7: Retraining PCIe links to Gen5\n");
+    for (i = 0; i < dev->pd->port_nums; i++) {
+        pci_dev = get_port_root_port(dev, i);
+        if (pci_dev)
+            retrain_pcie_link(pci_dev);
+    }
  
-     /* Step 9: Retrain PCIe links to Gen5 */
-     dev_info(&dev->pdev->dev, "Step 9: Retraining PCIe links to Gen5\n");
-     for (i = 0; i < dev->pd->port_nums; i++) {
-         pci_dev = get_port_root_port(dev, i);
-         if (pci_dev)
-             retrain_pcie_link(pci_dev);
-     }
- 
-     /* Step 10: Wait for link stability */
-     dev_info(&dev->pdev->dev, "Step 10: Waiting for link stability (%dms)\n",
-              PCIE_HP_DELAY_LINK_STABLE_MS);
-     msleep(PCIE_HP_DELAY_LINK_STABLE_MS);
+    /* Step 8: Wait for link stability */
+    dev_info(&dev->pdev->dev, "Step 8: Waiting for link stability (%dms)\n",
+             PCIE_HP_DELAY_LINK_STABLE_MS);
+    msleep(PCIE_HP_DELAY_LINK_STABLE_MS);
  
      dev_info(&dev->pdev->dev, "=== PCIe initialization complete - ready for device rescan ===\n");
      return 0;
