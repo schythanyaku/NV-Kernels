@@ -155,10 +155,29 @@ struct pcie_hp_plat_data {
      struct pcie_hp_dev *hp_dev;
  };
  
- struct acpi_gpio_parse_context {
-     struct gpio_acpi_context *ctx;
-     struct pcie_hp_dev *hp_dev;
- };
+struct acpi_gpio_parse_context {
+    struct gpio_acpi_context *ctx;
+    struct pcie_hp_dev *hp_dev;
+};
+
+/* Structure to collect all GPIO resources from ACPI walk */
+struct acpi_gpio_walk_context {
+    struct device *dev;
+    struct gpio_info {
+        unsigned int pin;              /* Hardware pin number (chip-relative) */
+        unsigned int connection_type;  /* ACPI_RESOURCE_GPIO_TYPE_INT or ACPI_RESOURCE_GPIO_TYPE_IO */
+        unsigned int triggering;        /* ACPI_EDGE_SENSITIVE or ACPI_LEVEL_SENSITIVE */
+        unsigned int polarity;         /* ACPI_ACTIVE_HIGH or ACPI_ACTIVE_LOW */
+        unsigned int debounce_timeout; /* Debounce timeout in 10ms units */
+        unsigned int wake_capable;     /* Wake capability */
+        char vendor_data[MAX_VENDOR_DATA_LEN + 1]; /* Vendor data string */
+        char resource_source[16];      /* GPIO controller name (e.g., "\\_SB.GIO0") */
+        unsigned int resource_source_index; /* Resource source index */
+    } gpios[PCIE_PIN_MAX];
+    int count;                          /* Number of GPIOs found */
+    unsigned int gpio_chip_base;        /* GPIO chip base (to be determined) */
+    bool found_chip_base;               /* Whether chip base was found */
+};
  
  /**
   * struct pcie_hp_acpi_mmio - Container for parsed ACPI MMIO resources
@@ -210,6 +229,7 @@ struct pcie_hp_plat_data {
      spinlock_t lock; /* Protect state changes (IRQ-safe) */
      struct pci_dev *cached_root_ports[HP_PORT_MAX]; /* Cached root port pointers */
      struct pcie_hp_mmio_runtime mmio; /* Runtime mapped MMIO base addresses */
+     struct gpio_device *gdev; /* Cached GPIO device for ACPI walk path */
  };
  
  /**
@@ -1035,6 +1055,113 @@ static irqreturn_t pcie_hp_work(int irq, void *dev_id)
      return IRQ_HANDLED;
  }
  
+/**
+ * acpi_gpio_walk_handler - Handler for acpi_walk_resources to collect all GPIO resources
+ * @ares: ACPI resource structure
+ * @context: Pointer to acpi_gpio_walk_context
+ *
+ * This callback is invoked by acpi_walk_resources() for each GPIO resource in _CRS.
+ * It collects all GPIO pins, their properties, and vendor data.
+ */
+static acpi_status acpi_gpio_walk_handler(struct acpi_resource *ares, void *context)
+{
+    struct acpi_gpio_walk_context *walk_ctx = context;
+    struct acpi_resource_gpio *agpio;
+    int length;
+
+    if (ares->type != ACPI_RESOURCE_TYPE_GPIO)
+        return AE_OK;
+
+    if (walk_ctx->count >= PCIE_PIN_MAX) {
+        dev_warn(walk_ctx->dev, "Too many GPIO resources, truncating at %d\n", PCIE_PIN_MAX);
+        return AE_OK;
+    }
+
+    agpio = &ares->data.gpio;
+
+    /* Get pin number from pin table (first pin) */
+    if (!agpio->pin_table || agpio->pin_table_length == 0) {
+        dev_warn(walk_ctx->dev, "GPIO resource has no pin table\n");
+        return AE_OK;
+    }
+
+    /* Store GPIO information */
+    walk_ctx->gpios[walk_ctx->count].pin = agpio->pin_table[0];
+    walk_ctx->gpios[walk_ctx->count].connection_type = agpio->connection_type;
+    walk_ctx->gpios[walk_ctx->count].triggering = agpio->triggering;
+    walk_ctx->gpios[walk_ctx->count].polarity = agpio->polarity;
+    walk_ctx->gpios[walk_ctx->count].debounce_timeout = agpio->debounce_timeout;
+    walk_ctx->gpios[walk_ctx->count].wake_capable = agpio->wake_capable;
+
+    /* Store vendor data if present */
+    if (agpio->vendor_length && agpio->vendor_data) {
+        length = min_t(int, agpio->vendor_length, MAX_VENDOR_DATA_LEN);
+        memcpy(walk_ctx->gpios[walk_ctx->count].vendor_data, agpio->vendor_data, length);
+        walk_ctx->gpios[walk_ctx->count].vendor_data[length] = '\0';
+    } else {
+        walk_ctx->gpios[walk_ctx->count].vendor_data[0] = '\0';
+    }
+
+    /* Store resource source (GPIO controller name) */
+    if (agpio->resource_source.string_ptr) {
+        length = min_t(int, agpio->resource_source.string_length, 15);
+        memcpy(walk_ctx->gpios[walk_ctx->count].resource_source,
+               agpio->resource_source.string_ptr, length);
+        walk_ctx->gpios[walk_ctx->count].resource_source[length] = '\0';
+    } else {
+        walk_ctx->gpios[walk_ctx->count].resource_source[0] = '\0';
+    }
+    walk_ctx->gpios[walk_ctx->count].resource_source_index = agpio->resource_source.resource_source_index;
+
+    walk_ctx->count++;
+    return AE_OK;
+}
+
+/**
+ * pcie_hp_walk_acpi_gpios - Walk ACPI _CRS to collect all GPIO resources
+ * @pdev: Platform device
+ * @walk_ctx: Context structure to fill with GPIO information
+ *
+ * Uses acpi_walk_resources() to parse all GPIO resources from ACPI _CRS.
+ * This bypasses the kernel's GPIO grouping bug by directly accessing ACPI resources.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int pcie_hp_walk_acpi_gpios(struct platform_device *pdev,
+                                    struct acpi_gpio_walk_context *walk_ctx)
+{
+    struct acpi_device *adev;
+    acpi_status status;
+
+    adev = ACPI_COMPANION(&pdev->dev);
+    if (!adev) {
+        dev_err(&pdev->dev, "Failed to get ACPI companion device\n");
+        return -ENODEV;
+    }
+
+    /* Initialize walk context */
+    memset(walk_ctx, 0, sizeof(*walk_ctx));
+    walk_ctx->dev = &pdev->dev;
+
+    /* Walk all GPIO resources in _CRS */
+    status = acpi_walk_resources(adev->handle, METHOD_NAME__CRS,
+                                 acpi_gpio_walk_handler, walk_ctx);
+    if (ACPI_FAILURE(status)) {
+        dev_err(&pdev->dev, "Failed to walk ACPI GPIO resources: %s\n",
+                acpi_format_exception(status));
+        return -EIO;
+    }
+
+    dev_info(&pdev->dev, "Found %d GPIO resources via ACPI walk\n", walk_ctx->count);
+    
+    if (walk_ctx->count == 0) {
+        dev_info(&pdev->dev, "ACPI walk found 0 GPIOs, will fallback to gpiod_get_index\n");
+        return -ENOENT; /* Signal to caller to fallback to gpiod_get_index */
+    }
+    
+    return 0;
+}
+
  static acpi_status acpi_gpio_resource_handler(struct acpi_resource *ares, void *context)
  {
      struct acpi_gpio_parse_context *parse_ctx = context;
@@ -1283,21 +1410,35 @@ static irqreturn_t pcie_hp_work(int irq, void *dev_id)
      return ret;
  }
  
- static int pcie_hp_probe_io_info(struct platform_device *pdev)
- {
-     struct gpio_desc *desc;
-     int count = 0;
- 
-     for (;;) {
-         desc = gpiod_get_index(&pdev->dev, NULL, count, GPIOD_ASIS);
-         if (IS_ERR(desc))
-             break;
-         count++;
-         gpiod_put(desc);
-     }
- 
-     return count;
- }
+static int pcie_hp_probe_io_info(struct platform_device *pdev)
+{
+    struct gpio_desc *desc;
+    int count = 0;
+
+    for (;;) {
+        desc = gpiod_get_index(&pdev->dev, NULL, count, GPIOD_ASIS);
+        if (IS_ERR(desc))
+            break;
+        count++;
+        gpiod_put(desc);
+    }
+
+    return count;
+}
+
+/**
+ * pcie_hp_put_gpio_device - Release GPIO device reference
+ * @data: GPIO device pointer
+ *
+ * Cleanup function called by devm_add_action_or_reset() to release
+ * the GPIO device reference when the hotplug device is removed.
+ */
+static void pcie_hp_put_gpio_device(void *data)
+{
+    struct gpio_device *gdev = data;
+
+    gpio_device_put(gdev);
+}
  
  /**
   * pcie_hp_discover_devices - Discover existing PCI devices on managed ports
@@ -1356,10 +1497,184 @@ static irqreturn_t pcie_hp_work(int irq, void *dev_id)
          return -ENODEV;
      }
  
-     return 0;
- }
- 
- static int pcie_hp_probe(struct platform_device *pdev)
+    return 0;
+}
+
+/**
+ * pcie_hp_enumerate_gpios - Enumerate GPIOs with three-tier fallback
+ * @pdev: Platform device
+ * @hp_dev: Hotplug device structure
+ * @pd: Platform data
+ *
+ * Attempts GPIO enumeration in this order:
+ * 1. ACPI walk resources (bypasses kernel 6.17 GPIO grouping bug)
+ * 2. gpiod_get_index (standard kernel API) + platform data fallback for EN pin
+ *
+ * Returns: Number of GPIOs found, or negative error code
+ */
+static int pcie_hp_enumerate_gpios(struct platform_device *pdev,
+                                     struct pcie_hp_dev *hp_dev,
+                                     struct pcie_hp_plat_data *pd)
+{
+    struct acpi_gpio_walk_context walk_ctx;
+    struct gpio_desc *first_desc = NULL;
+    unsigned int gpio_chip_base = 0;
+    int ret, i, get_index_gpio_count = 0;
+    bool use_acpi_walk = false;
+    struct fwnode_handle *gpio_fwnode = NULL;
+    struct acpi_device *gpio_adev = NULL;
+    acpi_handle gpio_handle;
+    acpi_status status;
+
+    /* Step 1: Try ACPI walk resources first */
+    ret = pcie_hp_walk_acpi_gpios(pdev, &walk_ctx);
+    if (!ret && walk_ctx.count >= PCIE_HP_MIN_GPIO_COUNT) {
+        dev_info(&pdev->dev, "ACPI walk found %d GPIOs, attempting to find GPIO device\n", walk_ctx.count);
+        
+        /* Find GPIO device using resource_source from first GPIO */
+        if (walk_ctx.count > 0 && walk_ctx.gpios[0].resource_source[0] != '\0') {
+            status = acpi_get_handle(NULL, walk_ctx.gpios[0].resource_source, &gpio_handle);
+            if (ACPI_SUCCESS(status)) {
+                gpio_adev = acpi_fetch_acpi_dev(gpio_handle);
+                if (gpio_adev) {
+                    gpio_fwnode = acpi_fwnode_handle(gpio_adev);
+                    hp_dev->gdev = gpio_device_find_by_fwnode(gpio_fwnode);
+                    if (hp_dev->gdev) {
+                        /* Successfully found GPIO device - manage reference */
+                        ret = devm_add_action_or_reset(&pdev->dev, pcie_hp_put_gpio_device,
+                                                       hp_dev->gdev);
+                        if (ret) {
+                            gpio_device_put(hp_dev->gdev);
+                            hp_dev->gdev = NULL;
+                            dev_warn(&pdev->dev, "Failed to register GPIO device cleanup, falling back to gpiod_get_index\n");
+                        } else {
+                            gpio_chip_base = gpio_device_get_base(hp_dev->gdev);
+                            dev_info(&pdev->dev, "Found GPIO device via fwnode, chip base: %u\n", gpio_chip_base);
+                            use_acpi_walk = true;
+                        }
+                    } else {
+                        dev_info(&pdev->dev, "GPIO device not found (controller may not be loaded), deferring probe\n");
+                        return dev_err_probe(&pdev->dev, -EPROBE_DEFER,
+                                             "GPIO controller not available\n");
+                    }
+                } else {
+                    dev_warn(&pdev->dev, "Failed to get ACPI device for GPIO controller %s, falling back to gpiod_get_index\n",
+                             walk_ctx.gpios[0].resource_source);
+                }
+            } else {
+                dev_warn(&pdev->dev, "Failed to get ACPI handle for GPIO controller %s, falling back to gpiod_get_index\n",
+                         walk_ctx.gpios[0].resource_source);
+            }
+        } else {
+            dev_warn(&pdev->dev, "No resource_source in ACPI GPIO resources, falling back to gpiod_get_index\n");
+        }
+    } else {
+        if (ret)
+            dev_info(&pdev->dev, "ACPI walk failed (%d), falling back to gpiod_get_index\n", ret);
+        else
+            dev_info(&pdev->dev, "ACPI walk found only %d GPIOs (< %d required), falling back to gpiod_get_index\n",
+                     walk_ctx.count, PCIE_HP_MIN_GPIO_COUNT);
+    }
+
+    /* Step 2: Fall back to gpiod_get_index if ACPI walk didn't work */
+    if (!use_acpi_walk) {
+        get_index_gpio_count = pcie_hp_probe_io_info(pdev);
+        if (get_index_gpio_count == 0) {
+            dev_info(&pdev->dev, "gpiod_get_index found 0 GPIOs, exiting gracefully\n");
+            return -ENODEV;
+        } else if (get_index_gpio_count >= PCIE_HP_MIN_GPIO_COUNT) {
+            dev_info(&pdev->dev, "gpiod_get_index found %d GPIOs\n", get_index_gpio_count);
+            /* GPIO chip base not needed here - only needed for platform data fallback (EN pin) */
+        } else {
+            dev_warn(&pdev->dev, "gpiod_get_index found only %d GPIOs (< %d required), will use platform data fallback for EN pin\n",
+                     get_index_gpio_count, PCIE_HP_MIN_GPIO_COUNT);
+        }
+    }
+
+    /* Step 3: Determine final GPIO count and allocation */
+    if (use_acpi_walk) {
+        hp_dev->gpio_count = walk_ctx.count;
+    } else {
+        /* Use gpiod_get_index count - platform data fallback only for EN pin if missing */
+        hp_dev->gpio_count = get_index_gpio_count;
+        /* Get GPIO chip base only if we're using gpiod_get_index and might need platform data fallback for EN pin */
+        if (get_index_gpio_count > 0 && pd->gpio_pin_en > 0) {
+            first_desc = gpiod_get_index(&pdev->dev, NULL, 0, GPIOD_ASIS);
+            if (!IS_ERR(first_desc)) {
+                gpio_chip_base = gpio_device_get_base(gpiod_to_gpio_device(first_desc));
+                gpiod_put(first_desc);
+                dev_info(&pdev->dev, "GPIO chip base: %u (from gpiod_get_index for platform data EN pin fallback)\n",
+                         gpio_chip_base);
+            }
+        }
+    }
+
+    if (hp_dev->gpio_count < PCIE_HP_MIN_GPIO_COUNT) {
+        dev_err(&pdev->dev, "Insufficient GPIOs: required at least %d, got %d\n",
+                PCIE_HP_MIN_GPIO_COUNT, hp_dev->gpio_count);
+        return -ENODEV;
+    }
+
+    /* Allocate GPIO context array */
+    hp_dev->pins = devm_kzalloc(&pdev->dev,
+                                 sizeof(struct pcie_hp_gpio_ctx) * hp_dev->gpio_count,
+                                 GFP_KERNEL);
+    if (!hp_dev->pins) {
+        dev_err(&pdev->dev, "Failed to allocate memory for GPIOs\n");
+        return -ENOMEM;
+    }
+
+    /* Setup GPIO pins based on enumeration method */
+    for (i = 0; i < hp_dev->gpio_count; i++) {
+        struct pcie_hp_gpio_ctx *app_ctx = &hp_dev->pins[i];
+        unsigned int global_gpio;
+
+        if (use_acpi_walk && i < walk_ctx.count) {
+            /* Use ACPI walk data with cached GPIO device - NO buggy APIs */
+            if (hp_dev->gdev) {
+                /* Use gpio_device_get_desc() to get descriptor directly - bypasses kernel 6.17 grouping bug */
+                app_ctx->desc = gpio_device_get_desc(hp_dev->gdev, walk_ctx.gpios[i].pin);
+                if (IS_ERR(app_ctx->desc)) {
+                    dev_err(&pdev->dev, "Failed to get GPIO descriptor for ACPI pin %u (index %d): %ld\n",
+                            walk_ctx.gpios[i].pin, i, PTR_ERR(app_ctx->desc));
+                    return PTR_ERR(app_ctx->desc);
+                }
+                dev_info(&pdev->dev, "Using ACPI walk GPIO: pin %u (index %d) via gpio_device_get_desc\n",
+                         walk_ctx.gpios[i].pin, i);
+            } else {
+                /* GPIO device not available - this should not happen if we got here */
+                dev_err(&pdev->dev, "GPIO device not available for ACPI walk path (index %d)\n", i);
+                return -ENODEV;
+            }
+        } else {
+            /* Use gpiod_get_index result */
+            app_ctx->desc = gpiod_get_index(&pdev->dev, NULL, i, GPIOD_ASIS);
+            /* Fallback to platform data only for EN pin if gpiod_get_index fails */
+            if (IS_ERR(app_ctx->desc) && i == PCIE_PIN_EN && gpio_chip_base > 0 && pd->gpio_pin_en > 0) {
+                global_gpio = gpio_chip_base + pd->gpio_pin_en;
+                app_ctx->desc = gpio_to_desc(global_gpio);
+                if (!app_ctx->desc) {
+                    dev_err(&pdev->dev, "Failed to get GPIO descriptor for platform data EN pin %u (global GPIO %u)\n",
+                            pd->gpio_pin_en, global_gpio);
+                    return -ENODEV;
+                }
+                dev_info(&pdev->dev, "Using platform data GPIO fallback: pin %u -> global GPIO %u for EN (index %d)\n",
+                         pd->gpio_pin_en, global_gpio, i);
+            }
+        }
+
+        if (IS_ERR(app_ctx->desc)) {
+            dev_err(&pdev->dev, "Failed to get GPIO %d: %ld\n", i, PTR_ERR(app_ctx->desc));
+            return PTR_ERR(app_ctx->desc);
+        }
+
+        app_ctx->hp_dev = hp_dev;
+    }
+
+    return hp_dev->gpio_count;
+}
+
+static int pcie_hp_probe(struct platform_device *pdev)
  {
      struct pcie_hp_plat_data *pd;
      struct pcie_hp_gpio_ctx *app_ctx;
@@ -1385,122 +1700,54 @@ static irqreturn_t pcie_hp_work(int irq, void *dev_id)
          return ret;
      }
  
-     hp_dev = devm_kzalloc(&pdev->dev, sizeof(*hp_dev), GFP_KERNEL);
-     if (!hp_dev) {
-         dev_err(&pdev->dev, "Failed to allocate memory for hotplug device\n");
-         return -ENOMEM;
-     }
- 
-    /* Discover GPIO pins via ACPI */
-    int acpi_gpio_count = pcie_hp_probe_io_info(pdev);
-    if (!acpi_gpio_count) {
-        dev_err(&pdev->dev, "Failed to get gpio descriptors\n");
-        return -ENODEV;
+    hp_dev = devm_kzalloc(&pdev->dev, sizeof(*hp_dev), GFP_KERNEL);
+    if (!hp_dev) {
+        dev_err(&pdev->dev, "Failed to allocate memory for hotplug device\n");
+        return -ENOMEM;
     }
-    
-    /* Use platform data fallback only for EN (index 3) if ACPI enumeration returns fewer GPIOs
-     * due to kernel 6.17 bug. CLQ0/CLQ1 are handled via pinctrl, not GPIO descriptors */
-    if (acpi_gpio_count >= PCIE_HP_MIN_GPIO_COUNT) {
-        /* ACPI provided all required GPIOs including EN */
-        hp_dev->gpio_count = acpi_gpio_count;
-    } else {
-        /* ACPI enumeration insufficient (< 4 GPIOs) but provides at least 1 GPIO for base calculation
-         * - use platform data fallback for minimum required GPIOs (EN) */
-        dev_warn(&pdev->dev, "ACPI GPIO enumeration returned %d GPIOs (required %d), using platform data fallback for EN\n",
-                 acpi_gpio_count, PCIE_HP_MIN_GPIO_COUNT);
-        hp_dev->gpio_count = PCIE_HP_MIN_GPIO_COUNT;
+
+    hp_dev->pdev = pdev;
+    hp_dev->pd = pd;
+    hp_dev->state = STATE_READY;
+    hp_dev->boot_pin = -1;
+    hp_dev->prsnt_pin = -1;
+    spin_lock_init(&hp_dev->lock);
+
+    /* Initialize cached root port pointers */
+    for (i = 0; i < HP_PORT_MAX; i++)
+        hp_dev->cached_root_ports[i] = NULL;
+
+    /* Enumerate GPIO pins with three-tier fallback:
+     * 1. ACPI walk resources
+     * 2. gpiod_get_index
+     * 3. Platform data fallback */
+    ret = pcie_hp_enumerate_gpios(pdev, hp_dev, pd);
+    if (ret < 0) {
+        dev_err(&pdev->dev, "Failed to enumerate GPIOs: %d\n", ret);
+        return ret;
     }
- 
-     hp_dev->pins = devm_kzalloc(&pdev->dev,
-                                  sizeof(struct pcie_hp_gpio_ctx) * hp_dev->gpio_count,
-                                  GFP_KERNEL);
-     if (!hp_dev->pins) {
-         dev_err(&pdev->dev, "Failed to allocate memory for GPIOs\n");
-         return -ENOMEM;
-     }
- 
-     hp_dev->pdev = pdev;
-     hp_dev->pd = pd;
-     hp_dev->state = STATE_READY;
-     hp_dev->boot_pin = -1;
-     hp_dev->prsnt_pin = -1;
-     spin_lock_init(&hp_dev->lock);
- 
-     /* Initialize cached root port pointers */
-     for (i = 0; i < HP_PORT_MAX; i++)
-         hp_dev->cached_root_ports[i] = NULL;
- 
-    /* Setup GPIO pins and IRQs */
-    /* Calculate GPIO chip base from first GPIO (BOOT pin, index 0) - needed for platform data fallback */
-    unsigned int gpio_chip_base = 0;
-    bool gpio_chip_base_valid = false;
-    if (acpi_gpio_count > 0) {
-        struct gpio_desc *first_desc = gpiod_get_index(&pdev->dev, NULL, 0, GPIOD_ASIS);
-        if (!IS_ERR(first_desc)) {
-            gpio_chip_base = gpio_device_get_base(gpiod_to_gpio_device(first_desc));
-            gpiod_put(first_desc);
-            gpio_chip_base_valid = true;
-            dev_info(&pdev->dev, "GPIO chip base: %u (calculated from ACPI GPIO 0, BOOT pin)\n", gpio_chip_base);
-        } else {
-            dev_warn(&pdev->dev, "Failed to get BOOT pin (GPIO 0) for chip base calculation: %ld\n",
-                     PTR_ERR(first_desc));
-        }
-    }
-    
+
+    /* Setup GPIO ACPI context and IRQs */
     for (i = 0; i < hp_dev->gpio_count; i++) {
         app_ctx = &hp_dev->pins[i];
         
-        /* Use platform data GPIO pins only for EN (index 3) if ACPI enumeration didn't provide it
-         * (kernel 6.17 GPIO grouping bug workaround). CLQ0/CLQ1 are handled via pinctrl, not GPIO descriptors */
-        if (i == PCIE_PIN_EN && i >= acpi_gpio_count) {
-            if (!gpio_chip_base_valid) {
-                dev_err(&pdev->dev, "Cannot use platform data fallback for EN: GPIO chip base not available\n");
-                ret = -ENODEV;
-                goto gpio_release;
-            }
-            /* Fallback: Convert ACPI pin number to global GPIO number and use gpio_to_desc()
-             * ACPI pin numbers are chip-relative, so add GPIO chip base to get global GPIO number */
-            unsigned int global_gpio = gpio_chip_base + pd->gpio_pin_en;
-            app_ctx->desc = gpio_to_desc(global_gpio);
-            if (!app_ctx->desc) {
-                dev_err(&pdev->dev, "Failed to get GPIO descriptor for EN (power enable) pin: ACPI pin %u (global GPIO %u)\n",
-                        pd->gpio_pin_en, global_gpio);
-                ret = -ENODEV;
-                app_ctx->desc = NULL;
-                goto gpio_release;
-            }
-            dev_info(&pdev->dev, "Using platform data GPIO: ACPI pin %u -> global GPIO %u for EN (index %d)\n",
-                     pd->gpio_pin_en, global_gpio, i);
-        } else {
-            /* Normal ACPI GPIO access for BOOT, PRSNT, PERST (indices 0-2) */
-            app_ctx->desc = gpiod_get_index(&pdev->dev, NULL, i, GPIOD_ASIS);
-            if (IS_ERR(app_ctx->desc)) {
-                dev_err(&pdev->dev, "Failed to get GPIO %d: %ld\n",
-                        i, PTR_ERR(app_ctx->desc));
-                ret = PTR_ERR(app_ctx->desc);
-                app_ctx->desc = NULL;
-                goto gpio_release;
-            }
+        app_ctx->ctx = gpio_acpi_setup(pdev, app_ctx->desc, hp_dev, i);
+        if (!app_ctx->ctx) {
+            dev_err(&pdev->dev, "Failed to setup GPIO %d\n", i);
+            ret = -ENODEV;
+            goto gpio_release;
         }
- 
-         app_ctx->hp_dev = hp_dev;
-         app_ctx->ctx = gpio_acpi_setup(pdev, app_ctx->desc, hp_dev, i);
-         if (!app_ctx->ctx) {
-             dev_err(&pdev->dev, "Failed to setup GPIO %d\n", i);
-             ret = -ENODEV;
-             goto gpio_release;
-         }
- 
-         gpiod_set_debounce(app_ctx->desc, app_ctx->ctx->debounce_timeout_us);
- 
-         /* Setup IRQ for interrupt-type GPIOs */
-         if (app_ctx->ctx->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT) {
-             dev_info(&pdev->dev, "Setting up IRQ for GPIO %d (pin %d)\n", i, app_ctx->ctx->pin);
-             ret = pcie_hp_setup_irq(app_ctx);
-             if (ret) {
-                 dev_err(&pdev->dev, "Failed to setup IRQ for GPIO %d\n", i);
-                 goto gpio_release;
-             }
+
+        gpiod_set_debounce(app_ctx->desc, app_ctx->ctx->debounce_timeout_us);
+
+        /* Setup IRQ for interrupt-type GPIOs */
+        if (app_ctx->ctx->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT) {
+            dev_info(&pdev->dev, "Setting up IRQ for GPIO %d (pin %d)\n", i, app_ctx->ctx->pin);
+            ret = pcie_hp_setup_irq(app_ctx);
+            if (ret) {
+                dev_err(&pdev->dev, "Failed to setup IRQ for GPIO %d\n", i);
+                goto gpio_release;
+            }
             dev_info(&pdev->dev, "IRQ %d registered for GPIO %d\n", gpiod_to_irq(app_ctx->desc), i);
         }
     }
