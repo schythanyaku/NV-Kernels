@@ -142,7 +142,7 @@ CONFIG_MTD                                      policy<{'amd64': 'm', 'arm64': '
 CONFIG_MTD                                      note<'Essential for boot on ARM64'>
 
 CONFIG_MTK_PCIE_HOTPLUG                         policy<{'arm64': 'm'}>
-CONFIG_MTK_PCIE_HOTPLUG                         note<'PCIe hotplug driver for NVIDIA DGX Spark (MediaTek MT8901 SoC)'>
+CONFIG_MTK_PCIE_HOTPLUG                         note<'PCIe hotplug driver for NVIDIA DGX Spark systems with MediaTek MT8901 SoC. Provides ACPI-based GPIO and MMIO resource management for PCIe device hotplug support.'>
 
 CONFIG_NOUVEAU_DEBUG                            policy<{'amd64': '-', 'arm64': '-'}>
 CONFIG_NOUVEAU_DEBUG                            note<'Disable nouveau for NVIDIA kernels'>

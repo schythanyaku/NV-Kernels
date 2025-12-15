@@ -13,11 +13,15 @@ config MTK_PCIE_HOTPLUG
 	  Say Y here to enable the MediaTek PCIe hotplug driver for
 	  managing PCIe device hot-plug events on MediaTek SoCs.
 
-	  This driver handles GPIO-based detection of PCIe device
-	  insertion/removal and coordinates with the PCIe subsystem
-	  to properly initialize or remove devices.
+	  This driver uses ACPI to discover GPIO and MMIO resources for
+	  PCIe device insertion/removal detection and hardware control.
+	  It coordinates with the PCIe subsystem to properly initialize
+	  or remove devices.
 
 	  This is particularly useful for MediaTek MT8901 SoC-based
-	  systems.
+	  systems, such as NVIDIA DGX Spark with CX7 NIC hotplug support.
+
+	  The driver requires ACPI DSDT to provide GPIO and MMIO resources
+	  via RES0 device (PNP0C02) and PEDE device _CRS methods.
 
 	  If unsure, say N.
