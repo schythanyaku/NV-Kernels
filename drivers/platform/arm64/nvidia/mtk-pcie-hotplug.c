@@ -22,10 +22,9 @@
  #include <linux/property.h>
  #include <linux/string.h>
  
- #define HP_PORT_MAX		3
- #define HP_POLL_CNT_MAX		200
- #define PCIE_REG_SIZE		0x1000
- #define MAX_VENDOR_DATA_LEN	16
+#define HP_PORT_MAX		3
+#define HP_POLL_CNT_MAX		200
+#define MAX_VENDOR_DATA_LEN	16
 #define CX7_HP_MMIO_REGION_COUNT	5	/* TOP, PROTECT, CKM, MAC Port 0, MAC Port 1 */
 #define CX7_HP_MIN_GPIO_COUNT	4	/* Minimum required: BOOT, PRSNT, PERST, EN */
  
@@ -67,37 +66,32 @@
       PCIE_PIN_MAX
   };
  
- /* PCIe port information */
- struct pcie_port_info {
-     int domain;
-     int bus;
-     int devfn;
- };
+struct pcie_port_info {
+    int domain;
+    int bus;
+    int devfn;
+};
  
 struct rp_bus_mmio_top {
-    u32 addr;		/* Unused - MMIO addresses come from ACPI _CRS */
-    u32 ctrl;		/* Register offset from _DSD */
+    u32 ctrl;
     u32 port_bits[HP_PORT_MAX];
     u32 update_bit;
 };
 
 struct rp_bus_mmio_protect {
-    u32 addr;		/* Unused - MMIO addresses come from ACPI _CRS */
-    u32 mode;		/* Register offset from _DSD */
-    u32 enable;		/* Register offset from _DSD */
+    u32 mode;
+    u32 enable;
     u32 port_bits[HP_PORT_MAX];
 };
 
 struct rp_bus_mmio_mac {
-    u32 addr[HP_PORT_MAX];	/* Unused - MMIO addresses come from ACPI _CRS */
-    u32 init_ctrl;		/* Register offset from _DSD */
+    u32 init_ctrl;
     u32 ltssm_bit;
     u32 phy_rst_bit;
 };
 
 struct rp_bus_mmio_ckm {
-    u32 addr;		/* Unused - MMIO addresses come from ACPI _CRS */
-    u32 ctrl;		/* Register offset from _DSD */
+    u32 ctrl;
     u32 disable_bit;
 };
  
@@ -108,34 +102,31 @@ struct rp_bus_mmio_ckm {
      struct rp_bus_mmio_ckm ckm;
  };
  
- struct gpio_acpi_context {
-     struct device *dev;
-     unsigned int debounce_timeout_us; /* in microseconds */
-     int pin;
-     int wake_capable;
-     int triggering;
-     int polarity;
-     unsigned long irq_flags;
-     int valid;
-     unsigned int connection_type;
-     char vendor_data[MAX_VENDOR_DATA_LEN + 1];
- };
- 
- /* Forward declaration */
- struct cx7_hp_dev;
- 
+struct gpio_acpi_context {
+    struct device *dev;
+    unsigned int debounce_timeout_us;
+    int pin;
+    int wake_capable;
+    int triggering;
+    int polarity;
+    unsigned long irq_flags;
+    int valid;
+    unsigned int connection_type;
+    char vendor_data[MAX_VENDOR_DATA_LEN + 1];
+};
+
+struct cx7_hp_dev;
+
 struct cx7_hp_plat_data {
     int port_nums;
     struct pcie_port_info ports[HP_PORT_MAX];
     u32 vendor_id;
     u32 device_id;
     int num_devices;
-    /* Platform-specific MMIO configuration */
     struct rp_bus_mmio_info rp_bus_mmio;
     void (*rp_bus_protect)(struct cx7_hp_dev *dev, int port_idx, int stage);
     u32 ltssm_reg;
     u32 ltssm_l0_state;
-    /* Pinctrl configuration */
     int pin_nums;
     struct pinctrl_map pinmap[];
 };
@@ -151,35 +142,25 @@ struct acpi_gpio_parse_context {
     struct cx7_hp_dev *hp_dev;
 };
 
-/* Structure to collect all GPIO resources from ACPI walk */
 struct acpi_gpio_walk_context {
     struct device *dev;
     struct gpio_info {
-        unsigned int pin;              /* Hardware pin number (chip-relative) */
-        unsigned int connection_type;  /* ACPI_RESOURCE_GPIO_TYPE_INT or ACPI_RESOURCE_GPIO_TYPE_IO */
-        unsigned int triggering;        /* ACPI_EDGE_SENSITIVE or ACPI_LEVEL_SENSITIVE */
-        unsigned int polarity;         /* ACPI_ACTIVE_HIGH or ACPI_ACTIVE_LOW */
-        unsigned int debounce_timeout; /* Debounce timeout in 10ms units */
-        unsigned int wake_capable;     /* Wake capability */
-        char vendor_data[MAX_VENDOR_DATA_LEN + 1]; /* Vendor data string */
-        char resource_source[16];      /* GPIO controller name */
-        unsigned int resource_source_index; /* Resource source index */
+        unsigned int pin;
+        unsigned int connection_type;
+        unsigned int triggering;
+        unsigned int polarity;
+        unsigned int debounce_timeout;
+        unsigned int wake_capable;
+        char vendor_data[MAX_VENDOR_DATA_LEN + 1];
+        char resource_source[16];
+        unsigned int resource_source_index;
     } gpios[PCIE_PIN_MAX];
-    int count;                          /* Number of GPIOs found */
-    unsigned int gpio_chip_base;        /* GPIO chip base (to be determined) */
-    bool found_chip_base;               /* Whether chip base was found */
+    int count;
+    unsigned int gpio_chip_base;
+    bool found_chip_base;
 };
  
- /**
-  * struct cx7_hp_acpi_mmio - Container for parsed ACPI MMIO resources
-  * @mmio_regions: array of Memory32Fixed resources from ACPI _CRS
-  * @count: number of MMIO regions found
-  * @dev: device pointer for logging
-  *
-  * This structure is used to collect MMIO resources during ACPI _CRS parsing.
-  * The callback function populates this as it walks through the ACPI resources.
-  */
- struct cx7_hp_acpi_mmio {
+struct cx7_hp_acpi_mmio {
      struct acpi_resource_fixed_memory32 mmio_regions[CX7_HP_MMIO_REGION_COUNT];
      int count;
      struct device *dev;
@@ -191,48 +172,34 @@ struct acpi_gpio_walk_context {
     CX7_HP_DEBUG_MAX_VAL
  };
  
- /**
-  * struct cx7_hp_mmio_runtime - Runtime MMIO base addresses
-  * @top_base: Mapped TOP region base
-  * @protect_base: Mapped PROTECT region base
-  * @ckm_base: Mapped CKM region base
-  * @mac_port_base: Mapped MAC port base addresses (per port)
-  *
-  * These are the dynamically mapped MMIO base addresses, separate from the
-  * const platform data which only contains offsets and bit masks.
-  */
- struct cx7_hp_mmio_runtime {
+struct cx7_hp_mmio_runtime {
      void __iomem *top_base;
      void __iomem *protect_base;
      void __iomem *ckm_base;
      void __iomem *mac_port_base[HP_PORT_MAX];
  };
  
- struct cx7_hp_dev {
+struct cx7_hp_dev {
     struct cx7_hp_gpio_ctx *pins;
     struct cx7_hp_plat_data *pd;
-     struct platform_device *pdev;
-     enum cx7_hp_state state;
-     int gpio_count;
-     int boot_pin;
-     int prsnt_pin;
-     enum cx7_hp_debug_val debug_state;
-     spinlock_t lock; /* Protect state changes (IRQ-safe) */
-     struct pci_dev *cached_root_ports[HP_PORT_MAX]; /* Cached root port pointers */
-     struct cx7_hp_mmio_runtime mmio; /* Runtime mapped MMIO base addresses */
-     struct gpio_device *gdev; /* Cached GPIO device for ACPI walk path */
- };
+    struct platform_device *pdev;
+    enum cx7_hp_state state;
+    int gpio_count;
+    int boot_pin;
+    int prsnt_pin;
+    enum cx7_hp_debug_val debug_state;
+    spinlock_t lock;
+    struct pci_dev *cached_root_ports[HP_PORT_MAX];
+    struct cx7_hp_mmio_runtime mmio;
+    struct gpio_device *gdev;
+};
  
  /**
-  * cx7_hp_pinctrl_init - Register pinctrl mappings for the device
-  * @hp_dev: hotplug device
-  *
-  * Registers platform-specific pinctrl mappings for GPIO pin multiplexing
-  * states (default, clkreqn) for the MediaTek PCIe hotplug controller.
-  * These mappings are SoC-specific and define pin names and mux functions.
-  *
-  * Returns: 0 on success, negative error code on failure
-  */
+ * cx7_hp_pinctrl_init - Register pinctrl mappings for the device
+ * @hp_dev: hotplug device
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
  static int cx7_hp_pinctrl_init(struct cx7_hp_dev *hp_dev)
  {
      int ret;
@@ -246,71 +213,85 @@ struct acpi_gpio_walk_context {
          return ret;
      }
  
-     return 0;
- }
- 
- static void cx7_hp_pinctrl_remove(struct cx7_hp_dev *hp_dev)
+    return 0;
+}
+
+/**
+ * cx7_hp_pinctrl_remove - Unregister pinctrl mappings
+ * @hp_dev: hotplug device
+ */
+static void cx7_hp_pinctrl_remove(struct cx7_hp_dev *hp_dev)
  {
-     if (hp_dev->pd->pin_nums)
-         pinctrl_unregister_mappings(hp_dev->pd->pinmap);
- }
- 
- static int cx7_hp_change_state(struct cx7_hp_dev *hp_dev, const char *new_state)
- {
-     struct pinctrl *pinctrl;
-     struct pinctrl_state *state;
-     int ret;
- 
-     /* devm_pinctrl_get() prefers ACPI/DT-provided pinctrl if available,
-      * otherwise falls back to mappings registered in cx7_hp_pinctrl_init() */
-     pinctrl = devm_pinctrl_get(&hp_dev->pdev->dev);
-     if (IS_ERR(pinctrl)) {
-         dev_err(&hp_dev->pdev->dev, "Failed to get pinctrl\n");
-         return PTR_ERR(pinctrl);
-     }
- 
-     state = pinctrl_lookup_state(pinctrl, new_state);
-     if (IS_ERR(state)) {
-         dev_err(&hp_dev->pdev->dev, "Failed to lookup state:%s\n", new_state);
-         return PTR_ERR(state);
-     }
- 
-     ret = pinctrl_select_state(pinctrl, state);
-     if (ret) {
-         dev_err(&hp_dev->pdev->dev, "Failed to select pinctrl state:%s\n", new_state);
-         return ret;
-     }
- 
-     return 0;
- }
- 
- static void cx7_hp_send_uevent(struct cx7_hp_dev *hp_dev, const char *msg)
- {
-     char *uevent = NULL;
-     char *envp[2];
- 
-     uevent = kasprintf(GFP_KERNEL, msg);
-     if (!uevent) {
-         dev_err(&hp_dev->pdev->dev, "Failed to allocate uevent string\n");
-         return;
-     }
- 
-     envp[0] = uevent;
-     envp[1] = NULL;
- 
-     if (kobject_uevent_env(&hp_dev->pdev->dev.kobj, KOBJ_CHANGE, envp))
-         dev_err(&hp_dev->pdev->dev, "Failed to send uevent\n");
- 
-     kfree(uevent);
- }
- 
- /**
-  * cx7_hp_reg_update_bits - Update specific bits in a register
-  * @base: MMIO base address
-  * @offset: Register offset
-  * @mask: Bits to modify
-  * @set: true to set bits, false to clear bits
-  */
+    if (hp_dev->pd->pin_nums)
+        pinctrl_unregister_mappings(hp_dev->pd->pinmap);
+}
+
+/**
+ * cx7_hp_change_state - Change pinctrl state
+ * @hp_dev: hotplug device
+ * @new_state: new pinctrl state name
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int cx7_hp_change_state(struct cx7_hp_dev *hp_dev, const char *new_state)
+{
+    struct pinctrl *pinctrl;
+    struct pinctrl_state *state;
+    int ret;
+
+    pinctrl = devm_pinctrl_get(&hp_dev->pdev->dev);
+    if (IS_ERR(pinctrl)) {
+        dev_err(&hp_dev->pdev->dev, "Failed to get pinctrl\n");
+        return PTR_ERR(pinctrl);
+    }
+
+    state = pinctrl_lookup_state(pinctrl, new_state);
+    if (IS_ERR(state)) {
+        dev_err(&hp_dev->pdev->dev, "Failed to lookup state:%s\n", new_state);
+        return PTR_ERR(state);
+    }
+
+    ret = pinctrl_select_state(pinctrl, state);
+    if (ret) {
+        dev_err(&hp_dev->pdev->dev, "Failed to select pinctrl state:%s\n", new_state);
+        return ret;
+    }
+
+    return 0;
+}
+
+/**
+ * cx7_hp_send_uevent - Send uevent to userspace
+ * @hp_dev: hotplug device
+ * @msg: uevent message string
+ */
+static void cx7_hp_send_uevent(struct cx7_hp_dev *hp_dev, const char *msg)
+{
+    char *uevent = NULL;
+    char *envp[2];
+
+    uevent = kasprintf(GFP_KERNEL, msg);
+    if (!uevent) {
+        dev_err(&hp_dev->pdev->dev, "Failed to allocate uevent string\n");
+        return;
+    }
+
+    envp[0] = uevent;
+    envp[1] = NULL;
+
+    if (kobject_uevent_env(&hp_dev->pdev->dev.kobj, KOBJ_CHANGE, envp))
+        dev_err(&hp_dev->pdev->dev, "Failed to send uevent\n");
+
+    kfree(uevent);
+}
+
+/**
+ * cx7_hp_reg_update_bits - Update specific bits in a register
+ * @base: MMIO base address
+ * @offset: Register offset
+ * @mask: Bits to modify
+ * @set: true to set bits, false to clear bits
+ */
  static inline void cx7_hp_reg_update_bits(void __iomem *base, u32 offset,
                                              u32 mask, bool set)
  {
@@ -324,16 +305,16 @@ struct acpi_gpio_walk_context {
      writel(val, base + offset);
  }
  
- /**
-  * cx7_hp_toggle_update_bit - Toggle control register update bit
-  * @base: MMIO base address
-  * @ctrl_offset: Control register offset
-  * @bits: Bits to set/clear before toggling update
-  * @update_bit: Update bit mask
-  * @set: true to set bits, false to clear bits
-  *
-  * Performs the sequence: modify bits, clear update bit, set update bit
-  */
+/**
+ * cx7_hp_toggle_update_bit - Toggle control register update bit
+ * @base: MMIO base address
+ * @ctrl_offset: Control register offset
+ * @bits: Bits to set/clear before toggling update
+ * @update_bit: Update bit mask
+ * @set: true to set bits, false to clear bits
+ *
+ * Performs the sequence: modify bits, clear update bit, set update bit
+ */
  static void cx7_hp_toggle_update_bit(void __iomem *base, u32 ctrl_offset,
                                         u32 bits, u32 update_bit, bool set)
  {
@@ -343,40 +324,43 @@ struct acpi_gpio_walk_context {
  }
  
  /**
-  * cx7_hp_bus_protect_enable - Enable bus protection for a port
-  * @dev: hotplug device
-  * @port_idx: Port index
-  */
+ * cx7_hp_bus_protect_enable - Enable bus protection for a port
+ * @dev: hotplug device
+ * @port_idx: Port index
+ */
 static void cx7_hp_bus_protect_enable(struct cx7_hp_dev *dev, int port_idx)
 {
     struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
     u32 port_bit = mmio_info->protect.port_bits[port_idx];
 
-    /* MMIO regions are guaranteed to be mapped if probe succeeded */
     cx7_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.mode, port_bit, true);
     cx7_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.enable, port_bit, true);
 }
  
- /**
-  * cx7_hp_bus_protect_disable - Disable bus protection for a port
-  * @dev: hotplug device
-  * @port_idx: Port index
-  */
+/**
+ * cx7_hp_bus_protect_disable - Disable bus protection for a port
+ * @dev: hotplug device
+ * @port_idx: Port index
+ */
 static void cx7_hp_bus_protect_disable(struct cx7_hp_dev *dev, int port_idx)
 {
     struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
     u32 port_bit = mmio_info->protect.port_bits[port_idx];
 
-    /* MMIO regions are guaranteed to be mapped if probe succeeded */
     cx7_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.enable, port_bit, false);
     cx7_hp_reg_update_bits(dev->mmio.protect_base,
                              mmio_info->protect.mode, port_bit, false);
 }
- 
- static void cx7_hp_ckm_control(struct cx7_hp_dev *dev, bool disable)
+
+/**
+ * cx7_hp_ckm_control - Control clock module
+ * @dev: hotplug device
+ * @disable: true to disable clock, false to enable
+ */
+static void cx7_hp_ckm_control(struct cx7_hp_dev *dev, bool disable)
  {
      struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
  
@@ -388,12 +372,11 @@ static void cx7_hp_bus_protect_disable(struct cx7_hp_dev *dev, int port_idx)
  }
  
 /**
-* cx7_hp_parse_res0_mmio_resources - ACPI resource callback for parsing RES0 MMIO from _CRS
-* @ares: ACPI resource being processed
-* @data: pointer to cx7_hp_acpi_mmio structure
+ * cx7_hp_parse_res0_mmio_resources - ACPI resource callback for parsing RES0 MMIO from _CRS
+ * @ares: ACPI resource being processed
+ * @data: pointer to cx7_hp_acpi_mmio structure
  *
- * This callback extracts Memory32Fixed resources from RES0's _CRS and stores
- * them from ACPI _CRS.
+ * Extracts Memory32Fixed resources from RES0's _CRS.
  * Only processes MMIO resources, ignores other resource types (GPIO, IRQ, etc.).
  *
  * Returns: AE_OK to continue iteration, AE_ERROR on error
@@ -409,12 +392,10 @@ static acpi_status cx7_hp_parse_res0_mmio_resources(struct acpi_resource *ares, 
                  CX7_HP_MMIO_REGION_COUNT);
             break;
         }
-        /* Store the Memory32Fixed resource */
         parsed->mmio_regions[parsed->count] = ares->data.fixed_memory32;
         parsed->count++;
         break;
     default:
-        /* Ignore other resource types */
         break;
     }
 
@@ -426,34 +407,19 @@ static acpi_status cx7_hp_parse_res0_mmio_resources(struct acpi_resource *ares, 
  * @dev: device pointer for logging
  *
  * Searches for RES0 device (PNP0C02) in ACPI namespace.
- * Note: If multiple RES0 devices exist, this returns the first one found.
- * The caller should verify the device contains the required MMIO regions.
  * The returned device has a reference that must be released by the caller.
  *
  * Returns: acpi_device pointer on success (with reference), NULL on failure
  */
 static struct acpi_device *cx7_hp_find_res0_device(struct device *dev)
 {
-    struct acpi_device *adev;
-
-    /* Use upstream-friendly API to find RES0 device by HID "PNP0C02"
-     * This is the preferred method used by other drivers in the kernel.
-     * Returns first matching device with a reference that must be released. */
-    adev = acpi_dev_get_first_match_dev("PNP0C02", NULL, -1);
-    if (!adev)
-        return NULL;
-
-    return adev;
+    return acpi_dev_get_first_match_dev("PNP0C02", NULL, -1);
 }
 
 /**
  * cx7_hp_parse_res0_dsd - Parse _DSD properties from RES0 device
  * @pdev: platform device
  * @pd: platform data to populate
- *
- * Parses _DSD properties from RES0 device. _DSD is mandatory for register
- * configuration. Platform data should only contain code-specific items
- * (function pointers, pinctrl mappings) that cannot be in _DSD.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -464,7 +430,6 @@ static int cx7_hp_parse_res0_dsd(struct platform_device *pdev,
     struct device *dev = &pdev->dev;
     u32 val, bit1;
 
-    /* Find RES0 device - this is mandatory */
     res0_adev = cx7_hp_find_res0_device(dev);
     if (!res0_adev) {
         dev_err(dev, "RES0 device (PNP0C02) not found - _DSD is required\n");
@@ -474,14 +439,12 @@ static int cx7_hp_parse_res0_dsd(struct platform_device *pdev,
     dev_info(dev, "Parsing _DSD properties from RES0 device: %s\n",
              acpi_device_bid(res0_adev));
 
-    /* Verify _DSD properties are available */
     if (!acpi_dev_has_props(res0_adev)) {
         dev_err(dev, "RES0 device has no _DSD properties. Check DSDT.\n");
         acpi_dev_put(res0_adev);
         return -EINVAL;
     }
 
-    /* MAC region register offsets - mandatory */
     if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "mac-init-ctrl-offset", &val)) {
         dev_err(dev, "Missing required _DSD property: mac-init-ctrl-offset\n");
         acpi_dev_put(res0_adev);
@@ -503,7 +466,6 @@ static int cx7_hp_parse_res0_dsd(struct platform_device *pdev,
     }
     pd->rp_bus_mmio.mac.phy_rst_bit = BIT(val);
 
-    /* TOP region register offsets - mandatory */
     if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "top-ctrl-offset", &val)) {
         dev_err(dev, "Missing required _DSD property: top-ctrl-offset\n");
         acpi_dev_put(res0_adev);
@@ -532,7 +494,6 @@ static int cx7_hp_parse_res0_dsd(struct platform_device *pdev,
     }
     pd->rp_bus_mmio.top.port_bits[1] = BIT(val);
 
-    /* PROTECT region register offsets - mandatory */
     if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "protect-mode-offset", &val)) {
         dev_err(dev, "Missing required _DSD property: protect-mode-offset\n");
         acpi_dev_put(res0_adev);
@@ -561,7 +522,6 @@ static int cx7_hp_parse_res0_dsd(struct platform_device *pdev,
     }
     pd->rp_bus_mmio.protect.port_bits[1] = BIT(val);
 
-    /* CKM region register offsets - mandatory */
     if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "ckm-ctrl-offset", &val)) {
         dev_err(dev, "Missing required _DSD property: ckm-ctrl-offset\n");
         acpi_dev_put(res0_adev);
@@ -581,7 +541,6 @@ static int cx7_hp_parse_res0_dsd(struct platform_device *pdev,
     }
     pd->rp_bus_mmio.ckm.disable_bit = BIT(val) | BIT(bit1);
 
-    /* LTSSM register configuration - mandatory */
     if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "ltssm-reg-offset", &val)) {
         dev_err(dev, "Missing required _DSD property: ltssm-reg-offset\n");
         acpi_dev_put(res0_adev);
@@ -596,7 +555,6 @@ static int cx7_hp_parse_res0_dsd(struct platform_device *pdev,
     }
     pd->ltssm_l0_state = val;
 
-    /* Port configuration - mandatory */
     if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "port-nums", &val)) {
         dev_err(dev, "Missing required _DSD property: port-nums\n");
         acpi_dev_put(res0_adev);
@@ -656,7 +614,6 @@ static int cx7_hp_parse_res0_dsd(struct platform_device *pdev,
 
     dev_info(dev, "Successfully parsed all required _DSD properties from RES0\n");
 
-    /* Release reference acquired by acpi_dev_get_first_match_dev() */
     acpi_dev_put(res0_adev);
     return 0;
 }
@@ -667,7 +624,6 @@ static int cx7_hp_parse_res0_dsd(struct platform_device *pdev,
  * @parsed: pointer to parsed MMIO structure
  *
  * Parses MMIO regions from RES0 device's _CRS.
- * MMIO regions are provided via RES0 device (PNP0C02) in the ACPI DSDT.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -682,16 +638,13 @@ static int cx7_hp_map_resources_from_res0(struct cx7_hp_dev *dev,
         return -EINVAL;
     }
 
-    /* Find RES0 device */
     res0_adev = cx7_hp_find_res0_device(&dev->pdev->dev);
     if (!res0_adev)
         return -ENODEV;
 
-    /* Initialize parsed structure */
     parsed->count = 0;
     memset(parsed->mmio_regions, 0, sizeof(parsed->mmio_regions));
 
-    /* Walk RES0's _CRS to find MMIO regions */
     dev_info(&dev->pdev->dev, "Parsing MMIO regions from RES0 device _CRS\n");
     status = acpi_walk_resources(res0_adev->handle, METHOD_NAME__CRS,
                                  cx7_hp_parse_res0_mmio_resources, parsed);
@@ -702,7 +655,6 @@ static int cx7_hp_map_resources_from_res0(struct cx7_hp_dev *dev,
         goto out;
     }
 
-    /* Verify we found all required MMIO regions */
     if (parsed->count < CX7_HP_MMIO_REGION_COUNT) {
         dev_warn(&dev->pdev->dev, "Expected %d MMIO regions from RES0, found %d\n",
              CX7_HP_MMIO_REGION_COUNT, parsed->count);
@@ -713,20 +665,16 @@ static int cx7_hp_map_resources_from_res0(struct cx7_hp_dev *dev,
     dev_info(&dev->pdev->dev, "Found %d MMIO regions from RES0 device\n", parsed->count);
 
 out:
-    /* Release reference acquired by acpi_dev_get_first_match_dev() */
     acpi_dev_put(res0_adev);
     return ret;
 }
 
 /**
-  * cx7_hp_map_mmio_resources - Map all MMIO regions from ACPI _CRS
-  * @dev: hotplug device
-  *
-  * Maps MMIO regions from RES0 device (PNP0C02) _CRS using acpi_walk_resources()
- * and devm_ioremap().
+ * cx7_hp_map_mmio_resources - Map all MMIO regions from ACPI _CRS
+ * @dev: hotplug device
  *
  * Returns: 0 on success, negative error code on failure
-  */
+ */
 static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 {
     struct platform_device *pdev = dev->pdev;
@@ -736,23 +684,21 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 
     dev_info(&pdev->dev, "Parsing MMIO regions from RES0 device _CRS\n");
 
-    /* Get MMIO regions directly from RES0 device */
     ret = cx7_hp_map_resources_from_res0(dev, &parsed);
     if (ret) {
         dev_err(&pdev->dev, "Failed to get MMIO regions from RES0 device\n");
         return ret;
     }
- 
-     dev_info(&pdev->dev, "Found %d MMIO regions in _CRS, mapping...\n", parsed.count);
- 
-    /* Map each MMIO region using the addresses from ACPI */
-     int mapped_count = 0;
+
+    dev_info(&pdev->dev, "Found %d MMIO regions in _CRS, mapping...\n", parsed.count);
+
+    int mapped_count = 0;
      for (i = 0; i < parsed.count; i++) {
          void __iomem *base = NULL;
          u32 addr = parsed.mmio_regions[i].address;
          u32 size = parsed.mmio_regions[i].address_length;
          switch (i) {
-         case 0: /* MAC Port 0 */
+         case 0:
              if (dev->pd->port_nums >= 1) {
                  base = devm_ioremap(&pdev->dev, addr, size);
                  if (!base) {
@@ -765,7 +711,7 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
                       addr, size, base);
              }
              break;
-         case 1: /* MAC Port 1 */
+         case 1:
              if (dev->pd->port_nums >= 2) {
                  base = devm_ioremap(&pdev->dev, addr, size);
                  if (!base) {
@@ -778,7 +724,7 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
                       addr, size, base);
              }
              break;
-         case 2: /* TOP */
+         case 2:
              base = devm_ioremap(&pdev->dev, addr, size);
              if (!base) {
                  dev_err(&pdev->dev, "Failed to map TOP region (0x%08x)\n", addr);
@@ -789,7 +735,7 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
              dev_info(&pdev->dev, "Mapped TOP: 0x%08x (size 0x%x) -> %p\n",
                   addr, size, base);
              break;
-         case 3: /* PROTECT */
+         case 3:
              base = devm_ioremap(&pdev->dev, addr, size);
              if (!base) {
                  dev_err(&pdev->dev, "Failed to map PROTECT region (0x%08x)\n", addr);
@@ -800,7 +746,7 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
              dev_info(&pdev->dev, "Mapped PROTECT: 0x%08x (size 0x%x) -> %p\n",
                   addr, size, base);
              break;
-         case 4: /* CKM */
+         case 4:
              base = devm_ioremap(&pdev->dev, addr, size);
              if (!base) {
                  dev_err(&pdev->dev, "Failed to map CKM region (0x%08x)\n", addr);
@@ -817,10 +763,7 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
              break;
          }
      }
- 
-    /* Verify all required regions were mapped.
-     * TOP, PROTECT, and CKM are mandatory.
-     * MAC ports are required based on port_nums. */
+
     if (!dev->mmio.top_base || !dev->mmio.protect_base || !dev->mmio.ckm_base ||
         (dev->pd->port_nums >= 1 && !dev->mmio.mac_port_base[0]) ||
         (dev->pd->port_nums >= 2 && !dev->mmio.mac_port_base[1])) {
@@ -836,7 +779,6 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
             dev_err(&pdev->dev, "  Missing: MAC Port 0 (port_nums=%d)\n", dev->pd->port_nums);
         if (dev->pd->port_nums >= 2 && !dev->mmio.mac_port_base[1])
             dev_err(&pdev->dev, "  Missing: MAC Port 1 (port_nums=%d)\n", dev->pd->port_nums);
-        /* Clear any partially mapped regions (devm_ioremap will clean up automatically) */
         dev->mmio.top_base = NULL;
         dev->mmio.protect_base = NULL;
         dev->mmio.ckm_base = NULL;
@@ -859,11 +801,9 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
  {
      switch (stage) {
      case BUS_PROTECT_INIT:
-         /* Initialize bus protection during probe - map MMIO regions */
          {
              int ret;
 
-            /* Map MMIO regions from RES0 _CRS */
             ret = cx7_hp_map_mmio_resources(dev);
             if (ret) {
                 dev_err(&dev->pdev->dev, "Failed to map MMIO resources during bus init: %d\n", ret);
@@ -873,13 +813,9 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
          return;
  
      case BUS_PROTECT_CLEANUP:
-         /* Cleanup stage (called during remove).
-          * Note: devm_ioremap() automatically cleans up mappings, so no manual
-          * iounmap() is needed. This cleanup clears pointers. */
          {
              int i;
- 
-             /* Clear MMIO base pointers (mappings are automatically cleaned up by devm_ioremap) */
+
              for (i = 0; i < HP_PORT_MAX; i++) {
                  if (dev->mmio.mac_port_base[i])
                      dev->mmio.mac_port_base[i] = NULL;
@@ -907,38 +843,29 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
                  return;
  
              if (stage == BUS_PROTECT_CABLE_REMOVAL) {
-                 /* Deassert LTSSM enable and PHY reset */
                  cx7_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
                                           mmio_info->mac.ltssm_bit, false);
                  cx7_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
                                           mmio_info->mac.phy_rst_bit, false);
                  return;
              }
- 
-            /* BUS_PROTECT_CABLE_PLUGIN */
-            /* MMIO regions (top_base, protect_base) are guaranteed to be mapped if probe succeeded */
 
-            /* Deassert way_en */
              cx7_hp_toggle_update_bit(dev->mmio.top_base, mmio_info->top.ctrl,
                                         mmio_info->top.port_bits[port_idx],
                                         mmio_info->top.update_bit, false);
              udelay(CX7_HP_DELAY_SHORT_US);
- 
-             /* Enable bus protection */
+
              cx7_hp_bus_protect_enable(dev, port_idx);
              usleep_range(CX7_HP_DELAY_BUS_PROTECT_US, CX7_HP_DELAY_BUS_PROTECT_US + 1000);
- 
-             /* Assert LTSSM enable and PHY reset */
+
              cx7_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
                                       mmio_info->mac.phy_rst_bit, true);
              cx7_hp_reg_update_bits(mac_base, mmio_info->mac.init_ctrl,
                                       mmio_info->mac.ltssm_bit, true);
              usleep_range(CX7_HP_DELAY_PHY_RESET_US, CX7_HP_DELAY_PHY_RESET_US + 1000);
- 
-             /* Disable bus protection */
+
              cx7_hp_bus_protect_disable(dev, port_idx);
- 
-             /* Assert way_en */
+
              cx7_hp_toggle_update_bit(dev->mmio.top_base, mmio_info->top.ctrl,
                                         mmio_info->top.port_bits[port_idx],
                                         mmio_info->top.update_bit, true);
@@ -948,10 +875,14 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
      default:
          dev_warn(&dev->pdev->dev, "Unknown bus protect stage: %d\n", stage);
          break;
-     }
- }
- 
- static void retrain_pcie_link(struct pci_dev *dev)
+    }
+}
+
+/**
+ * retrain_pcie_link - Retrain PCIe link
+ * @dev: PCI device
+ */
+static void retrain_pcie_link(struct pci_dev *dev)
  {
      u16 link_control, lnksta;
      int pos, i = 0;
@@ -994,9 +925,8 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
         return NULL;
 
     port = &hp_dev->pd->ports[port_idx];
- 
-     /* Try to find the root port if not cached */
-     if (!hp_dev->cached_root_ports[port_idx]) {
+
+    if (!hp_dev->cached_root_ports[port_idx]) {
          hp_dev->cached_root_ports[port_idx] = 
              pci_get_domain_bus_and_slot(port->domain,
                                                          port->bus,
@@ -1020,22 +950,14 @@ static void remove_device(struct cx7_hp_dev *dev)
 {
     int i;
 
-    /* Apply bus protection before removal */
     if (dev->pd->rp_bus_protect) {
         for (i = 0; i < dev->pd->port_nums; i++)
             dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_REMOVAL);
     }
 
-    /* Deassert PCIe reset */
     gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 0);
-
-    /* Change pinctrl state */
     cx7_hp_change_state(dev, "default");
-
-    /* Disable clock */
     cx7_hp_ckm_control(dev, true);
-
-    /* Power off device */
     gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
 }
  
@@ -1043,7 +965,7 @@ static void remove_device(struct cx7_hp_dev *dev)
  * polling_link_to_l0 - Poll until all PCIe ports reach L0 state
  * @dev: hotplug device
  *
- * Returns 0 on success, negative on error.
+ * Returns: 0 on success, negative error code on failure
  */
 static int polling_link_to_l0(struct cx7_hp_dev *dev)
 {
@@ -1101,23 +1023,20 @@ static int polling_link_to_l0(struct cx7_hp_dev *dev)
  * rescan_device - Rescan PCIe bus to discover devices
  * @dev: hotplug device
  *
- * Returns 0 on success, negative on error.
+ * Returns: 0 on success, negative error code on failure
  */
 static int rescan_device(struct cx7_hp_dev *dev)
 {
     struct pci_dev *pci_dev;
     int i, err;
 
-    /* Change pinctrl state */
     err = cx7_hp_change_state(dev, "clkreqn");
     if (err)
         return err;
 
-    /* Enable clock */
     cx7_hp_ckm_control(dev, false);
     usleep_range(CX7_HP_DELAY_STANDARD_US, CX7_HP_DELAY_STANDARD_US + 1000);
 
-    /* Resume root ports */
     for (i = 0; i < dev->pd->port_nums; i++) {
          pci_dev = get_port_root_port(dev, i);
          if (!pci_dev)
@@ -1130,29 +1049,24 @@ static int rescan_device(struct cx7_hp_dev *dev)
                      pci_name(pci_dev), err);
          }
      }
- 
-    /* Assert PCIe reset */
+
     gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
- 
-    /* Apply bus protection */
+
     if (dev->pd->rp_bus_protect) {
         for (i = 0; i < dev->pd->port_nums; i++)
             dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
     }
- 
-     /* Wait for links to reach L0 */
+
      err = polling_link_to_l0(dev);
      if (err)
          return err;
- 
-    /* Retrain PCIe links */
+
     for (i = 0; i < dev->pd->port_nums; i++) {
         pci_dev = get_port_root_port(dev, i);
         if (pci_dev)
             retrain_pcie_link(pci_dev);
     }
- 
-     /* Wait for link stability */
+
      msleep(CX7_HP_DELAY_LINK_STABLE_MS);
  
      return 0;
@@ -1160,7 +1074,7 @@ static int rescan_device(struct cx7_hp_dev *dev)
  
 /**
  * cx7_hp_work - Work queue handler for hotplug state machine
- * @irq: interrupt number (unused)
+ * @irq: interrupt number
  * @dev_id: GPIO context pointer
  *
  * Processes hotplug state transitions based on current state.
@@ -1226,25 +1140,21 @@ static irqreturn_t cx7_hp_work(int irq, void *dev_id)
      int value;
      enum cx7_hp_state state;
  
-     value = gpiod_get_value(app_ctx->desc);
- 
-    /* Handle presence pin events first - no lock needed as prsnt_pin is read-only */
+    value = gpiod_get_value(app_ctx->desc);
+
     if (gpio_ctx->pin == hp_dev->prsnt_pin) {
         if (value) {
             cx7_hp_send_uevent(hp_dev, REMOVAL_EVT);
         } else {
             cx7_hp_send_uevent(hp_dev, PLUG_IN_EVT);
         }
-        /* For physical hotplug, let userspace handle device management
-         * to avoid potential deadlocks when hardware is in transition */
         return IRQ_HANDLED;
     }
 
     spin_lock_irqsave(&hp_dev->lock, flags);
     state = hp_dev->state;
- 
-     /* Handle boot status pin events (compare hardware pin numbers - robust against order changes) */
-     if (gpio_ctx->pin == hp_dev->boot_pin) {
+
+    if (gpio_ctx->pin == hp_dev->boot_pin) {
          if (value && state == STATE_PLUG_IN) {
              hp_dev->state = STATE_DEV_POWER_ON;
          } else if (value && state == STATE_DEV_FW_START) {
@@ -1258,11 +1168,10 @@ static irqreturn_t cx7_hp_work(int irq, void *dev_id)
              return IRQ_HANDLED;
          }
          spin_unlock_irqrestore(&hp_dev->lock, flags);
-         return IRQ_WAKE_THREAD;
-     }
- 
-     /* Unknown GPIO pin */
-     dev_err(gpio_ctx->dev, "Unknown GPIO pin event: pin=%d irq=%d value=%d\n",
+        return IRQ_WAKE_THREAD;
+    }
+
+    dev_err(gpio_ctx->dev, "Unknown GPIO pin event: pin=%d irq=%d value=%d\n",
               gpio_ctx->pin, irq, value);
      spin_unlock_irqrestore(&hp_dev->lock, flags);
      return IRQ_HANDLED;
@@ -1273,8 +1182,7 @@ static irqreturn_t cx7_hp_work(int irq, void *dev_id)
  * @ares: ACPI resource structure
  * @context: Pointer to acpi_gpio_walk_context
  *
- * This callback is invoked by acpi_walk_resources() for each GPIO resource in _CRS.
- * It collects all GPIO pins, their properties, and vendor data.
+ * Returns: AE_OK to continue iteration
  */
 static acpi_status acpi_gpio_walk_handler(struct acpi_resource *ares, void *context)
 {
@@ -1292,13 +1200,11 @@ static acpi_status acpi_gpio_walk_handler(struct acpi_resource *ares, void *cont
 
     agpio = &ares->data.gpio;
 
-    /* Get pin number from pin table (first pin) */
     if (!agpio->pin_table || agpio->pin_table_length == 0) {
         dev_warn(walk_ctx->dev, "GPIO resource has no pin table\n");
         return AE_OK;
     }
 
-    /* Store GPIO information */
     walk_ctx->gpios[walk_ctx->count].pin = agpio->pin_table[0];
     walk_ctx->gpios[walk_ctx->count].connection_type = agpio->connection_type;
     walk_ctx->gpios[walk_ctx->count].triggering = agpio->triggering;
@@ -1306,7 +1212,6 @@ static acpi_status acpi_gpio_walk_handler(struct acpi_resource *ares, void *cont
     walk_ctx->gpios[walk_ctx->count].debounce_timeout = agpio->debounce_timeout;
     walk_ctx->gpios[walk_ctx->count].wake_capable = agpio->wake_capable;
 
-    /* Store vendor data if present */
     if (agpio->vendor_length && agpio->vendor_data) {
         length = min_t(int, agpio->vendor_length, MAX_VENDOR_DATA_LEN);
         memcpy(walk_ctx->gpios[walk_ctx->count].vendor_data, agpio->vendor_data, length);
@@ -1315,7 +1220,6 @@ static acpi_status acpi_gpio_walk_handler(struct acpi_resource *ares, void *cont
         walk_ctx->gpios[walk_ctx->count].vendor_data[0] = '\0';
     }
 
-    /* Store resource source (GPIO controller name) */
     if (agpio->resource_source.string_ptr) {
         length = min_t(int, agpio->resource_source.string_length, 15);
         memcpy(walk_ctx->gpios[walk_ctx->count].resource_source,
@@ -1334,8 +1238,6 @@ static acpi_status acpi_gpio_walk_handler(struct acpi_resource *ares, void *cont
  * @pdev: Platform device
  * @walk_ctx: Context structure to fill with GPIO information
  *
- * Uses acpi_walk_resources() to parse all GPIO resources from ACPI _CRS.
- *
  * Returns: 0 on success, negative error code on failure
  */
 static int cx7_hp_walk_acpi_gpios(struct platform_device *pdev,
@@ -1350,11 +1252,9 @@ static int cx7_hp_walk_acpi_gpios(struct platform_device *pdev,
         return -ENODEV;
     }
 
-    /* Initialize walk context */
     memset(walk_ctx, 0, sizeof(*walk_ctx));
     walk_ctx->dev = &pdev->dev;
 
-    /* Walk all GPIO resources in _CRS */
     status = acpi_walk_resources(adev->handle, METHOD_NAME__CRS,
                                  acpi_gpio_walk_handler, walk_ctx);
     if (ACPI_FAILURE(status)) {
@@ -1373,7 +1273,14 @@ static int cx7_hp_walk_acpi_gpios(struct platform_device *pdev,
     return 0;
 }
 
- static acpi_status acpi_gpio_resource_handler(struct acpi_resource *ares, void *context)
+/**
+ * acpi_gpio_resource_handler - ACPI resource callback for parsing GPIO from _CRS
+ * @ares: ACPI resource being processed
+ * @context: Pointer to acpi_gpio_parse_context
+ *
+ * Returns: AE_OK to continue iteration
+ */
+static acpi_status acpi_gpio_resource_handler(struct acpi_resource *ares, void *context)
  {
      struct acpi_gpio_parse_context *parse_ctx = context;
      struct gpio_acpi_context *ctx = parse_ctx->ctx;
@@ -1395,21 +1302,18 @@ static int cx7_hp_walk_acpi_gpios(struct platform_device *pdev,
      ctx->triggering = agpio->triggering;
      ctx->polarity = agpio->polarity;
      ctx->connection_type = agpio->connection_type;
- 
-     /* Store vendor data and identify BOOT/PRSNT pins (upstream-friendly) */
+
      if (agpio->vendor_length && agpio->vendor_data && hp_dev) {
          length = min_t(int, agpio->vendor_length, MAX_VENDOR_DATA_LEN);
          memcpy(&ctx->vendor_data[0], agpio->vendor_data, length);
          ctx->vendor_data[length] = '\0';
- 
-         /* Identify BOOT and PRSNT pins by vendor data and store hardware pin numbers */
+
          if (!strncmp("BOOT", ctx->vendor_data, strlen("BOOT")))
              hp_dev->boot_pin = ctx->pin;
          else if (!strncmp("PRSNT", ctx->vendor_data, strlen("PRSNT")))
              hp_dev->prsnt_pin = ctx->pin;
      }
- 
-     /* Set IRQ flags based on triggering and polarity */
+
      if (agpio->triggering == ACPI_EDGE_SENSITIVE) {
          if (agpio->polarity == ACPI_ACTIVE_LOW)
              ctx->irq_flags = IRQF_TRIGGER_FALLING;
@@ -1427,27 +1331,23 @@ static int cx7_hp_walk_acpi_gpios(struct platform_device *pdev,
      return AE_OK;
  }
  
- /**
-  * pci_devices_present_on_domain() - Check if PCI devices exist on a domain
-  * @domain: PCI domain number to check
-  *
-  * Returns true if any PCI devices are present on the specified domain,
-  * false otherwise. This is used as a safety check before hardware shutdown.
-  */
+/**
+ * pci_devices_present_on_domain() - Check if PCI devices exist on a domain
+ * @domain: PCI domain number to check
+ *
+ * Returns: true if any PCI devices are present on the specified domain,
+ * false otherwise. This is used as a safety check before hardware shutdown.
+ */
  static bool pci_devices_present_on_domain(int domain)
  {
      struct pci_bus *bus;
      struct pci_dev *dev;
      bool has_endpoint_devices = false;
- 
-     /* Find the secondary bus (bus 01) for this domain
-      * This is where endpoint devices live, not the root ports.
-      * Only check for endpoint devices, not root ports (which must remain). */
+
      bus = pci_find_bus(domain, 1);
      if (!bus)
-         return false;  /* No secondary bus means no endpoints */
- 
-     /* Check if the secondary bus has any devices (CX7 endpoints) */
+         return false;
+
      list_for_each_entry(dev, &bus->devices, bus_list) {
          has_endpoint_devices = true;
          break;
@@ -1484,11 +1384,7 @@ static int cx7_hp_walk_acpi_gpios(struct platform_device *pdev,
 
     switch (val) {
     case CX7_HP_DEBUG_PLUG_OUT:
-
-        /* Safety check: Verify no devices on the bus before hardware shutdown.
-         * This prevents silicon bug where CPU access during link down causes
-         * system hang. Userspace must remove PCI devices first.
-         * Release lock before calling sleep-capable function (pci_find_bus can sleep) */
+        /* Safety check: Verify no devices on the bus before hardware shutdown. */
         for (i = 0; i < hp_dev->pd->port_nums; i++) {
             if (pci_devices_present_on_domain(hp_dev->pd->ports[i].domain)) {
                 dev_err(dev, "PCI devices still present, remove them first\n");
@@ -1496,18 +1392,14 @@ static int cx7_hp_walk_acpi_gpios(struct platform_device *pdev,
             }
         }
 
-        /* Safe to proceed - no devices on bus */
         spin_lock_irqsave(&hp_dev->lock, flags);
         hp_dev->state = STATE_PLUG_OUT;
         hp_dev->debug_state = val;
         spin_unlock_irqrestore(&hp_dev->lock, flags);
-        /* Release lock before calling sleep-capable function */
         remove_device(hp_dev);
         return count;
 
     case CX7_HP_DEBUG_PLUG_IN:
-
-        /* Release lock before calling sleep-capable function (pci_find_bus can sleep) */
         for (i = 0; i < hp_dev->pd->port_nums; i++) {
             if (pci_devices_present_on_domain(hp_dev->pd->ports[i].domain)) {
                 dev_err(dev, "PCI devices already present, cannot reinitialize hardware\n");
@@ -1515,13 +1407,10 @@ static int cx7_hp_walk_acpi_gpios(struct platform_device *pdev,
             }
         }
 
-        /* Safe to proceed - no devices on bus */
         spin_lock_irqsave(&hp_dev->lock, flags);
         hp_dev->state = STATE_PLUG_IN;
         hp_dev->debug_state = val;
         spin_unlock_irqrestore(&hp_dev->lock, flags);
-        /* Release lock before calling sleep-capable function */
-        /* Enable device power - GPIO IRQ state machine will handle rest */
         gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
         return count;
 
@@ -1543,8 +1432,17 @@ static const struct attribute_group cx7_hp_attr_group = {
     .name = "pcie_hotplug",
     .attrs = cx7_hp_attrs
 };
- 
- static struct gpio_acpi_context *gpio_acpi_setup(struct platform_device *pdev,
+
+/**
+ * gpio_acpi_setup - Setup GPIO ACPI context from _CRS
+ * @pdev: platform device
+ * @desc: GPIO descriptor
+ * @hp_dev: hotplug device
+ * @gpio_index: GPIO index
+ *
+ * Returns: GPIO ACPI context on success, NULL on failure
+ */
+static struct gpio_acpi_context *gpio_acpi_setup(struct platform_device *pdev,
                                                     struct gpio_desc *desc,
                                                     struct cx7_hp_dev *hp_dev,
                                                     int gpio_index)
@@ -1567,11 +1465,10 @@ static const struct attribute_group cx7_hp_attr_group = {
      ctx->pin = desc_to_gpio(desc) - gpio_device_get_base(gpiod_to_gpio_device(desc));
      ctx->dev = &pdev->dev;
  
-     parse_ctx.ctx = ctx;
-     parse_ctx.hp_dev = hp_dev;
- 
-     /* Parse ACPI _CRS to get GPIO properties and identify special pins */
-     status = acpi_walk_resources(adev->handle, METHOD_NAME__CRS,
+    parse_ctx.ctx = ctx;
+    parse_ctx.hp_dev = hp_dev;
+
+    status = acpi_walk_resources(adev->handle, METHOD_NAME__CRS,
                                   acpi_gpio_resource_handler, &parse_ctx);
      if (ACPI_FAILURE(status)) {
          devm_kfree(&pdev->dev, ctx);
@@ -1579,8 +1476,6 @@ static const struct attribute_group cx7_hp_attr_group = {
      }
  
     if (ctx->valid) {
-        /* If vendor data missing in ACPI, identify BOOT/PRSNT pins by array index
-         * Still uses ACPI data - just different identification method */
         if (gpio_index == PCIE_PIN_BOOT && hp_dev->boot_pin == -1) {
              hp_dev->boot_pin = ctx->pin;
              dev_info(&pdev->dev, "BOOT pin identified by index: hardware pin %d\n", hp_dev->boot_pin);
@@ -1591,11 +1486,17 @@ static const struct attribute_group cx7_hp_attr_group = {
          return ctx;
      }
  
-     devm_kfree(&pdev->dev, ctx);
-     return NULL;
- }
- 
- static int cx7_hp_setup_irq(struct cx7_hp_gpio_ctx *app_ctx)
+    devm_kfree(&pdev->dev, ctx);
+    return NULL;
+}
+
+/**
+ * cx7_hp_setup_irq - Setup IRQ for GPIO
+ * @app_ctx: GPIO context
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int cx7_hp_setup_irq(struct cx7_hp_gpio_ctx *app_ctx)
  {
      struct gpio_acpi_context *ctx = app_ctx->ctx;
      int irq, ret;
@@ -1622,9 +1523,6 @@ static const struct attribute_group cx7_hp_attr_group = {
 /**
  * cx7_hp_put_gpio_device - Release GPIO device reference
  * @data: GPIO device pointer
- *
- * Cleanup function called by devm_add_action_or_reset() to release
- * the GPIO device reference when the hotplug device is removed.
  */
 static void cx7_hp_put_gpio_device(void *data)
 {
@@ -1638,10 +1536,6 @@ static void cx7_hp_put_gpio_device(void *data)
  * @pdev: platform device
  * @pd: platform data
  *
- * Scans for PCI devices matching the vendor/device ID specified in platform data
- * and verifies they're on one of the managed PCIe domains.
- * This version can be called before hp_dev is allocated.
- *
  * Returns: 0 on success, -EPROBE_DEFER if devices are still initializing,
  *         negative error code on failure
  */
@@ -1652,21 +1546,17 @@ static int cx7_hp_discover_devices(struct platform_device *pdev,
     int device_count = 0;
     int i;
 
-    /* If no vendor/device ID specified, skip device discovery */
     if (!pd->vendor_id || !pd->device_id)
         return 0;
 
-    /* Find all matching PCI devices */
     while ((pci_dev = pci_get_device(pd->vendor_id,
                                       pd->device_id,
                                       pci_dev)) != NULL) {
-        /* Wait for device to be initialized */
         if (!pci_dev->state_saved) {
             pci_dev_put(pci_dev);
             return -EPROBE_DEFER;
         }
 
-        /* Verify device is on one of our managed ports */
         for (i = 0; i < pd->port_nums; i++) {
             if (pci_domain_nr(pci_dev->bus) == pd->ports[i].domain)
                 break;
@@ -1698,10 +1588,6 @@ static int cx7_hp_discover_devices(struct platform_device *pdev,
  * @pdev: platform device
  * @pd: platform data to populate
  *
- * Parses _DSD properties from RES0 device (mandatory) and then discovers existing
- * PCI devices on managed ports. This combines firmware configuration parsing with
- * device discovery since device discovery requires port configuration from _DSD.
- *
  * Returns: 0 on success, negative error code on failure
  */
 static int cx7_hp_init_from_res0(struct platform_device *pdev,
@@ -1709,7 +1595,6 @@ static int cx7_hp_init_from_res0(struct platform_device *pdev,
 {
     int ret;
 
-    /* Parse _DSD properties from RES0 - this is mandatory */
     ret = cx7_hp_parse_res0_dsd(pdev, pd);
     if (ret) {
         dev_err(&pdev->dev, "Failed to parse required _DSD properties from RES0: %d\n", ret);
@@ -1738,9 +1623,6 @@ static int cx7_hp_init_from_res0(struct platform_device *pdev,
  * @pdev: Platform device
  * @hp_dev: Hotplug device structure
  *
- * Enumerates GPIOs exclusively from ACPI _CRS resources via ACPI walk.
- * No fallbacks - ACPI is mandatory.
- *
  * Returns: Number of GPIOs found, or negative error code
  */
 static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
@@ -1753,7 +1635,6 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
     acpi_status status;
     int ret, i;
 
-    /* Enumerate GPIOs from ACPI _CRS - this is mandatory */
     ret = cx7_hp_walk_acpi_gpios(pdev, &walk_ctx);
     if (ret) {
         dev_err(&pdev->dev, "Failed to walk ACPI GPIO resources: %d\n", ret);
@@ -1813,7 +1694,6 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 
     hp_dev->gpio_count = walk_ctx.count;
 
-    /* Allocate GPIO context array */
     hp_dev->pins = devm_kzalloc(&pdev->dev,
                                  sizeof(struct cx7_hp_gpio_ctx) * hp_dev->gpio_count,
                                  GFP_KERNEL);
@@ -1822,11 +1702,9 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
         return -ENOMEM;
     }
 
-    /* Setup GPIO pins from ACPI walk data */
     for (i = 0; i < hp_dev->gpio_count; i++) {
         struct cx7_hp_gpio_ctx *app_ctx = &hp_dev->pins[i];
 
-        /* Get GPIO descriptor directly from GPIO device using ACPI pin number */
         app_ctx->desc = gpio_device_get_desc(hp_dev->gdev, walk_ctx.gpios[i].pin);
         if (IS_ERR(app_ctx->desc)) {
             dev_err(&pdev->dev, "Failed to get GPIO descriptor for ACPI pin %u (index %d): %ld\n",
@@ -1850,7 +1728,7 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
  * Initializes the PCIe hotplug driver, parses ACPI resources, and sets up
  * GPIO interrupts and sysfs interface.
  *
- * Returns 0 on success, negative error code on failure.
+ * Returns: 0 on success, negative error code on failure
  */
 static int cx7_hp_probe(struct platform_device *pdev)
  {
@@ -1867,7 +1745,6 @@ static int cx7_hp_probe(struct platform_device *pdev)
         return -EINVAL;
     }
 
-    /* Allocate runtime copy of platform data (to allow _DSD overrides) */
     pd_size = sizeof(*pd_template) + (pd_template->pin_nums * sizeof(struct pinctrl_map));
     pd = devm_kzalloc(&pdev->dev, pd_size, GFP_KERNEL);
     if (!pd) {
@@ -1875,10 +1752,8 @@ static int cx7_hp_probe(struct platform_device *pdev)
         return -ENOMEM;
     }
 
-    /* Copy template platform data */
     memcpy(pd, pd_template, pd_size);
 
-    /* Initialize platform data from RES0 _DSD and discover PCI devices */
     ret = cx7_hp_init_from_res0(pdev, pd);
     if (ret)
         return ret;
@@ -1896,21 +1771,18 @@ static int cx7_hp_probe(struct platform_device *pdev)
     hp_dev->prsnt_pin = -1;
     spin_lock_init(&hp_dev->lock);
 
-    /* Initialize cached root port pointers */
     for (i = 0; i < HP_PORT_MAX; i++)
         hp_dev->cached_root_ports[i] = NULL;
 
-    /* Enumerate GPIO pins from ACPI only - no fallbacks */
     ret = cx7_hp_enumerate_gpios(pdev, hp_dev);
     if (ret < 0) {
         dev_err(&pdev->dev, "Failed to enumerate GPIOs from ACPI: %d\n", ret);
         return ret;
     }
 
-    /* Setup GPIO ACPI context and IRQs */
     for (i = 0; i < hp_dev->gpio_count; i++) {
         app_ctx = &hp_dev->pins[i];
-        
+
         app_ctx->ctx = gpio_acpi_setup(pdev, app_ctx->desc, hp_dev, i);
         if (!app_ctx->ctx) {
             dev_err(&pdev->dev, "Failed to setup GPIO %d\n", i);
@@ -1918,10 +1790,8 @@ static int cx7_hp_probe(struct platform_device *pdev)
             goto gpio_release;
         }
 
-        /* GPIO descriptors are guaranteed to be valid after successful enumeration */
         gpiod_set_debounce(app_ctx->desc, app_ctx->ctx->debounce_timeout_us);
 
-        /* Setup IRQ for interrupt-type GPIOs */
         if (app_ctx->ctx->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT) {
             dev_info(&pdev->dev, "Setting up IRQ for GPIO %d (pin %d)\n", i, app_ctx->ctx->pin);
             ret = cx7_hp_setup_irq(app_ctx);
@@ -1934,28 +1804,23 @@ static int cx7_hp_probe(struct platform_device *pdev)
     }
 
     platform_set_drvdata(pdev, hp_dev);
- 
-     /* Initialize pinctrl */
+
      ret = cx7_hp_pinctrl_init(hp_dev);
      if (ret) {
          dev_err(&pdev->dev, "Pinmux init failed, ret: %d\n", ret);
          goto gpio_release;
      }
- 
-     /* Create sysfs interface */
+
      ret = sysfs_create_group(&pdev->dev.kobj, &cx7_hp_attr_group);
      if (ret) {
          dev_err(&pdev->dev, "Sysfs creation failed: %d\n", ret);
          goto pinctrl_remove;
      }
- 
-     /* Initialize bus protection - handles MMIO mapping and device discovery.
-      * Called once for first port only since MMIO mapping is per-device. */
+
      if (hp_dev->pd->rp_bus_protect) {
          hp_dev->pd->rp_bus_protect(hp_dev, 0, BUS_PROTECT_INIT);
      }
- 
-    /* Send initial state uevent */
+
     if (gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc)) {
         hp_dev->debug_state = CX7_HP_DEBUG_PLUG_OUT;
         cx7_hp_send_uevent(hp_dev, REMOVAL_EVT);
@@ -1996,82 +1861,44 @@ gpio_release:
     if (!hp_dev)
         return;
 
-    /* Remove sysfs interface */
     sysfs_remove_group(&pdev->dev.kobj, &cx7_hp_attr_group);
 
-    /* Cleanup bus protection */
     if (hp_dev->pd->rp_bus_protect)
         hp_dev->pd->rp_bus_protect(hp_dev, 0, BUS_PROTECT_CLEANUP);
- 
-     /* Remove pinctrl */
+
      cx7_hp_pinctrl_remove(hp_dev);
- 
-     /* Release GPIO pins */
+
      for (i = 0; i < hp_dev->gpio_count; i++) {
          app_ctx = &hp_dev->pins[i];
          if (app_ctx->desc)
              gpiod_put(app_ctx->desc);
      }
- 
-    /* Release cached PCI device references */
+
     for (i = 0; i < hp_dev->pd->port_nums; i++) {
         if (hp_dev->cached_root_ports[i])
             pci_dev_put(hp_dev->cached_root_ports[i]);
     }
- 
+
      platform_set_drvdata(pdev, NULL);
- 
-     /* MMIO regions are automatically unmapped via devm_* */
  }
  
 /*
  * Platform data for MT8901 PCIe hotplug support
  *
- * Register offsets and bit positions come from RES0 _DSD properties.
+ * Fields initialized to 0/default are populated from RES0 _DSD at runtime.
  * MMIO addresses come from RES0 _CRS (PNP0C02 device).
- * This structure only contains code-specific items not in ACPI:
- * function pointers, pinctrl mappings, and device matching.
+ * Code-specific fields: function pointers, pinctrl mappings, and device matching.
  */
 static const struct cx7_hp_plat_data mt8901_plat_data = {
-    .port_nums = 0,  /* Will be set from _DSD "port-nums" */
-    .ports = {
-        { .domain = 0, .bus = 0, .devfn = 0 },  /* Will be set from _DSD */
-        { .domain = 0, .bus = 0, .devfn = 0 },  /* Will be set from _DSD */
-    },
+    .port_nums = 0,
+    .ports = { {0}, {0} },
     .vendor_id = PCI_VENDOR_ID_MELLANOX,
     .device_id = 0x1021, /* CX7 device ID */
     .num_devices = 4,
-    .rp_bus_mmio = {
-        .top = {
-            .addr = 0,  /* MMIO addresses come from RES0 _CRS */
-            .ctrl = 0,  /* Will be set from _DSD "top-ctrl-offset" */
-            .update_bit = 0,  /* Will be set from _DSD "top-update-bit" */
-            .port_bits = {0, 0},  /* Will be set from _DSD "top-port0-bit", "top-port1-bit" */
-        },
-        .protect = {
-            .addr = 0,  /* MMIO addresses come from RES0 _CRS */
-            .mode = 0,  /* Will be set from _DSD "protect-mode-offset" */
-            .enable = 0,  /* Will be set from _DSD "protect-enable-offset" */
-            .port_bits = {0, 0},  /* Will be set from _DSD "protect-port0-bit", "protect-port1-bit" */
-        },
-        .mac = {
-            .addr = {0, 0},  /* MMIO addresses come from RES0 _CRS */
-            .init_ctrl = 0,  /* Will be set from _DSD "mac-init-ctrl-offset" */
-            .ltssm_bit = 0,  /* Will be set from _DSD "mac-ltssm-bit" */
-            .phy_rst_bit = 0,  /* Will be set from _DSD "mac-phy-rst-bit" */
-        },
-        .ckm = {
-            .addr = 0,  /* MMIO addresses come from RES0 _CRS */
-            .ctrl = 0,  /* Will be set from _DSD "ckm-ctrl-offset" */
-            .disable_bit = 0,  /* Will be set from _DSD "ckm-disable-bit0", "ckm-disable-bit1" */
-        },
-    },
+    .rp_bus_mmio = { {0}, {0}, {0}, {0} },
     .rp_bus_protect = mt8901_rp_bus_protect,
-    .ltssm_reg = 0,  /* Will be set from _DSD "ltssm-reg-offset" */
-    .ltssm_l0_state = 0,  /* Will be set from _DSD "ltssm-l0-state" */
-    /* Pinctrl mappings: Platform-specific GPIO pin multiplexing configuration
-     * for PCIe clock request signals. These define SoC-specific pin names
-     * and mux functions for the MediaTek MT8901 platform. */
+    .ltssm_reg = 0,
+    .ltssm_l0_state = 0,
     .pin_nums = 4,
      .pinmap = {
          PIN_MAP_MUX_GROUP("MTKP0001:00", "default", "NVDA9221:00", "GPIO177", "func0"),
@@ -2101,3 +1928,4 @@ module_platform_driver(cx7_hp_driver);
  
  MODULE_LICENSE("GPL");
  MODULE_DESCRIPTION("CX7 PCIe Hotplug Driver for NVIDIA DGX Systems");
+ 
