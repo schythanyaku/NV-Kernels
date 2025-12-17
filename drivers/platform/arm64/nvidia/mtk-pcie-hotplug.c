@@ -392,7 +392,7 @@ static acpi_status cx7_hp_parse_mmio_resources(struct acpi_resource *ares, void 
     switch (ares->type) {
     case ACPI_RESOURCE_TYPE_FIXED_MEMORY32:
         if (parsed->count >= CX7_HP_MMIO_REGION_COUNT) {
-            dev_warn(parsed->dev, "More than %d MMIO regions found in RES0, ignoring extras\n",
+            dev_warn(parsed->dev, "More than %d MMIO regions found in platform configuration device, ignoring extras\n",
                  CX7_HP_MMIO_REGION_COUNT);
             break;
         }
@@ -407,12 +407,15 @@ static acpi_status cx7_hp_parse_mmio_resources(struct acpi_resource *ares, void 
 }
 
 /**
- * cx7_hp_find_res0_device - Find RES0 device by HID
+ * cx7_hp_find_platform_config_device - Find platform configuration device by HID
  * @dev: device pointer for logging
+ *
+ * Finds the ACPI device (PNP0C02) that provides platform configuration
+ * via _DSD properties and MMIO resources via _CRS.
  *
  * Returns: acpi_device pointer on success (with reference), NULL on failure
  */
-static struct acpi_device *cx7_hp_find_res0_device(struct device *dev)
+static struct acpi_device *cx7_hp_find_platform_config_device(struct device *dev)
 {
     return acpi_dev_get_first_match_dev("PNP0C02", NULL, -1);
 }
@@ -427,195 +430,195 @@ static struct acpi_device *cx7_hp_find_res0_device(struct device *dev)
 static int cx7_hp_parse_dsd(struct platform_device *pdev,
                                    struct cx7_hp_plat_data *pd)
 {
-    struct acpi_device *res0_adev;
+    struct acpi_device *config_adev;
     struct device *dev = &pdev->dev;
     u32 val, bit1;
 
-    res0_adev = cx7_hp_find_res0_device(dev);
-    if (!res0_adev) {
-        dev_err(dev, "RES0 device (PNP0C02) not found - _DSD is required\n");
+    config_adev = cx7_hp_find_platform_config_device(dev);
+    if (!config_adev) {
+        dev_err(dev, "Platform configuration device (PNP0C02) not found - _DSD is required\n");
         return -ENODEV;
     }
 
-    dev_info(dev, "Parsing _DSD properties from RES0 device: %s\n",
-             acpi_device_bid(res0_adev));
+    dev_info(dev, "Parsing _DSD properties from platform configuration device: %s\n",
+             acpi_device_bid(config_adev));
 
-    if (!acpi_dev_has_props(res0_adev)) {
-        dev_err(dev, "RES0 device has no _DSD properties. Check DSDT.\n");
-        acpi_dev_put(res0_adev);
+    if (!acpi_dev_has_props(config_adev)) {
+        dev_err(dev, "Platform configuration device has no _DSD properties. Check DSDT.\n");
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "mac-init-ctrl-offset", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "mac-init-ctrl-offset", &val)) {
         dev_err(dev, "Missing required _DSD property: mac-init-ctrl-offset\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.mac.init_ctrl = val;
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "mac-ltssm-bit", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "mac-ltssm-bit", &val)) {
         dev_err(dev, "Missing required _DSD property: mac-ltssm-bit\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.mac.ltssm_bit = BIT(val);
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "mac-phy-rst-bit", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "mac-phy-rst-bit", &val)) {
         dev_err(dev, "Missing required _DSD property: mac-phy-rst-bit\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.mac.phy_rst_bit = BIT(val);
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "top-ctrl-offset", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "top-ctrl-offset", &val)) {
         dev_err(dev, "Missing required _DSD property: top-ctrl-offset\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.top.ctrl = val;
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "top-update-bit", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "top-update-bit", &val)) {
         dev_err(dev, "Missing required _DSD property: top-update-bit\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.top.update_bit = BIT(val);
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "top-port0-bit", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "top-port0-bit", &val)) {
         dev_err(dev, "Missing required _DSD property: top-port0-bit\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.top.port_bits[0] = BIT(val);
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "top-port1-bit", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "top-port1-bit", &val)) {
         dev_err(dev, "Missing required _DSD property: top-port1-bit\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.top.port_bits[1] = BIT(val);
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "protect-mode-offset", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "protect-mode-offset", &val)) {
         dev_err(dev, "Missing required _DSD property: protect-mode-offset\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.protect.mode = val;
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "protect-enable-offset", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "protect-enable-offset", &val)) {
         dev_err(dev, "Missing required _DSD property: protect-enable-offset\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.protect.enable = val;
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "protect-port0-bit", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "protect-port0-bit", &val)) {
         dev_err(dev, "Missing required _DSD property: protect-port0-bit\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.protect.port_bits[0] = BIT(val);
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "protect-port1-bit", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "protect-port1-bit", &val)) {
         dev_err(dev, "Missing required _DSD property: protect-port1-bit\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.protect.port_bits[1] = BIT(val);
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "ckm-ctrl-offset", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "ckm-ctrl-offset", &val)) {
         dev_err(dev, "Missing required _DSD property: ckm-ctrl-offset\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.ckm.ctrl = val;
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "ckm-disable-bit0", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "ckm-disable-bit0", &val)) {
         dev_err(dev, "Missing required _DSD property: ckm-disable-bit0\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "ckm-disable-bit1", &bit1)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "ckm-disable-bit1", &bit1)) {
         dev_err(dev, "Missing required _DSD property: ckm-disable-bit1\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->rp_bus_mmio.ckm.disable_bit = BIT(val) | BIT(bit1);
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "ltssm-reg-offset", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "ltssm-reg-offset", &val)) {
         dev_err(dev, "Missing required _DSD property: ltssm-reg-offset\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->ltssm_reg = val;
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "ltssm-l0-state", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "ltssm-l0-state", &val)) {
         dev_err(dev, "Missing required _DSD property: ltssm-l0-state\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->ltssm_l0_state = val;
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "port-nums", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "port-nums", &val)) {
         dev_err(dev, "Missing required _DSD property: port-nums\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     if (val == 0 || val > HP_PORT_MAX) {
         dev_err(dev, "Invalid _DSD property port-nums: %u (must be 1-%d)\n",
                 val, HP_PORT_MAX);
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->port_nums = val;
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "port0-domain", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "port0-domain", &val)) {
         dev_err(dev, "Missing required _DSD property: port0-domain\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->ports[0].domain = val;
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "port0-bus", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "port0-bus", &val)) {
         dev_err(dev, "Missing required _DSD property: port0-bus\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->ports[0].bus = val;
 
-    if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "port0-devfn", &val)) {
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "port0-devfn", &val)) {
         dev_err(dev, "Missing required _DSD property: port0-devfn\n");
-        acpi_dev_put(res0_adev);
+        acpi_dev_put(config_adev);
         return -EINVAL;
     }
     pd->ports[0].devfn = val;
 
     if (pd->port_nums >= 2) {
-        if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "port1-domain", &val)) {
+        if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "port1-domain", &val)) {
             dev_err(dev, "Missing required _DSD property: port1-domain\n");
-            acpi_dev_put(res0_adev);
+            acpi_dev_put(config_adev);
             return -EINVAL;
         }
         pd->ports[1].domain = val;
 
-        if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "port1-bus", &val)) {
+        if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "port1-bus", &val)) {
             dev_err(dev, "Missing required _DSD property: port1-bus\n");
-            acpi_dev_put(res0_adev);
+            acpi_dev_put(config_adev);
             return -EINVAL;
         }
         pd->ports[1].bus = val;
 
-        if (fwnode_property_read_u32(acpi_fwnode_handle(res0_adev), "port1-devfn", &val)) {
+        if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "port1-devfn", &val)) {
             dev_err(dev, "Missing required _DSD property: port1-devfn\n");
-            acpi_dev_put(res0_adev);
+            acpi_dev_put(config_adev);
             return -EINVAL;
         }
         pd->ports[1].devfn = val;
     }
 
-    dev_info(dev, "Successfully parsed all required _DSD properties from RES0\n");
+    dev_info(dev, "Successfully parsed all required _DSD properties\n");
 
-    acpi_dev_put(res0_adev);
+    acpi_dev_put(config_adev);
     return 0;
 }
 
@@ -629,7 +632,7 @@ static int cx7_hp_parse_dsd(struct platform_device *pdev,
 static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev,
                                             struct cx7_hp_acpi_mmio *parsed)
 {
-    struct acpi_device *res0_adev;
+    struct acpi_device *config_adev;
     acpi_status status;
     int ret = 0;
 
@@ -637,34 +640,34 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev,
         return -EINVAL;
     }
 
-    res0_adev = cx7_hp_find_res0_device(&dev->pdev->dev);
-    if (!res0_adev)
+    config_adev = cx7_hp_find_platform_config_device(&dev->pdev->dev);
+    if (!config_adev)
         return -ENODEV;
 
     parsed->count = 0;
     memset(parsed->mmio_regions, 0, sizeof(parsed->mmio_regions));
 
-    dev_info(&dev->pdev->dev, "Parsing MMIO regions from RES0 device _CRS\n");
-    status = acpi_walk_resources(res0_adev->handle, METHOD_NAME__CRS,
+    dev_info(&dev->pdev->dev, "Parsing MMIO regions from platform configuration device _CRS\n");
+    status = acpi_walk_resources(config_adev->handle, METHOD_NAME__CRS,
                                  cx7_hp_parse_mmio_resources, parsed);
     if (ACPI_FAILURE(status)) {
-        dev_err(&dev->pdev->dev, "Failed to walk RES0 resources: %s\n",
+        dev_err(&dev->pdev->dev, "Failed to walk platform configuration resources: %s\n",
              acpi_format_exception(status));
         ret = -ENODEV;
         goto out;
     }
 
     if (parsed->count < CX7_HP_MMIO_REGION_COUNT) {
-        dev_warn(&dev->pdev->dev, "Expected %d MMIO regions from RES0, found %d\n",
+        dev_warn(&dev->pdev->dev, "Expected %d MMIO regions from platform configuration device, found %d\n",
              CX7_HP_MMIO_REGION_COUNT, parsed->count);
         ret = -ENODEV;
         goto out;
     }
 
-    dev_info(&dev->pdev->dev, "Found %d MMIO regions from RES0 device\n", parsed->count);
+    dev_info(&dev->pdev->dev, "Found %d MMIO regions from platform configuration device\n", parsed->count);
 
 out:
-    acpi_dev_put(res0_adev);
+    acpi_dev_put(config_adev);
     return ret;
 }
 
@@ -681,11 +684,11 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
     int ret;
     int i;
 
-    dev_info(&pdev->dev, "Parsing MMIO regions from RES0 device _CRS\n");
+    dev_info(&pdev->dev, "Parsing MMIO regions from platform configuration device _CRS\n");
 
     ret = cx7_hp_map_mmio_resources(dev, &parsed);
     if (ret) {
-        dev_err(&pdev->dev, "Failed to get MMIO regions from RES0 device\n");
+        dev_err(&pdev->dev, "Failed to get MMIO regions from platform configuration device\n");
         return ret;
     }
 
@@ -1596,7 +1599,7 @@ static int cx7_hp_init_platform_data(struct platform_device *pdev,
 
     ret = cx7_hp_parse_dsd(pdev, pd);
     if (ret) {
-        dev_err(&pdev->dev, "Failed to parse required _DSD properties from RES0: %d\n", ret);
+        dev_err(&pdev->dev, "Failed to parse required _DSD properties: %d\n", ret);
         return ret;
     }
 
@@ -1885,7 +1888,7 @@ gpio_release:
  * Platform data for PCIe hotplug support
  *
  * ACPI resource sources for platform data:
- * - All platform data: RES0 device (PNP0C02) _DSD
+ * - All platform data: Platform configuration device (PNP0C02) _DSD
  *
  * Fields initialized to 0 are populated from _DSD at runtime.
  * Code-specific fields: function pointers, pinctrl mappings, and device matching.
