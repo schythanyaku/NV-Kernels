@@ -179,6 +179,13 @@ struct cx7_hp_mmio_runtime {
      void __iomem *mac_port_base[HP_PORT_MAX];
  };
  
+/**
+ * cx7_hp_dev - Hotplug device structure
+ *
+ * ACPI resource sources:
+ * - MMIO addresses: RES0 device (PNP0C02) _CRS, stored in mmio field
+ * - GPIO resources: PEDE device (MTKP0001) _CRS, stored in pins field
+ */
 struct cx7_hp_dev {
     struct cx7_hp_gpio_ctx *pins;
     struct cx7_hp_plat_data *pd;
@@ -372,16 +379,13 @@ static void cx7_hp_ckm_control(struct cx7_hp_dev *dev, bool disable)
  }
  
 /**
- * cx7_hp_parse_res0_mmio_resources - ACPI resource callback for parsing RES0 MMIO from _CRS
+ * cx7_hp_parse_mmio_resources - ACPI resource callback for parsing MMIO from _CRS
  * @ares: ACPI resource being processed
  * @data: pointer to cx7_hp_acpi_mmio structure
  *
- * Extracts Memory32Fixed resources from RES0's _CRS.
- * Only processes MMIO resources, ignores other resource types (GPIO, IRQ, etc.).
- *
  * Returns: AE_OK to continue iteration, AE_ERROR on error
  */
-static acpi_status cx7_hp_parse_res0_mmio_resources(struct acpi_resource *ares, void *data)
+static acpi_status cx7_hp_parse_mmio_resources(struct acpi_resource *ares, void *data)
 {
     struct cx7_hp_acpi_mmio *parsed = data;
 
@@ -406,9 +410,6 @@ static acpi_status cx7_hp_parse_res0_mmio_resources(struct acpi_resource *ares, 
  * cx7_hp_find_res0_device - Find RES0 device by HID
  * @dev: device pointer for logging
  *
- * Searches for RES0 device (PNP0C02) in ACPI namespace.
- * The returned device has a reference that must be released by the caller.
- *
  * Returns: acpi_device pointer on success (with reference), NULL on failure
  */
 static struct acpi_device *cx7_hp_find_res0_device(struct device *dev)
@@ -417,13 +418,13 @@ static struct acpi_device *cx7_hp_find_res0_device(struct device *dev)
 }
 
 /**
- * cx7_hp_parse_res0_dsd - Parse _DSD properties from RES0 device
+ * cx7_hp_parse_dsd - Parse _DSD properties
  * @pdev: platform device
  * @pd: platform data to populate
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_parse_res0_dsd(struct platform_device *pdev,
+static int cx7_hp_parse_dsd(struct platform_device *pdev,
                                    struct cx7_hp_plat_data *pd)
 {
     struct acpi_device *res0_adev;
@@ -619,15 +620,13 @@ static int cx7_hp_parse_res0_dsd(struct platform_device *pdev,
 }
 
 /**
- * cx7_hp_map_resources_from_res0 - Map MMIO regions from RES0 device
+ * cx7_hp_map_mmio_resources - Map MMIO regions from _CRS
  * @dev: hotplug device
  * @parsed: pointer to parsed MMIO structure
  *
- * Parses MMIO regions from RES0 device's _CRS.
- *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_map_resources_from_res0(struct cx7_hp_dev *dev,
+static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev,
                                             struct cx7_hp_acpi_mmio *parsed)
 {
     struct acpi_device *res0_adev;
@@ -647,7 +646,7 @@ static int cx7_hp_map_resources_from_res0(struct cx7_hp_dev *dev,
 
     dev_info(&dev->pdev->dev, "Parsing MMIO regions from RES0 device _CRS\n");
     status = acpi_walk_resources(res0_adev->handle, METHOD_NAME__CRS,
-                                 cx7_hp_parse_res0_mmio_resources, parsed);
+                                 cx7_hp_parse_mmio_resources, parsed);
     if (ACPI_FAILURE(status)) {
         dev_err(&dev->pdev->dev, "Failed to walk RES0 resources: %s\n",
              acpi_format_exception(status));
@@ -684,7 +683,7 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 
     dev_info(&pdev->dev, "Parsing MMIO regions from RES0 device _CRS\n");
 
-    ret = cx7_hp_map_resources_from_res0(dev, &parsed);
+    ret = cx7_hp_map_mmio_resources(dev, &parsed);
     if (ret) {
         dev_err(&pdev->dev, "Failed to get MMIO regions from RES0 device\n");
         return ret;
@@ -792,12 +791,12 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
  }
  
 /**
- * mt8901_rp_bus_protect - Bus protection handler for MT8901 platform
+ * cx7_hp_rp_bus_protect - Bus protection handler
  * @dev: hotplug device
  * @port_idx: port index (0-based)
  * @stage: protection stage (BUS_PROTECT_INIT, BUS_PROTECT_CLEANUP, etc.)
  */
- static void mt8901_rp_bus_protect(struct cx7_hp_dev *dev, int port_idx, int stage)
+ static void cx7_hp_rp_bus_protect(struct cx7_hp_dev *dev, int port_idx, int stage)
  {
      switch (stage) {
      case BUS_PROTECT_INIT:
@@ -1584,18 +1583,18 @@ static int cx7_hp_discover_devices(struct platform_device *pdev,
 }
 
 /**
- * cx7_hp_init_from_res0 - Initialize platform data from RES0 _DSD and discover devices
+ * cx7_hp_init_platform_data - Initialize platform data from _DSD and discover devices
  * @pdev: platform device
  * @pd: platform data to populate
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_init_from_res0(struct platform_device *pdev,
+static int cx7_hp_init_platform_data(struct platform_device *pdev,
                                    struct cx7_hp_plat_data *pd)
 {
     int ret;
 
-    ret = cx7_hp_parse_res0_dsd(pdev, pd);
+    ret = cx7_hp_parse_dsd(pdev, pd);
     if (ret) {
         dev_err(&pdev->dev, "Failed to parse required _DSD properties from RES0: %d\n", ret);
         return ret;
@@ -1754,7 +1753,7 @@ static int cx7_hp_probe(struct platform_device *pdev)
 
     memcpy(pd, pd_template, pd_size);
 
-    ret = cx7_hp_init_from_res0(pdev, pd);
+    ret = cx7_hp_init_platform_data(pdev, pd);
     if (ret)
         return ret;
 
@@ -1883,20 +1882,22 @@ gpio_release:
  }
  
 /*
- * Platform data for MT8901 PCIe hotplug support
+ * Platform data for PCIe hotplug support
  *
- * Fields initialized to 0/default are populated from RES0 _DSD at runtime.
- * MMIO addresses come from RES0 _CRS (PNP0C02 device).
+ * ACPI resource sources for platform data:
+ * - All platform data: RES0 device (PNP0C02) _DSD
+ *
+ * Fields initialized to 0 are populated from _DSD at runtime.
  * Code-specific fields: function pointers, pinctrl mappings, and device matching.
  */
-static const struct cx7_hp_plat_data mt8901_plat_data = {
+static const struct cx7_hp_plat_data platform_data = {
     .port_nums = 0,
     .ports = { {0}, {0} },
     .vendor_id = PCI_VENDOR_ID_MELLANOX,
     .device_id = 0x1021, /* CX7 device ID */
     .num_devices = 4,
     .rp_bus_mmio = { {0}, {0}, {0}, {0} },
-    .rp_bus_protect = mt8901_rp_bus_protect,
+    .rp_bus_protect = cx7_hp_rp_bus_protect,
     .ltssm_reg = 0,
     .ltssm_l0_state = 0,
     .pin_nums = 4,
@@ -1909,7 +1910,7 @@ static const struct cx7_hp_plat_data mt8901_plat_data = {
  };
  
  static const struct acpi_device_id cx7_hp_acpi_match[] = {
-     {"MTKP0001", (kernel_ulong_t)&mt8901_plat_data},
+     {"MTKP0001", (kernel_ulong_t)&platform_data},
      {}
  };
  
