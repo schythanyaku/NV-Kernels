@@ -208,7 +208,7 @@ struct cx7_hp_dev {
 };
  
 /**
- * cx7_hp_parse_pinctrl_mappings - Parse pinctrl mappings from PEDE device _DSD
+ * cx7_hp_parse_pinctrl_config_dsd - Parse pinctrl configuration from PEDE device _DSD
  * @hp_dev: hotplug device
  *
  * Parses pin-nums and pinctrl-mappings from PEDE device (MTKP0001) _DSD.
@@ -216,46 +216,95 @@ struct cx7_hp_dev {
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_parse_pinctrl_mappings(struct cx7_hp_dev *hp_dev)
+static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 {
-    struct acpi_device *adev = ACPI_COMPANION(&hp_dev->pdev->dev);
+    struct acpi_device *adev;
     struct device *dev = &hp_dev->pdev->dev;
     const union acpi_object *mappings_pkg, *mapping_entry;
     struct pinctrl_map *pinmap;
     u32 pin_nums = 0;
-    int k, ret;
+    int k;
     const char *strings[PINCTRL_MAPPING_ENTRY_SIZE];
 
+    /* Get ACPI companion device - same as GPIO parsing */
+    adev = ACPI_COMPANION(dev);
     if (!adev) {
-        dev_err(dev, "No ACPI device found for platform device\n");
+        dev_err(dev, "Failed to get ACPI companion device\n");
         return -ENODEV;
     }
 
-    if (!acpi_dev_has_props(adev)) {
-        dev_err(dev, "PEDE device has no _DSD properties. Check DSDT.\n");
-        return -EINVAL;
+    dev_info(dev, "Parsing _DSD properties from PEDE device: %s\n",
+             acpi_device_bid(adev));
+
+    /* Check if _DSD buffer is available - adev->data.pointer contains _DSD data
+     * (not _CRS, which is accessed separately via acpi_walk_resources).
+     * This is set even if nested packages are rejected by the standard parser.
+     */
+    if (!adev->data.pointer) {
+        dev_err(dev, "PEDE device has no _DSD data. Check DSDT.\n");
+        return -ENODEV;
     }
 
-    /* Parse pin-nums from _DSD */
-    if (fwnode_property_read_u32(acpi_fwnode_handle(adev), "pin-nums", &pin_nums)) {
-        dev_err(dev, "Missing required _DSD property: pin-nums\n");
-        return -EINVAL;
-    }
+    /* Parse properties manually - the standard parser rejects the entire
+     * properties package if ANY property has nested packages, so we parse
+     * from the raw buffer.
+     */
+    {
+        const union acpi_object *dsd_pkg, *props_pkg = NULL;
+        int i, j;
 
-    if (pin_nums == 0) {
-        dev_info(dev, "pin-nums is 0, no pinctrl mappings to parse\n");
-        hp_dev->pd->pin_nums = 0;
-        return 0;
-    }
+        dsd_pkg = adev->data.pointer;
+        /* Find Device Properties GUID package */
+        for (i = 0; i + 1 < dsd_pkg->package.count; i += 2) {
+            const union acpi_object *guid = &dsd_pkg->package.elements[i];
+            if (is_acpi_device_properties_guid(guid)) {
+                props_pkg = &dsd_pkg->package.elements[i + 1];
+                if (props_pkg->type == ACPI_TYPE_PACKAGE)
+                    break;
+            }
+        }
 
-    dev_info(dev, "Parsing %u pinctrl mappings from PEDE device _DSD\n", pin_nums);
+        if (!props_pkg) {
+            dev_err(dev, "Device Properties GUID package not found in _DSD\n");
+            return -EINVAL;
+        }
 
-    /* Get pinctrl-mappings property directly */
-    ret = acpi_dev_get_property(adev, "pinctrl-mappings", ACPI_TYPE_PACKAGE,
-                                 (const union acpi_object **)&mappings_pkg);
-    if (ret) {
-        dev_err(dev, "Missing required _DSD property: pinctrl-mappings\n");
-        return ret;
+        /* Search for pin-nums and pinctrl-mappings
+         * Each property is Package(2) { "name", value }:
+         *   elements[0] = property name (string)
+         *   elements[1] = property value (integer, string, package, etc.)
+         */
+        for (j = 0; j < props_pkg->package.count; j++) {
+            const union acpi_object *prop = &props_pkg->package.elements[j];
+            if (prop->type != ACPI_TYPE_PACKAGE ||
+                prop->package.count != 2 ||
+                prop->package.elements[0].type != ACPI_TYPE_STRING)
+                continue;
+
+            const char *prop_name = prop->package.elements[0].string.pointer;
+            const union acpi_object *prop_value = &prop->package.elements[1];
+
+            if (!strcmp(prop_name, "pin-nums")) {
+                if (prop_value->type == ACPI_TYPE_INTEGER)
+                    pin_nums = prop_value->integer.value;
+            } else if (!strcmp(prop_name, "pinctrl-mappings")) {
+                if (prop_value->type == ACPI_TYPE_PACKAGE)
+                    mappings_pkg = prop_value;
+            }
+        }
+
+        if (pin_nums == 0) {
+            dev_info(dev, "pin-nums is 0, no pinctrl mappings to parse\n");
+            hp_dev->pd->pin_nums = 0;
+            return 0;
+        }
+
+        if (!mappings_pkg) {
+            dev_err(dev, "Missing required _DSD property: pinctrl-mappings\n");
+            return -EINVAL;
+        }
+
+        dev_info(dev, "Parsing %u pinctrl mappings from PEDE device _DSD\n", pin_nums);
     }
 
     if (mappings_pkg->package.count != pin_nums) {
@@ -266,8 +315,9 @@ static int cx7_hp_parse_pinctrl_mappings(struct cx7_hp_dev *hp_dev)
 
     /* Allocate pinmap array */
     pinmap = devm_kcalloc(dev, pin_nums, sizeof(*pinmap), GFP_KERNEL);
-    if (!pinmap)
+    if (!pinmap) {
         return -ENOMEM;
+    }
 
     /* Parse each mapping entry */
     for (k = 0; k < pin_nums; k++) {
@@ -311,7 +361,10 @@ static int cx7_hp_parse_pinctrl_mappings(struct cx7_hp_dev *hp_dev)
                 pinmap[k].data.mux.function);
     }
 
-    /* Successfully parsed all mappings */
+    /* Successfully parsed all mappings - strings are copied with devm_kstrdup().
+     * Buffer is managed by ACPI core (adev->data.pointer), no need to free.
+     */
+    
     hp_dev->pd->pin_nums = pin_nums;
     hp_dev->pd->parsed_pinmap = pinmap;
     dev_info(dev, "Successfully parsed %u pinctrl mappings from ACPI\n", pin_nums);
@@ -330,10 +383,10 @@ static int cx7_hp_parse_pinctrl_mappings(struct cx7_hp_dev *hp_dev)
  {
      int ret;
 
-     /* Parse pinctrl mappings from ACPI _DSD */
-     ret = cx7_hp_parse_pinctrl_mappings(hp_dev);
+     /* Parse pinctrl configuration from ACPI _DSD */
+     ret = cx7_hp_parse_pinctrl_config_dsd(hp_dev);
      if (ret) {
-         dev_err(&hp_dev->pdev->dev, "Failed to parse pinctrl mappings from ACPI: %d\n", ret);
+         dev_err(&hp_dev->pdev->dev, "Failed to parse pinctrl configuration from ACPI: %d\n", ret);
          return ret;
      }
 
@@ -550,14 +603,17 @@ static struct acpi_device *cx7_hp_find_platform_config_device(struct device *dev
 }
 
 /**
- * cx7_hp_parse_dsd - Parse _DSD properties
+ * cx7_hp_parse_pcie_config_dsd - Parse PCIe configuration from RES0 device _DSD
  * @pdev: platform device
  * @pd: platform data to populate
  *
+ * Parses PCIe MMIO register offsets, bit positions, port configuration, and PCIe device
+ * identification from platform configuration device (RES0/PNP0C02) _DSD.
+ *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_parse_dsd(struct platform_device *pdev,
-                                   struct cx7_hp_plat_data *pd)
+static int cx7_hp_parse_pcie_config_dsd(struct platform_device *pdev,
+                                        struct cx7_hp_plat_data *pd)
 {
     struct acpi_device *config_adev;
     struct device *dev = &pdev->dev;
@@ -1684,15 +1740,15 @@ static void cx7_hp_put_gpio_device(void *data)
 }
 
 /**
- * cx7_hp_discover_devices - Discover existing PCI devices on managed ports
+ * cx7_hp_discover_pcie_devices - Discover existing PCI devices on managed ports
  * @pdev: platform device
  * @pd: platform data
  *
  * Returns: 0 on success, -EPROBE_DEFER if devices are still initializing,
  *         negative error code on failure
  */
-static int cx7_hp_discover_devices(struct platform_device *pdev,
-                                     struct cx7_hp_plat_data *pd)
+static int cx7_hp_discover_pcie_devices(struct platform_device *pdev,
+                                         struct cx7_hp_plat_data *pd)
 {
     struct pci_dev *pci_dev = NULL;
     int device_count = 0;
@@ -1736,20 +1792,20 @@ static int cx7_hp_discover_devices(struct platform_device *pdev,
 }
 
 /**
- * cx7_hp_init_platform_data - Initialize platform data from _DSD and discover devices
+ * cx7_hp_init_pcie_data - Initialize PCIe data from _DSD and discover devices
  * @pdev: platform device
  * @pd: platform data to populate
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_init_platform_data(struct platform_device *pdev,
-                                   struct cx7_hp_plat_data *pd)
+static int cx7_hp_init_pcie_data(struct platform_device *pdev,
+                                  struct cx7_hp_plat_data *pd)
 {
     int ret;
 
-    ret = cx7_hp_parse_dsd(pdev, pd);
+    ret = cx7_hp_parse_pcie_config_dsd(pdev, pd);
     if (ret) {
-        dev_err(&pdev->dev, "Failed to parse required _DSD properties: %d\n", ret);
+        dev_err(&pdev->dev, "Failed to parse PCIe configuration _DSD properties: %d\n", ret);
         return ret;
     }
 
@@ -1761,7 +1817,7 @@ static int cx7_hp_init_platform_data(struct platform_device *pdev,
     }
 
     /* Discover existing PCI devices (uses port_nums and ports[] from _DSD) */
-    ret = cx7_hp_discover_devices(pdev, pd);
+    ret = cx7_hp_discover_pcie_devices(pdev, pd);
     if (ret) {
         dev_err(&pdev->dev, "Device discovery failed: %d\n", ret);
         return ret;
@@ -1895,7 +1951,7 @@ static int cx7_hp_probe(struct platform_device *pdev)
         return -ENOMEM;
     }
 
-    ret = cx7_hp_init_platform_data(pdev, pd);
+    ret = cx7_hp_init_pcie_data(pdev, pd);
     if (ret)
         return ret;
 
