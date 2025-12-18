@@ -4,7 +4,7 @@
 #
 
 config MTK_PCIE_HOTPLUG
-	tristate "MediaTek PCIe Hotplug Driver"
+	tristate "CX7 PCIe Hotplug Driver"
 	depends on EINT_MTK
 	depends on PCI && ACPI
 	help
