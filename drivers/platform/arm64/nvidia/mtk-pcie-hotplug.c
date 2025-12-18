@@ -247,17 +247,26 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 
     /* Parse manually - standard parser rejects entire properties package
      * when ANY property has nested packages (like pinctrl-mappings).
-     * Parse from raw _DSD buffer (adev->data.pointer).
+     * Manually evaluate _DSD to get the raw data.
      */
+    struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+    acpi_status status;
     const union acpi_object *dsd_pkg, *props_pkg = NULL;
     int i, j;
 
-    if (!adev->data.pointer) {
-        dev_err(dev, "PEDE device has no _DSD data. Check DSDT.\n");
+    status = acpi_evaluate_object_typed(adev->handle, "_DSD", NULL, &buffer,
+                                         ACPI_TYPE_PACKAGE);
+    if (ACPI_FAILURE(status)) {
+        dev_err(dev, "Failed to evaluate _DSD: %s\n", acpi_format_exception(status));
         return -ENODEV;
     }
 
-    dsd_pkg = adev->data.pointer;
+    dsd_pkg = buffer.pointer;
+    if (!dsd_pkg || dsd_pkg->type != ACPI_TYPE_PACKAGE) {
+        dev_err(dev, "Invalid _DSD package\n");
+        ACPI_FREE(buffer.pointer);
+        return -EINVAL;
+    }
     /* Find Device Properties GUID package */
     for (i = 0; i + 1 < dsd_pkg->package.count; i += 2) {
         const union acpi_object *guid = &dsd_pkg->package.elements[i];
@@ -274,6 +283,7 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 
     if (!props_pkg) {
         dev_err(dev, "Device Properties GUID package not found in _DSD\n");
+        ACPI_FREE(buffer.pointer);
         return -EINVAL;
     }
 
@@ -304,11 +314,13 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
     if (pin_nums == 0) {
         dev_info(dev, "pin-nums is 0, no pinctrl mappings to parse\n");
         hp_dev->pd->pin_nums = 0;
+        ACPI_FREE(buffer.pointer);
         return 0;
     }
 
     if (!mappings_pkg) {
         dev_err(dev, "Missing required _DSD property: pinctrl-mappings\n");
+        ACPI_FREE(buffer.pointer);
         return -EINVAL;
     }
 
@@ -317,12 +329,14 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
     if (mappings_pkg->package.count != pin_nums) {
         dev_err(dev, "pinctrl-mappings count mismatch: expected %u, got %u\n",
                 pin_nums, mappings_pkg->package.count);
+        ACPI_FREE(buffer.pointer);
         return -EINVAL;
     }
 
     /* Allocate pinmap array */
     pinmap = devm_kcalloc(dev, pin_nums, sizeof(*pinmap), GFP_KERNEL);
     if (!pinmap) {
+        ACPI_FREE(buffer.pointer);
         return -ENOMEM;
     }
 
@@ -335,6 +349,7 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
                     k, ARRAY_SIZE(strings),
                     mapping_entry->type == ACPI_TYPE_PACKAGE ? "Package" : "non-Package",
                     mapping_entry->type == ACPI_TYPE_PACKAGE ? mapping_entry->package.count : 0);
+            ACPI_FREE(buffer.pointer);
             return -EINVAL;
         }
 
@@ -342,6 +357,7 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
         for (int l = 0; l < ARRAY_SIZE(strings); l++) {
             if (mapping_entry->package.elements[l].type != ACPI_TYPE_STRING) {
                 dev_err(dev, "Mapping entry %d element %d is not a string\n", k, l);
+                ACPI_FREE(buffer.pointer);
                 return -EINVAL;
             }
             strings[l] = mapping_entry->package.elements[l].string.pointer;
@@ -359,6 +375,7 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
             !pinmap[k].ctrl_dev_name || !pinmap[k].data.mux.group ||
             !pinmap[k].data.mux.function) {
             dev_err(dev, "Failed to allocate memory for mapping %d\n", k);
+            ACPI_FREE(buffer.pointer);
             return -ENOMEM;
         }
 
@@ -369,11 +386,12 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
     }
 
     /* Successfully parsed all mappings - strings are copied with devm_kstrdup().
-     * Buffer is managed by ACPI core (adev->data.pointer), no need to free.
+     * Free the manually evaluated _DSD buffer.
      */
     
     hp_dev->pd->pin_nums = pin_nums;
     hp_dev->pd->parsed_pinmap = pinmap;
+    ACPI_FREE(buffer.pointer);
     dev_info(dev, "Successfully parsed %u pinctrl mappings from ACPI\n", pin_nums);
     return 0;
 }
