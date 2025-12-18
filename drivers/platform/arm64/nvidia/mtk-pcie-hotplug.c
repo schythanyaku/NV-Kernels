@@ -299,8 +299,10 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 		    &prop->package.elements[1];
 
 		if (!strcmp(prop_name, "pin-nums")) {
-			if (prop_value->type == ACPI_TYPE_INTEGER)
+			if (prop_value->type == ACPI_TYPE_INTEGER) {
 				pin_nums = prop_value->integer.value;
+				dev_info(dev, "Parsed pin-nums: %u\n", pin_nums);
+			}
 		} else if (!strcmp(prop_name, "pinctrl-mappings")) {
 			if (prop_value->type == ACPI_TYPE_PACKAGE)
 				mappings_pkg = prop_value;
@@ -391,17 +393,13 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 			ACPI_FREE(buffer.pointer);
 			return -ENOMEM;
 		}
-
-		dev_dbg(dev,
-			"Parsed mapping %d: dev=%s state=%s ctrl=%s group=%s func=%s\n",
-			k, pinmap[k].dev_name, pinmap[k].name,
-			pinmap[k].ctrl_dev_name, pinmap[k].data.mux.group,
-			pinmap[k].data.mux.function);
 	}
 
 	hp_dev->pd->pin_nums = pin_nums;
 	hp_dev->pd->parsed_pinmap = pinmap;
 	ACPI_FREE(buffer.pointer);
+	dev_info(dev, "Successfully parsed %u pinctrl mappings from ACPI\n",
+		 pin_nums);
 	return 0;
 }
 
@@ -437,6 +435,8 @@ static int cx7_hp_pinctrl_init(struct cx7_hp_dev *hp_dev)
 		return ret;
 	}
 
+	dev_info(&hp_dev->pdev->dev, "Registered %u pinctrl mappings\n",
+		 hp_dev->pd->pin_nums);
 	return 0;
 }
 
