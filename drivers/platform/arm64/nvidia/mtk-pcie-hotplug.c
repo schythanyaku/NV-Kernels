@@ -301,7 +301,6 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 		if (!strcmp(prop_name, "pin-nums")) {
 			if (prop_value->type == ACPI_TYPE_INTEGER) {
 				pin_nums = prop_value->integer.value;
-				dev_info(dev, "Parsed pin-nums: %u\n", pin_nums);
 			}
 		} else if (!strcmp(prop_name, "pinctrl-mappings")) {
 			if (prop_value->type == ACPI_TYPE_PACKAGE)
@@ -669,10 +668,6 @@ static int cx7_hp_parse_pcie_config_dsd(struct platform_device *pdev,
 		return -ENODEV;
 	}
 
-	dev_info(dev,
-		 "Parsing _DSD properties from platform configuration device: %s\n",
-		 acpi_device_bid(config_adev));
-
 	if (!acpi_dev_has_props(config_adev)) {
 		dev_err(dev,
 			"Platform configuration device has no _DSD properties. Check DSDT.\n");
@@ -894,7 +889,6 @@ static int cx7_hp_parse_pcie_config_dsd(struct platform_device *pdev,
 		return -EINVAL;
 	}
 	pd->vendor_id = val;
-	dev_info(dev, "Parsed vendor-id: 0x%04X\n", pd->vendor_id);
 
 	if (fwnode_property_read_u32
 	    (acpi_fwnode_handle(config_adev), "device-id", &val)) {
@@ -903,7 +897,6 @@ static int cx7_hp_parse_pcie_config_dsd(struct platform_device *pdev,
 		return -EINVAL;
 	}
 	pd->device_id = val;
-	dev_info(dev, "Parsed device-id: 0x%04X\n", pd->device_id);
 
 	if (fwnode_property_read_u32
 	    (acpi_fwnode_handle(config_adev), "num-devices", &val)) {
@@ -912,7 +905,6 @@ static int cx7_hp_parse_pcie_config_dsd(struct platform_device *pdev,
 		return -EINVAL;
 	}
 	pd->num_devices = val;
-	dev_info(dev, "Parsed num-devices: %u\n", pd->num_devices);
 
 	dev_info(dev, "Successfully parsed all required _DSD properties\n");
 
@@ -946,8 +938,6 @@ static int cx7_hp_parse_mmio_resources_from_acpi(struct cx7_hp_dev *dev,
 	parsed->count = 0;
 	memset(parsed->mmio_regions, 0, sizeof(parsed->mmio_regions));
 
-	dev_info(&dev->pdev->dev,
-		 "Parsing MMIO regions from platform configuration device _CRS\n");
 	status =
 	    acpi_walk_resources(config_adev->handle, METHOD_NAME__CRS,
 				cx7_hp_parse_mmio_resources, parsed);
@@ -967,10 +957,6 @@ static int cx7_hp_parse_mmio_resources_from_acpi(struct cx7_hp_dev *dev,
 		goto out;
 	}
 
-	dev_info(&dev->pdev->dev,
-		 "Found %d MMIO regions from platform configuration device\n",
-		 parsed->count);
-
 out:
 	acpi_dev_put(config_adev);
 	return ret;
@@ -988,9 +974,6 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 	struct cx7_hp_acpi_mmio parsed = {.count = 0, .dev = &pdev->dev };
 	int ret;
 	int i;
-
-	dev_info(&pdev->dev,
-		 "Parsing MMIO regions from platform configuration device _CRS\n");
 
 	ret = cx7_hp_parse_mmio_resources_from_acpi(dev, &parsed);
 	if (ret) {
@@ -1019,9 +1002,6 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 				}
 				dev->mmio.mac_port_base[0] = base;
 				mapped_count++;
-				dev_info(&pdev->dev,
-					 "Mapped MAC Port 0: 0x%08x (size 0x%x) -> %p\n",
-					 addr, size, base);
 			}
 			break;
 		case 1:
@@ -1035,9 +1015,6 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 				}
 				dev->mmio.mac_port_base[1] = base;
 				mapped_count++;
-				dev_info(&pdev->dev,
-					 "Mapped MAC Port 1: 0x%08x (size 0x%x) -> %p\n",
-					 addr, size, base);
 			}
 			break;
 		case 2:
@@ -1050,9 +1027,6 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 			}
 			dev->mmio.top_base = base;
 			mapped_count++;
-			dev_info(&pdev->dev,
-				 "Mapped TOP: 0x%08x (size 0x%x) -> %p\n", addr,
-				 size, base);
 			break;
 		case 3:
 			base = devm_ioremap(&pdev->dev, addr, size);
@@ -1064,9 +1038,6 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 			}
 			dev->mmio.protect_base = base;
 			mapped_count++;
-			dev_info(&pdev->dev,
-				 "Mapped PROTECT: 0x%08x (size 0x%x) -> %p\n",
-				 addr, size, base);
 			break;
 		case 4:
 			base = devm_ioremap(&pdev->dev, addr, size);
@@ -1078,9 +1049,6 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 			}
 			dev->mmio.ckm_base = base;
 			mapped_count++;
-			dev_info(&pdev->dev,
-				 "Mapped CKM: 0x%08x (size 0x%x) -> %p\n", addr,
-				 size, base);
 			break;
 		default:
 			dev_warn(&pdev->dev,
@@ -1302,6 +1270,8 @@ static void remove_device(struct cx7_hp_dev *dev)
 {
 	int i;
 
+	dev_info(&dev->pdev->dev, "Cable removal\n");
+
 	for (i = 0; i < dev->pd->port_nums; i++)
 		cx7_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_REMOVAL);
 
@@ -1451,6 +1421,7 @@ static irqreturn_t cx7_hp_work(int irq, void *dev_id)
 		remove_device(hp_dev);
 		break;
 	case STATE_PLUG_IN:
+		dev_info(&hp_dev->pdev->dev, "Cable plugin\n");
 		gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
 		break;
 	case STATE_DEV_POWER_OFF:
@@ -1776,6 +1747,7 @@ static ssize_t debug_state_store(struct device *dev,
 		hp_dev->state = STATE_PLUG_IN;
 		hp_dev->debug_state = val;
 		spin_unlock_irqrestore(&hp_dev->lock, flags);
+		dev_info(dev, "Cable plugin\n");
 		gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
 		return count;
 
@@ -1845,15 +1817,9 @@ static struct gpio_acpi_context *gpio_acpi_setup(struct platform_device *pdev,
 	if (ctx->valid) {
 		if (gpio_index == PCIE_PIN_BOOT && hp_dev->boot_pin == -1) {
 			hp_dev->boot_pin = ctx->pin;
-			dev_info(&pdev->dev,
-				 "BOOT pin identified by index: hardware pin %d\n",
-				 hp_dev->boot_pin);
 		} else if (gpio_index == PCIE_PIN_PRSNT
 			   && hp_dev->prsnt_pin == -1) {
 			hp_dev->prsnt_pin = ctx->pin;
-			dev_info(&pdev->dev,
-				 "PRSNT pin identified by index: hardware pin %d\n",
-				 hp_dev->prsnt_pin);
 		}
 		return ctx;
 	}
@@ -2022,10 +1988,6 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 		return -ENODEV;
 	}
 
-	dev_info(&pdev->dev,
-		 "ACPI walk found %d GPIOs, attempting to find GPIO device\n",
-		 walk_ctx.count);
-
 	/* Find GPIO device using resource_source from first GPIO */
 	if (walk_ctx.count == 0 || walk_ctx.gpios[0].resource_source[0] == '\0') {
 		dev_err(&pdev->dev,
@@ -2033,8 +1995,6 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 		return -ENODEV;
 	}
 
-	dev_info(&pdev->dev, "Looking up GPIO controller: %s\n",
-		 walk_ctx.gpios[0].resource_source);
 	status =
 	    acpi_get_handle(NULL, walk_ctx.gpios[0].resource_source,
 			    &gpio_handle);
@@ -2053,8 +2013,6 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 		return -ENODEV;
 	}
 
-	dev_info(&pdev->dev, "Found ACPI GPIO device: %s\n",
-		 acpi_device_name(gpio_adev));
 	gpio_fwnode = acpi_fwnode_handle(gpio_adev);
 	hp_dev->gdev = gpio_device_find_by_fwnode(gpio_fwnode);
 	if (!hp_dev->gdev) {
@@ -2073,9 +2031,6 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 		dev_err(&pdev->dev, "Failed to register GPIO device cleanup\n");
 		return ret;
 	}
-
-	dev_info(&pdev->dev, "Found GPIO device via fwnode, chip base: %u\n",
-		 gpio_device_get_base(hp_dev->gdev));
 
 	hp_dev->gpio_count = walk_ctx.count;
 
@@ -2099,11 +2054,6 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 				PTR_ERR(app_ctx->desc));
 			return PTR_ERR(app_ctx->desc);
 		}
-		dev_info(&pdev->dev,
-			 "Using ACPI GPIO[%d]: pin %u (chip-relative) -> global GPIO %u\n",
-			 i, walk_ctx.gpios[i].pin,
-			 gpio_device_get_base(hp_dev->gdev) +
-			 walk_ctx.gpios[i].pin);
 
 		app_ctx->hp_dev = hp_dev;
 	}
@@ -2177,17 +2127,12 @@ static int cx7_hp_probe(struct platform_device *pdev)
 
 		if (app_ctx->ctx->connection_type ==
 		    ACPI_RESOURCE_GPIO_TYPE_INT) {
-			dev_info(&pdev->dev,
-				 "Setting up IRQ for GPIO %d (pin %d)\n", i,
-				 app_ctx->ctx->pin);
 			ret = cx7_hp_setup_irq(app_ctx);
 			if (ret) {
 				dev_err(&pdev->dev,
 					"Failed to setup IRQ for GPIO %d\n", i);
 				goto gpio_release;
 			}
-			dev_info(&pdev->dev, "IRQ %d registered for GPIO %d\n",
-				 gpiod_to_irq(app_ctx->desc), i);
 		}
 	}
 
