@@ -254,13 +254,16 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
         int i, j;
 
         dsd_pkg = adev->data.pointer;
-        /* Find Device Properties GUID package */
+        /* Find first GUID+Package pair (Device Properties GUID package) */
         for (i = 0; i + 1 < dsd_pkg->package.count; i += 2) {
             const union acpi_object *guid = &dsd_pkg->package.elements[i];
-            if (is_acpi_device_properties_guid(guid)) {
-                props_pkg = &dsd_pkg->package.elements[i + 1];
-                if (props_pkg->type == ACPI_TYPE_PACKAGE)
-                    break;
+            const union acpi_object *pkg = &dsd_pkg->package.elements[i + 1];
+            
+            /* GUID is a 16-byte buffer, followed by a properties package */
+            if (guid->type == ACPI_TYPE_BUFFER && guid->buffer.length == 16 &&
+                pkg->type == ACPI_TYPE_PACKAGE) {
+                props_pkg = pkg;
+                break;
             }
         }
 
