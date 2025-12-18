@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (c) 2014-2025 MediaTek Inc.
-// Copyright (c) 2025-2026 NVIDIA Corporation
 /*
+ * Copyright (c) 2014-2025 MediaTek Inc.
+ * Copyright (c) 2025-2026 NVIDIA Corporation
+ *
  * CX7 PCIe Hotplug Driver
  *
  * Manages PCIe device hotplug using GPIO interrupts and ACPI resources.
@@ -270,10 +271,10 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 		    &dsd_pkg->package.elements[i + 1];
 
 		/* Verify GUID matches Device Properties GUID */
-		if (guid->type == ACPI_TYPE_BUFFER && guid->buffer.length == 16
-		    && pkg->type == ACPI_TYPE_PACKAGE
-		    && guid_equal((guid_t *) guid->buffer.pointer,
-				  &device_properties_guid)) {
+		if (guid->type == ACPI_TYPE_BUFFER && guid->buffer.length == 16 &&
+		    pkg->type == ACPI_TYPE_PACKAGE &&
+		    guid_equal((guid_t *)guid->buffer.pointer,
+			      &device_properties_guid)) {
 			props_pkg = pkg;
 			break;
 		}
@@ -288,6 +289,7 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 
 	for (j = 0; j < props_pkg->package.count; j++) {
 		const union acpi_object *prop = &props_pkg->package.elements[j];
+
 		if (prop->type != ACPI_TYPE_PACKAGE ||
 		    prop->package.count != 2 ||
 		    prop->package.elements[0].type != ACPI_TYPE_STRING)
@@ -342,13 +344,13 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 		if (mapping_entry->type != ACPI_TYPE_PACKAGE ||
 		    mapping_entry->package.count != ARRAY_SIZE(strings)) {
 			dev_err(dev,
-				"Invalid pinctrl mapping entry %d: expected Package(%zu), got %s(count=%u)\n",
+				"Invalid pinctrl mapping entry %d: expected Package(%zu), "
+				"got %s(count=%u)\n",
 				k, ARRAY_SIZE(strings),
-				mapping_entry->type ==
-				ACPI_TYPE_PACKAGE ? "Package" : "non-Package",
-				mapping_entry->type ==
-				ACPI_TYPE_PACKAGE ? mapping_entry->package.
-				count : 0);
+				mapping_entry->type == ACPI_TYPE_PACKAGE ?
+				"Package" : "non-Package",
+				mapping_entry->type == ACPI_TYPE_PACKAGE ?
+				mapping_entry->package.count : 0);
 			ACPI_FREE(buffer.pointer);
 			return -EINVAL;
 		}
@@ -397,8 +399,8 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 	hp_dev->pd->pin_nums = pin_nums;
 	hp_dev->pd->parsed_pinmap = pinmap;
 	ACPI_FREE(buffer.pointer);
-	dev_info(dev, "Successfully parsed %u pinctrl mappings from ACPI\n",
-		 pin_nums);
+	dev_dbg(dev, "Successfully parsed %u pinctrl mappings from ACPI\n",
+		pin_nums);
 	return 0;
 }
 
@@ -434,8 +436,8 @@ static int cx7_hp_pinctrl_init(struct cx7_hp_dev *hp_dev)
 		return ret;
 	}
 
-	dev_info(&hp_dev->pdev->dev, "Registered %u pinctrl mappings\n",
-		 hp_dev->pd->pin_nums);
+	dev_dbg(&hp_dev->pdev->dev, "Registered %u pinctrl mappings\n",
+		hp_dev->pd->pin_nums);
 	return 0;
 }
 
@@ -552,7 +554,7 @@ static void cx7_hp_toggle_update_bit(void __iomem *base, u32 ctrl_offset,
 	cx7_hp_reg_update_bits(base, ctrl_offset, update_bit, true);
 }
 
- /**
+/**
  * cx7_hp_bus_protect_enable - Enable bus protection for a port
  * @dev: hotplug device
  * @port_idx: Port index
@@ -632,14 +634,13 @@ static acpi_status cx7_hp_parse_mmio_resources(struct acpi_resource *ares,
 
 /**
  * cx7_hp_find_pcie_config_device - Find PCIe configuration device by HID
- * @dev: device pointer for logging
  *
- * Finds the ACPI device (PNP0C02) that provides PCIe configuration
- * via _DSD properties and MMIO resources via _CRS.
+ * Finds the ACPI device that provides PCIe configuration via _DSD properties
+ * and MMIO resources via _CRS.
  *
  * Returns: acpi_device pointer on success (with reference), NULL on failure
  */
-static struct acpi_device *cx7_hp_find_pcie_config_device(struct device *dev)
+static struct acpi_device *cx7_hp_find_pcie_config_device(void)
 {
 	return acpi_dev_get_first_match_dev("PNP0C02", NULL, -1);
 }
@@ -661,7 +662,7 @@ static int cx7_hp_parse_pcie_config_dsd(struct platform_device *pdev,
 	struct device *dev = &pdev->dev;
 	u32 val, bit1;
 
-	config_adev = cx7_hp_find_pcie_config_device(dev);
+	config_adev = cx7_hp_find_pcie_config_device();
 	if (!config_adev) {
 		dev_err(dev,
 			"Platform configuration device (PNP0C02) not found - _DSD is required\n");
@@ -906,7 +907,7 @@ static int cx7_hp_parse_pcie_config_dsd(struct platform_device *pdev,
 	}
 	pd->num_devices = val;
 
-	dev_info(dev, "Successfully parsed all required _DSD properties\n");
+	dev_dbg(dev, "Successfully parsed all required _DSD properties\n");
 
 	acpi_dev_put(config_adev);
 	return 0;
@@ -931,7 +932,7 @@ static int cx7_hp_parse_mmio_resources_from_acpi(struct cx7_hp_dev *dev,
 		return -EINVAL;
 	}
 
-	config_adev = cx7_hp_find_pcie_config_device(&dev->pdev->dev);
+	config_adev = cx7_hp_find_pcie_config_device();
 	if (!config_adev)
 		return -ENODEV;
 
@@ -982,14 +983,15 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 		return ret;
 	}
 
-	dev_info(&pdev->dev, "Found %d MMIO regions in _CRS, mapping...\n",
-		 parsed.count);
+	dev_dbg(&pdev->dev, "Found %d MMIO regions in _CRS, mapping...\n",
+		parsed.count);
 
 	int mapped_count = 0;
 	for (i = 0; i < parsed.count; i++) {
 		void __iomem *base = NULL;
 		u32 addr = parsed.mmio_regions[i].address;
 		u32 size = parsed.mmio_regions[i].address_length;
+
 		switch (i) {
 		case 0:
 			if (dev->pd->port_nums >= 1) {
@@ -1087,8 +1089,8 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 		return -ENODEV;
 	}
 
-	dev_info(&pdev->dev,
-		 "Successfully mapped all MMIO regions from ACPI _CRS\n");
+	dev_dbg(&pdev->dev,
+		"Successfully mapped all MMIO regions from ACPI _CRS\n");
 	return 0;
 }
 
@@ -1592,8 +1594,8 @@ static int cx7_hp_walk_acpi_gpios(struct platform_device *pdev,
 		return -EIO;
 	}
 
-	dev_info(&pdev->dev, "Found %d GPIO resources via ACPI walk\n",
-		 walk_ctx->count);
+	dev_dbg(&pdev->dev, "Found %d GPIO resources via ACPI walk\n",
+		walk_ctx->count);
 
 	if (walk_ctx->count == 0) {
 		dev_err(&pdev->dev, "No GPIO resources found in ACPI _CRS\n");
@@ -1604,7 +1606,7 @@ static int cx7_hp_walk_acpi_gpios(struct platform_device *pdev,
 }
 
 /**
- * acpi_gpio_lookup_handler - ACPI resource handler to lookup a specific GPIO pin
+ * acpi_gpio_lookup_handler - ACPI resource handler to look up a specific GPIO pin
  * @ares: ACPI resource being processed
  * @context: Pointer to acpi_gpio_parse_context
  *
@@ -1939,7 +1941,6 @@ static int cx7_hp_init_pcie_data(struct platform_device *pdev,
 		return ret;
 	}
 
-	/* Validate port_nums after _DSD parsing */
 	if (pd->port_nums == 0 || pd->port_nums >= HP_PORT_MAX) {
 		dev_err(&pdev->dev,
 			"Invalid port count from _DSD: %d (must be 1-%d)\n",
@@ -1947,7 +1948,6 @@ static int cx7_hp_init_pcie_data(struct platform_device *pdev,
 		return -EINVAL;
 	}
 
-	/* Discover existing PCI devices (uses port_nums and ports[] from _DSD) */
 	ret = cx7_hp_discover_pcie_devices(pdev, pd);
 	if (ret) {
 		dev_err(&pdev->dev, "Device discovery failed: %d\n", ret);
@@ -1958,7 +1958,7 @@ static int cx7_hp_init_pcie_data(struct platform_device *pdev,
 }
 
 /**
- * cx7_hp_enumerate_gpios - Enumerate GPIOs from ACPI only
+ * cx7_hp_enumerate_gpios - Enumerate GPIOs from ACPI
  * @pdev: Platform device
  * @hp_dev: Hotplug device structure
  *
@@ -2016,8 +2016,6 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 	gpio_fwnode = acpi_fwnode_handle(gpio_adev);
 	hp_dev->gdev = gpio_device_find_by_fwnode(gpio_fwnode);
 	if (!hp_dev->gdev) {
-		dev_info(&pdev->dev,
-			 "GPIO device not found (controller may not be loaded), deferring probe\n");
 		return dev_err_probe(&pdev->dev, -EPROBE_DEFER,
 				     "GPIO controller not available\n");
 	}
@@ -2223,9 +2221,9 @@ static struct platform_driver cx7_hp_driver = {
 	.probe = cx7_hp_probe,
 	.remove = cx7_hp_remove,
 	.driver = {
-		   .name = "cx7-pcie-hotplug",
-		   .acpi_match_table = ACPI_PTR(cx7_hp_acpi_match),
-		   },
+		.name = "cx7-pcie-hotplug",
+		.acpi_match_table = ACPI_PTR(cx7_hp_acpi_match),
+	},
 };
 
 module_platform_driver(cx7_hp_driver);
