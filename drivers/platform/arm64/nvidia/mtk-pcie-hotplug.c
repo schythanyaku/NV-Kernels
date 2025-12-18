@@ -131,11 +131,10 @@ struct cx7_hp_plat_data {
     u32 device_id;
     int num_devices;
     struct rp_bus_mmio_info rp_bus_mmio;
-    void (*rp_bus_protect)(struct cx7_hp_dev *dev, int port_idx, int stage);
     u32 ltssm_reg;
     u32 ltssm_l0_state;
     int pin_nums;
-    struct pinctrl_map *parsed_pinmap;  /* Parsed from ACPI _DSD */
+    struct pinctrl_map *parsed_pinmap;
 };
  
  struct cx7_hp_gpio_ctx {
@@ -778,14 +777,14 @@ static int cx7_hp_parse_dsd(struct platform_device *pdev,
 }
 
 /**
- * cx7_hp_map_mmio_resources - Map MMIO regions from _CRS
+ * cx7_hp_parse_mmio_resources_from_acpi - Parse MMIO regions from _CRS
  * @dev: hotplug device
  * @parsed: pointer to parsed MMIO structure
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev,
-                                            struct cx7_hp_acpi_mmio *parsed)
+static int cx7_hp_parse_mmio_resources_from_acpi(struct cx7_hp_dev *dev,
+                                                   struct cx7_hp_acpi_mmio *parsed)
 {
     struct acpi_device *config_adev;
     acpi_status status;
@@ -841,7 +840,7 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 
     dev_info(&pdev->dev, "Parsing MMIO regions from platform configuration device _CRS\n");
 
-    ret = cx7_hp_map_mmio_resources(dev, &parsed);
+    ret = cx7_hp_parse_mmio_resources_from_acpi(dev, &parsed);
     if (ret) {
         dev_err(&pdev->dev, "Failed to get MMIO regions from platform configuration device\n");
         return ret;
@@ -1107,10 +1106,8 @@ static void remove_device(struct cx7_hp_dev *dev)
 {
     int i;
 
-    if (dev->pd->rp_bus_protect) {
-        for (i = 0; i < dev->pd->port_nums; i++)
-            dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_REMOVAL);
-    }
+    for (i = 0; i < dev->pd->port_nums; i++)
+        cx7_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_REMOVAL);
 
     gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 0);
     cx7_hp_change_state(dev, "default");
@@ -1209,10 +1206,8 @@ static int rescan_device(struct cx7_hp_dev *dev)
 
     gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
 
-    if (dev->pd->rp_bus_protect) {
-        for (i = 0; i < dev->pd->port_nums; i++)
-            dev->pd->rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
-    }
+    for (i = 0; i < dev->pd->port_nums; i++)
+        cx7_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
 
      err = polling_link_to_l0(dev);
      if (err)
@@ -1900,9 +1895,6 @@ static int cx7_hp_probe(struct platform_device *pdev)
         return -ENOMEM;
     }
 
-    /* Set function pointer - all other fields populated from ACPI */
-    pd->rp_bus_protect = cx7_hp_rp_bus_protect;
-
     ret = cx7_hp_init_platform_data(pdev, pd);
     if (ret)
         return ret;
@@ -1966,9 +1958,7 @@ static int cx7_hp_probe(struct platform_device *pdev)
          goto pinctrl_remove;
      }
 
-     if (hp_dev->pd->rp_bus_protect) {
-         hp_dev->pd->rp_bus_protect(hp_dev, 0, BUS_PROTECT_INIT);
-     }
+     cx7_hp_rp_bus_protect(hp_dev, 0, BUS_PROTECT_INIT);
 
     if (gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc)) {
         hp_dev->debug_state = CX7_HP_DEBUG_PLUG_OUT;
@@ -2012,8 +2002,7 @@ gpio_release:
 
     sysfs_remove_group(&pdev->dev.kobj, &cx7_hp_attr_group);
 
-    if (hp_dev->pd->rp_bus_protect)
-        hp_dev->pd->rp_bus_protect(hp_dev, 0, BUS_PROTECT_CLEANUP);
+    cx7_hp_rp_bus_protect(hp_dev, 0, BUS_PROTECT_CLEANUP);
 
      cx7_hp_pinctrl_remove(hp_dev);
 
