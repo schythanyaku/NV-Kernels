@@ -21,6 +21,7 @@
  #include <linux/of.h>
  #include <linux/property.h>
  #include <linux/string.h>
+ #include <linux/uuid.h>
  
 #define HP_PORT_MAX		3
 #define HP_POLL_CNT_MAX		200
@@ -206,6 +207,14 @@ struct cx7_hp_dev {
     struct cx7_hp_mmio_runtime mmio;
     struct gpio_device *gdev;
 };
+
+/* ACPI _DSD device properties GUID: daffd814-6eba-4d8c-8a91-bc9bbf4aa301
+ * Well-known ACPI standard GUID (UEFI DSD Guide).
+ * Same GUID used by PCIe parsing via fwnode_property_read_u32()
+ */
+static const guid_t device_properties_guid = GUID_INIT(0xdaffd814, 0x6eba, 0x4d8c,
+                                                        0x8a, 0x91, 0xbc, 0x9b,
+                                                        0xbf, 0x4a, 0xa3, 0x01);
  
 /**
  * cx7_hp_parse_pinctrl_config_dsd - Parse pinctrl configuration from PEDE device _DSD
@@ -236,79 +245,74 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
     dev_info(dev, "Parsing _DSD properties from PEDE device: %s\n",
              acpi_device_bid(adev));
 
-    /* Check if _DSD buffer is available - adev->data.pointer contains _DSD data
-     * (not _CRS, which is accessed separately via acpi_walk_resources).
-     * This is set even if nested packages are rejected by the standard parser.
+    /* Parse manually - standard parser rejects entire properties package
+     * when ANY property has nested packages (like pinctrl-mappings).
+     * Parse from raw _DSD buffer (adev->data.pointer).
      */
+    const union acpi_object *dsd_pkg, *props_pkg = NULL;
+    int i, j;
+
     if (!adev->data.pointer) {
         dev_err(dev, "PEDE device has no _DSD data. Check DSDT.\n");
         return -ENODEV;
     }
 
-    /* Parse properties manually - the standard parser rejects the entire
-     * properties package if ANY property has nested packages, so we parse
-     * from the raw buffer.
-     */
-    {
-        const union acpi_object *dsd_pkg, *props_pkg = NULL;
-        int i, j;
-
-        dsd_pkg = adev->data.pointer;
-        /* Find first GUID+Package pair (Device Properties GUID package) */
-        for (i = 0; i + 1 < dsd_pkg->package.count; i += 2) {
-            const union acpi_object *guid = &dsd_pkg->package.elements[i];
-            const union acpi_object *pkg = &dsd_pkg->package.elements[i + 1];
-            
-            /* GUID is a 16-byte buffer, followed by a properties package */
-            if (guid->type == ACPI_TYPE_BUFFER && guid->buffer.length == 16 &&
-                pkg->type == ACPI_TYPE_PACKAGE) {
-                props_pkg = pkg;
-                break;
-            }
+    dsd_pkg = adev->data.pointer;
+    /* Find Device Properties GUID package */
+    for (i = 0; i + 1 < dsd_pkg->package.count; i += 2) {
+        const union acpi_object *guid = &dsd_pkg->package.elements[i];
+        const union acpi_object *pkg = &dsd_pkg->package.elements[i + 1];
+        
+        /* Verify GUID matches Device Properties GUID */
+        if (guid->type == ACPI_TYPE_BUFFER && guid->buffer.length == 16 &&
+            pkg->type == ACPI_TYPE_PACKAGE &&
+            guid_equal((guid_t *)guid->buffer.pointer, &device_properties_guid)) {
+            props_pkg = pkg;
+            break;
         }
-
-        if (!props_pkg) {
-            dev_err(dev, "Device Properties GUID package not found in _DSD\n");
-            return -EINVAL;
-        }
-
-        /* Search for pin-nums and pinctrl-mappings
-         * Each property is Package(2) { "name", value }:
-         *   elements[0] = property name (string)
-         *   elements[1] = property value (integer, string, package, etc.)
-         */
-        for (j = 0; j < props_pkg->package.count; j++) {
-            const union acpi_object *prop = &props_pkg->package.elements[j];
-            if (prop->type != ACPI_TYPE_PACKAGE ||
-                prop->package.count != 2 ||
-                prop->package.elements[0].type != ACPI_TYPE_STRING)
-                continue;
-
-            const char *prop_name = prop->package.elements[0].string.pointer;
-            const union acpi_object *prop_value = &prop->package.elements[1];
-
-            if (!strcmp(prop_name, "pin-nums")) {
-                if (prop_value->type == ACPI_TYPE_INTEGER)
-                    pin_nums = prop_value->integer.value;
-            } else if (!strcmp(prop_name, "pinctrl-mappings")) {
-                if (prop_value->type == ACPI_TYPE_PACKAGE)
-                    mappings_pkg = prop_value;
-            }
-        }
-
-        if (pin_nums == 0) {
-            dev_info(dev, "pin-nums is 0, no pinctrl mappings to parse\n");
-            hp_dev->pd->pin_nums = 0;
-            return 0;
-        }
-
-        if (!mappings_pkg) {
-            dev_err(dev, "Missing required _DSD property: pinctrl-mappings\n");
-            return -EINVAL;
-        }
-
-        dev_info(dev, "Parsing %u pinctrl mappings from PEDE device _DSD\n", pin_nums);
     }
+
+    if (!props_pkg) {
+        dev_err(dev, "Device Properties GUID package not found in _DSD\n");
+        return -EINVAL;
+    }
+
+    /* Search for pin-nums and pinctrl-mappings
+     * Each property is Package(2) { "name", value }:
+     *   elements[0] = property name (string)
+     *   elements[1] = property value (integer, string, package, etc.)
+     */
+    for (j = 0; j < props_pkg->package.count; j++) {
+        const union acpi_object *prop = &props_pkg->package.elements[j];
+        if (prop->type != ACPI_TYPE_PACKAGE ||
+            prop->package.count != 2 ||
+            prop->package.elements[0].type != ACPI_TYPE_STRING)
+            continue;
+
+        const char *prop_name = prop->package.elements[0].string.pointer;
+        const union acpi_object *prop_value = &prop->package.elements[1];
+
+        if (!strcmp(prop_name, "pin-nums")) {
+            if (prop_value->type == ACPI_TYPE_INTEGER)
+                pin_nums = prop_value->integer.value;
+        } else if (!strcmp(prop_name, "pinctrl-mappings")) {
+            if (prop_value->type == ACPI_TYPE_PACKAGE)
+                mappings_pkg = prop_value;
+        }
+    }
+
+    if (pin_nums == 0) {
+        dev_info(dev, "pin-nums is 0, no pinctrl mappings to parse\n");
+        hp_dev->pd->pin_nums = 0;
+        return 0;
+    }
+
+    if (!mappings_pkg) {
+        dev_err(dev, "Missing required _DSD property: pinctrl-mappings\n");
+        return -EINVAL;
+    }
+
+    dev_info(dev, "Parsing %u pinctrl mappings from PEDE device _DSD\n", pin_nums);
 
     if (mappings_pkg->package.count != pin_nums) {
         dev_err(dev, "pinctrl-mappings count mismatch: expected %u, got %u\n",
