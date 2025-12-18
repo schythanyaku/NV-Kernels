@@ -27,6 +27,13 @@
 #define MAX_VENDOR_DATA_LEN	16
 #define CX7_HP_MMIO_REGION_COUNT	5	/* TOP, PROTECT, CKM, MAC Port 0, MAC Port 1 */
 #define CX7_HP_MIN_GPIO_COUNT	4	/* Minimum required: BOOT, PRSNT, PERST, EN */
+#define PINCTRL_MAPPING_ENTRY_SIZE 5	/* dev_name, state, ctrl_dev, group, function */
+/* Indices for pinctrl mapping entry strings */
+#define PINCTRL_IDX_DEV_NAME	0
+#define PINCTRL_IDX_STATE	1
+#define PINCTRL_IDX_CTRL_DEV	2
+#define PINCTRL_IDX_GROUP	3
+#define PINCTRL_IDX_FUNCTION	4
  
  /* Hardware timing requirements (in microseconds unless noted) */
 #define CX7_HP_DELAY_SHORT_US		10	/* Short delay for register writes */
@@ -128,7 +135,7 @@ struct cx7_hp_plat_data {
     u32 ltssm_reg;
     u32 ltssm_l0_state;
     int pin_nums;
-    struct pinctrl_map pinmap[];
+    struct pinctrl_map *parsed_pinmap;  /* Parsed from ACPI _DSD */
 };
  
  struct cx7_hp_gpio_ctx {
@@ -201,26 +208,147 @@ struct cx7_hp_dev {
     struct gpio_device *gdev;
 };
  
+/**
+ * cx7_hp_parse_pinctrl_mappings - Parse pinctrl mappings from PEDE device _DSD
+ * @hp_dev: hotplug device
+ *
+ * Parses pin-nums and pinctrl-mappings from PEDE device (MTKP0001) _DSD.
+ * Allocates and populates pinmap array dynamically.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int cx7_hp_parse_pinctrl_mappings(struct cx7_hp_dev *hp_dev)
+{
+    struct acpi_device *adev = ACPI_COMPANION(&hp_dev->pdev->dev);
+    struct device *dev = &hp_dev->pdev->dev;
+    const union acpi_object *mappings_pkg, *mapping_entry;
+    struct pinctrl_map *pinmap;
+    u32 pin_nums = 0;
+    int k, ret;
+    const char *strings[PINCTRL_MAPPING_ENTRY_SIZE];
+
+    if (!adev) {
+        dev_err(dev, "No ACPI device found for platform device\n");
+        return -ENODEV;
+    }
+
+    if (!acpi_dev_has_props(adev)) {
+        dev_err(dev, "PEDE device has no _DSD properties. Check DSDT.\n");
+        return -EINVAL;
+    }
+
+    /* Parse pin-nums from _DSD */
+    if (fwnode_property_read_u32(acpi_fwnode_handle(adev), "pin-nums", &pin_nums)) {
+        dev_err(dev, "Missing required _DSD property: pin-nums\n");
+        return -EINVAL;
+    }
+
+    if (pin_nums == 0) {
+        dev_info(dev, "pin-nums is 0, no pinctrl mappings to parse\n");
+        hp_dev->pd->pin_nums = 0;
+        return 0;
+    }
+
+    dev_info(dev, "Parsing %u pinctrl mappings from PEDE device _DSD\n", pin_nums);
+
+    /* Get pinctrl-mappings property directly */
+    ret = acpi_dev_get_property(adev, "pinctrl-mappings", ACPI_TYPE_PACKAGE,
+                                 (const union acpi_object **)&mappings_pkg);
+    if (ret) {
+        dev_err(dev, "Missing required _DSD property: pinctrl-mappings\n");
+        return ret;
+    }
+
+    if (mappings_pkg->package.count != pin_nums) {
+        dev_err(dev, "pinctrl-mappings count mismatch: expected %u, got %u\n",
+                pin_nums, mappings_pkg->package.count);
+        return -EINVAL;
+    }
+
+    /* Allocate pinmap array */
+    pinmap = devm_kcalloc(dev, pin_nums, sizeof(*pinmap), GFP_KERNEL);
+    if (!pinmap)
+        return -ENOMEM;
+
+    /* Parse each mapping entry */
+    for (k = 0; k < pin_nums; k++) {
+        mapping_entry = &mappings_pkg->package.elements[k];
+        if (mapping_entry->type != ACPI_TYPE_PACKAGE ||
+            mapping_entry->package.count != ARRAY_SIZE(strings)) {
+            dev_err(dev, "Invalid pinctrl mapping entry %d: expected Package(%zu), got %s(count=%u)\n",
+                    k, ARRAY_SIZE(strings),
+                    mapping_entry->type == ACPI_TYPE_PACKAGE ? "Package" : "non-Package",
+                    mapping_entry->type == ACPI_TYPE_PACKAGE ? mapping_entry->package.count : 0);
+            return -EINVAL;
+        }
+
+        /* Extract strings: dev_name, state, ctrl_dev, group, function */
+        for (int l = 0; l < ARRAY_SIZE(strings); l++) {
+            if (mapping_entry->package.elements[l].type != ACPI_TYPE_STRING) {
+                dev_err(dev, "Mapping entry %d element %d is not a string\n", k, l);
+                return -EINVAL;
+            }
+            strings[l] = mapping_entry->package.elements[l].string.pointer;
+        }
+
+        /* Populate pinctrl_map structure */
+        pinmap[k].dev_name = devm_kstrdup(dev, strings[PINCTRL_IDX_DEV_NAME], GFP_KERNEL);
+        pinmap[k].name = devm_kstrdup(dev, strings[PINCTRL_IDX_STATE], GFP_KERNEL);
+        pinmap[k].type = PIN_MAP_TYPE_MUX_GROUP;
+        pinmap[k].ctrl_dev_name = devm_kstrdup(dev, strings[PINCTRL_IDX_CTRL_DEV], GFP_KERNEL);
+        pinmap[k].data.mux.group = devm_kstrdup(dev, strings[PINCTRL_IDX_GROUP], GFP_KERNEL);
+        pinmap[k].data.mux.function = devm_kstrdup(dev, strings[PINCTRL_IDX_FUNCTION], GFP_KERNEL);
+
+        if (!pinmap[k].dev_name || !pinmap[k].name ||
+            !pinmap[k].ctrl_dev_name || !pinmap[k].data.mux.group ||
+            !pinmap[k].data.mux.function) {
+            dev_err(dev, "Failed to allocate memory for mapping %d\n", k);
+            return -ENOMEM;
+        }
+
+        dev_dbg(dev, "Parsed mapping %d: dev=%s state=%s ctrl=%s group=%s func=%s\n",
+                k, pinmap[k].dev_name, pinmap[k].name,
+                pinmap[k].ctrl_dev_name, pinmap[k].data.mux.group,
+                pinmap[k].data.mux.function);
+    }
+
+    /* Successfully parsed all mappings */
+    hp_dev->pd->pin_nums = pin_nums;
+    hp_dev->pd->parsed_pinmap = pinmap;
+    dev_info(dev, "Successfully parsed %u pinctrl mappings from ACPI\n", pin_nums);
+    return 0;
+}
+
  /**
  * cx7_hp_pinctrl_init - Register pinctrl mappings for the device
  * @hp_dev: hotplug device
+ *
+ * Parses pinctrl mappings from PEDE device _DSD and registers them.
  *
  * Returns: 0 on success, negative error code on failure
  */
  static int cx7_hp_pinctrl_init(struct cx7_hp_dev *hp_dev)
  {
      int ret;
- 
+
+     /* Parse pinctrl mappings from ACPI _DSD */
+     ret = cx7_hp_parse_pinctrl_mappings(hp_dev);
+     if (ret) {
+         dev_err(&hp_dev->pdev->dev, "Failed to parse pinctrl mappings from ACPI: %d\n", ret);
+         return ret;
+     }
+
      if (!hp_dev->pd->pin_nums)
          return 0;
- 
-     ret = pinctrl_register_mappings(hp_dev->pd->pinmap, hp_dev->pd->pin_nums);
+
+     ret = pinctrl_register_mappings(hp_dev->pd->parsed_pinmap, hp_dev->pd->pin_nums);
      if (ret) {
          dev_err(&hp_dev->pdev->dev, "Failed to register pinctrl mappings\n");
          return ret;
      }
- 
-    return 0;
+
+     dev_info(&hp_dev->pdev->dev, "Registered %u pinctrl mappings\n", hp_dev->pd->pin_nums);
+     return 0;
 }
 
 /**
@@ -228,9 +356,11 @@ struct cx7_hp_dev {
  * @hp_dev: hotplug device
  */
 static void cx7_hp_pinctrl_remove(struct cx7_hp_dev *hp_dev)
- {
-    if (hp_dev->pd->pin_nums)
-        pinctrl_unregister_mappings(hp_dev->pd->pinmap);
+{
+    if (!hp_dev->pd->pin_nums)
+        return;
+
+    pinctrl_unregister_mappings(hp_dev->pd->parsed_pinmap);
 }
 
 /**
@@ -615,6 +745,31 @@ static int cx7_hp_parse_dsd(struct platform_device *pdev,
         }
         pd->ports[1].devfn = val;
     }
+
+    /* PCIe device identification */
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "vendor-id", &val)) {
+        dev_err(dev, "Missing required _DSD property: vendor-id\n");
+        acpi_dev_put(config_adev);
+        return -EINVAL;
+    }
+    pd->vendor_id = val;
+    dev_info(dev, "Parsed vendor-id: 0x%04X\n", pd->vendor_id);
+
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "device-id", &val)) {
+        dev_err(dev, "Missing required _DSD property: device-id\n");
+        acpi_dev_put(config_adev);
+        return -EINVAL;
+    }
+    pd->device_id = val;
+    dev_info(dev, "Parsed device-id: 0x%04X\n", pd->device_id);
+
+    if (fwnode_property_read_u32(acpi_fwnode_handle(config_adev), "num-devices", &val)) {
+        dev_err(dev, "Missing required _DSD property: num-devices\n");
+        acpi_dev_put(config_adev);
+        return -EINVAL;
+    }
+    pd->num_devices = val;
+    dev_info(dev, "Parsed num-devices: %u\n", pd->num_devices);
 
     dev_info(dev, "Successfully parsed all required _DSD properties\n");
 
@@ -1734,27 +1889,19 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
  */
 static int cx7_hp_probe(struct platform_device *pdev)
  {
-     const struct cx7_hp_plat_data *pd_template;
      struct cx7_hp_plat_data *pd;
      struct cx7_hp_gpio_ctx *app_ctx;
      struct cx7_hp_dev *hp_dev;
-     size_t pd_size;
      int ret, i;
  
-    pd_template = (const struct cx7_hp_plat_data *)device_get_match_data(&pdev->dev);
-    if (!pd_template) {
-        dev_err(&pdev->dev, "No platform data available\n");
-        return -EINVAL;
-    }
-
-    pd_size = sizeof(*pd_template) + (pd_template->pin_nums * sizeof(struct pinctrl_map));
-    pd = devm_kzalloc(&pdev->dev, pd_size, GFP_KERNEL);
+    pd = devm_kzalloc(&pdev->dev, sizeof(*pd), GFP_KERNEL);
     if (!pd) {
         dev_err(&pdev->dev, "Failed to allocate memory for platform data\n");
         return -ENOMEM;
     }
 
-    memcpy(pd, pd_template, pd_size);
+    /* Set function pointer - all other fields populated from ACPI */
+    pd->rp_bus_protect = cx7_hp_rp_bus_protect;
 
     ret = cx7_hp_init_platform_data(pdev, pd);
     if (ret)
@@ -1884,36 +2031,8 @@ gpio_release:
      platform_set_drvdata(pdev, NULL);
  }
  
-/*
- * Platform data for PCIe hotplug support
- *
- * ACPI resource sources for platform data:
- * - All platform data: Platform configuration device (PNP0C02) _DSD
- *
- * Fields initialized to 0 are populated from _DSD at runtime.
- * Code-specific fields: function pointers, pinctrl mappings, and device matching.
- */
-static const struct cx7_hp_plat_data platform_data = {
-    .port_nums = 0,
-    .ports = { {0}, {0} },
-    .vendor_id = PCI_VENDOR_ID_MELLANOX,
-    .device_id = 0x1021, /* CX7 device ID */
-    .num_devices = 4,
-    .rp_bus_mmio = { {0}, {0}, {0}, {0} },
-    .rp_bus_protect = cx7_hp_rp_bus_protect,
-    .ltssm_reg = 0,
-    .ltssm_l0_state = 0,
-    .pin_nums = 4,
-     .pinmap = {
-         PIN_MAP_MUX_GROUP("MTKP0001:00", "default", "NVDA9221:00", "GPIO177", "func0"),
-         PIN_MAP_MUX_GROUP("MTKP0001:00", "default", "NVDA9221:00", "GPIO178", "func0"),
-         PIN_MAP_MUX_GROUP("MTKP0001:00", "clkreqn", "NVDA9221:00", "GPIO177", "func1"),
-         PIN_MAP_MUX_GROUP("MTKP0001:00", "clkreqn", "NVDA9221:00", "GPIO178", "func1"),
-     }
- };
- 
  static const struct acpi_device_id cx7_hp_acpi_match[] = {
-     {"MTKP0001", (kernel_ulong_t)&platform_data},
+     {"MTKP0001", 0},
      {}
  };
  
