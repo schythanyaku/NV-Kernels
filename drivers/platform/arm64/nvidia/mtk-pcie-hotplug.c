@@ -209,6 +209,7 @@ struct cx7_hp_dev {
 	int boot_pin;
 	int prsnt_pin;
 	enum cx7_hp_debug_val debug_state;
+	bool hotplug_enabled;	/* Enable/disable hotplug functionality */
 	spinlock_t lock;
 	struct pci_dev *cached_root_ports[HP_PORT_MAX];
 	struct cx7_hp_mmio_runtime mmio;
@@ -1463,6 +1464,14 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
 	int value;
 	enum cx7_hp_state state;
 
+	/* Ignore hotplug events if disabled */
+	spin_lock_irqsave(&hp_dev->lock, flags);
+	if (!hp_dev->hotplug_enabled) {
+		spin_unlock_irqrestore(&hp_dev->lock, flags);
+		return IRQ_HANDLED;
+	}
+	spin_unlock_irqrestore(&hp_dev->lock, flags);
+
 	value = gpiod_get_value(app_ctx->desc);
 
 	if (gpio_ctx->pin == hp_dev->prsnt_pin) {
@@ -1716,6 +1725,15 @@ static ssize_t debug_state_store(struct device *dev,
 	if (err)
 		return err;
 
+	/* Check if hotplug is enabled before allowing debug_state operations */
+	spin_lock_irqsave(&hp_dev->lock, flags);
+	if (!hp_dev->hotplug_enabled) {
+		spin_unlock_irqrestore(&hp_dev->lock, flags);
+		dev_err(dev, "Hotplug is disabled.\n");
+		return -EPERM;
+	}
+	spin_unlock_irqrestore(&hp_dev->lock, flags);
+
 	switch (val) {
 	case CX7_HP_DEBUG_PLUG_OUT:
 		/* Safety check: Verify no devices on the bus before hardware shutdown. */
@@ -1762,8 +1780,43 @@ static ssize_t debug_state_store(struct device *dev,
 
 DEVICE_ATTR_RW(debug_state);
 
+static ssize_t hotplug_enabled_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
+
+	if (!hp_dev)
+		return -EINVAL;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", hp_dev->hotplug_enabled ? 1 : 0);
+}
+
+static ssize_t hotplug_enabled_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
+	unsigned long val;
+	int err;
+
+	if (!hp_dev)
+		return -EINVAL;
+
+	err = kstrtoul(buf, 10, &val);
+	if (err)
+		return err;
+
+	hp_dev->hotplug_enabled = (val != 0);
+	dev_info(dev, "Hotplug %s\n", hp_dev->hotplug_enabled ? "enabled" : "disabled");
+
+	return count;
+}
+
+DEVICE_ATTR_RW(hotplug_enabled);
+
 static struct attribute *cx7_hp_attrs[] = {
 	&dev_attr_debug_state.attr,
+	&dev_attr_hotplug_enabled.attr,
 	NULL
 };
 
@@ -2098,6 +2151,7 @@ static int cx7_hp_probe(struct platform_device *pdev)
 	hp_dev->state = STATE_READY;
 	hp_dev->boot_pin = -1;
 	hp_dev->prsnt_pin = -1;
+	hp_dev->hotplug_enabled = false;	/* Disabled by default */
 	spin_lock_init(&hp_dev->lock);
 
 	for (i = 0; i < HP_PORT_MAX; i++)
