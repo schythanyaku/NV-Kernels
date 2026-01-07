@@ -1415,7 +1415,12 @@ static irqreturn_t cx7_hp_work(int irq, void *dev_id)
 
 	hp_dev = app_ctx->hp_dev;
 
+	/* Ignore work queue processing if hotplug is disabled */
 	spin_lock_irqsave(&hp_dev->lock, flags);
+	if (!hp_dev->hotplug_enabled) {
+		spin_unlock_irqrestore(&hp_dev->lock, flags);
+		return IRQ_HANDLED;
+	}
 	state = hp_dev->state;
 	spin_unlock_irqrestore(&hp_dev->lock, flags);
 
@@ -1911,6 +1916,44 @@ static int cx7_hp_setup_irq(struct cx7_hp_gpio_ctx *app_ctx)
 		dev_err(ctx->dev, "Failed to request IRQ %d: %d\n", irq, ret);
 
 	return ret;
+}
+
+/**
+ * cx7_hp_register_irqs - Register IRQs for all GPIOs
+ * @hp_dev: hotplug device
+ *
+ * Registers IRQs for all interrupt-capable GPIOs. Called when hotplug is enabled.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int cx7_hp_register_irqs(struct cx7_hp_dev *hp_dev)
+{
+	struct cx7_hp_gpio_ctx *app_ctx;
+	int ret, i;
+
+	for (i = 0; i < hp_dev->gpio_count; i++) {
+		app_ctx = &hp_dev->pins[i];
+
+		if (!app_ctx->ctx ||
+		    app_ctx->ctx->connection_type != ACPI_RESOURCE_GPIO_TYPE_INT)
+			continue;
+
+		/* Check if IRQ already registered */
+		if (gpiod_to_irq(app_ctx->desc) >= 0 &&
+		    !gpiod_cansleep(app_ctx->desc)) {
+			/* IRQ might already be registered, skip */
+			continue;
+		}
+
+		ret = cx7_hp_setup_irq(app_ctx);
+		if (ret) {
+			dev_err(&hp_dev->pdev->dev,
+				"Failed to setup IRQ for GPIO %d: %d\n", i, ret);
+			return ret;
+		}
+	}
+
+	return 0;
 }
 
 /**
