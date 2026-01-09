@@ -209,11 +209,12 @@ struct cx7_hp_dev {
 	int boot_pin;
 	int prsnt_pin;
 	enum cx7_hp_debug_val debug_state;
-	bool hotplug_enabled;	/* Enable/disable hotplug functionality */
+	bool hotplug_enabled;
 	spinlock_t lock;
 	struct pci_dev *cached_root_ports[HP_PORT_MAX];
 	struct cx7_hp_mmio_runtime mmio;
 	struct gpio_device *gdev;
+	struct notifier_block pci_notifier;
 };
 
 /* ACPI _DSD device properties GUID: daffd814-6eba-4d8c-8a91-bc9bbf4aa301 */
@@ -1415,7 +1416,6 @@ static irqreturn_t cx7_hp_work(int irq, void *dev_id)
 
 	hp_dev = app_ctx->hp_dev;
 
-	/* Ignore work queue processing if hotplug is disabled */
 	spin_lock_irqsave(&hp_dev->lock, flags);
 	if (!hp_dev->hotplug_enabled) {
 		spin_unlock_irqrestore(&hp_dev->lock, flags);
@@ -1469,14 +1469,6 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
 	int value;
 	enum cx7_hp_state state;
 
-	/* Ignore hotplug events if disabled */
-	spin_lock_irqsave(&hp_dev->lock, flags);
-	if (!hp_dev->hotplug_enabled) {
-		spin_unlock_irqrestore(&hp_dev->lock, flags);
-		return IRQ_HANDLED;
-	}
-	spin_unlock_irqrestore(&hp_dev->lock, flags);
-
 	value = gpiod_get_value(app_ctx->desc);
 
 	if (gpio_ctx->pin == hp_dev->prsnt_pin) {
@@ -1489,6 +1481,10 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
 	}
 
 	spin_lock_irqsave(&hp_dev->lock, flags);
+	if (!hp_dev->hotplug_enabled) {
+		spin_unlock_irqrestore(&hp_dev->lock, flags);
+		return IRQ_HANDLED;
+	}
 	state = hp_dev->state;
 
 	if (gpio_ctx->pin == hp_dev->boot_pin) {
@@ -1730,11 +1726,10 @@ static ssize_t debug_state_store(struct device *dev,
 	if (err)
 		return err;
 
-	/* Check if hotplug is enabled before allowing debug_state operations */
 	spin_lock_irqsave(&hp_dev->lock, flags);
 	if (!hp_dev->hotplug_enabled) {
 		spin_unlock_irqrestore(&hp_dev->lock, flags);
-		dev_err(dev, "Hotplug is disabled.\n");
+		dev_info(dev, "Hotplug is disabled.\n");
 		return -EPERM;
 	}
 	spin_unlock_irqrestore(&hp_dev->lock, flags);
@@ -1919,44 +1914,6 @@ static int cx7_hp_setup_irq(struct cx7_hp_gpio_ctx *app_ctx)
 }
 
 /**
- * cx7_hp_register_irqs - Register IRQs for all GPIOs
- * @hp_dev: hotplug device
- *
- * Registers IRQs for all interrupt-capable GPIOs. Called when hotplug is enabled.
- *
- * Returns: 0 on success, negative error code on failure
- */
-static int cx7_hp_register_irqs(struct cx7_hp_dev *hp_dev)
-{
-	struct cx7_hp_gpio_ctx *app_ctx;
-	int ret, i;
-
-	for (i = 0; i < hp_dev->gpio_count; i++) {
-		app_ctx = &hp_dev->pins[i];
-
-		if (!app_ctx->ctx ||
-		    app_ctx->ctx->connection_type != ACPI_RESOURCE_GPIO_TYPE_INT)
-			continue;
-
-		/* Check if IRQ already registered */
-		if (gpiod_to_irq(app_ctx->desc) >= 0 &&
-		    !gpiod_cansleep(app_ctx->desc)) {
-			/* IRQ might already be registered, skip */
-			continue;
-		}
-
-		ret = cx7_hp_setup_irq(app_ctx);
-		if (ret) {
-			dev_err(&hp_dev->pdev->dev,
-				"Failed to setup IRQ for GPIO %d: %d\n", i, ret);
-			return ret;
-		}
-	}
-
-	return 0;
-}
-
-/**
  * cx7_hp_put_gpio_device - Release GPIO device reference
  * @data: GPIO device pointer
  */
@@ -2046,7 +2003,7 @@ static int cx7_hp_init_pcie_data(struct platform_device *pdev,
 
 	ret = cx7_hp_discover_pcie_devices(pdev, pd);
 	if (ret) {
-		dev_err(&pdev->dev, "Device discovery failed: %d\n", ret);
+		dev_dbg(&pdev->dev, "Device discovery failed: %d\n", ret);
 		return ret;
 	}
 
@@ -2156,6 +2113,41 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 }
 
 /**
+ * cx7_hp_pci_notifier - PCI bus notifier to configure MPS for CX7 devices
+ * @nb: notifier block
+ * @action: bus notification action
+ * @data: pointer to device being added/removed
+ *
+ * Returns: NOTIFY_OK on success, NOTIFY_DONE if not a CX7 device
+ */
+static int cx7_hp_pci_notifier(struct notifier_block *nb, unsigned long action,
+				void *data)
+{
+	struct device *dev = data;
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct cx7_hp_dev *hp_dev;
+
+	if (action != BUS_NOTIFY_ADD_DEVICE)
+		return NOTIFY_DONE;
+
+	hp_dev = container_of(nb, struct cx7_hp_dev, pci_notifier);
+	if (!hp_dev || !hp_dev->pd)
+		return NOTIFY_DONE;
+
+	if (!pdev || !hp_dev->pd->vendor_id || !hp_dev->pd->device_id)
+		return NOTIFY_DONE;
+
+	if (pdev->vendor != hp_dev->pd->vendor_id ||
+	    pdev->device != hp_dev->pd->device_id)
+		return NOTIFY_DONE;
+
+	if (pdev->bus)
+		pcie_bus_configure_settings(pdev->bus);
+
+	return NOTIFY_OK;
+}
+
+/**
  * cx7_hp_probe - Platform device probe function
  * @pdev: platform device
  *
@@ -2194,7 +2186,7 @@ static int cx7_hp_probe(struct platform_device *pdev)
 	hp_dev->state = STATE_READY;
 	hp_dev->boot_pin = -1;
 	hp_dev->prsnt_pin = -1;
-	hp_dev->hotplug_enabled = false;	/* Disabled by default */
+	hp_dev->hotplug_enabled = false;
 	spin_lock_init(&hp_dev->lock);
 
 	for (i = 0; i < HP_PORT_MAX; i++)
@@ -2247,6 +2239,14 @@ static int cx7_hp_probe(struct platform_device *pdev)
 
 	cx7_hp_rp_bus_protect(hp_dev, 0, BUS_PROTECT_INIT);
 
+	hp_dev->pci_notifier.notifier_call = cx7_hp_pci_notifier;
+	ret = bus_register_notifier(&pci_bus_type, &hp_dev->pci_notifier);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to register PCI bus notifier: %d\n",
+			ret);
+		goto pinctrl_remove;
+	}
+
 	if (gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc)) {
 		hp_dev->debug_state = CX7_HP_DEBUG_PLUG_OUT;
 		cx7_hp_send_uevent(hp_dev, REMOVAL_EVT);
@@ -2288,6 +2288,8 @@ static void cx7_hp_remove(struct platform_device *pdev)
 		return;
 
 	sysfs_remove_group(&pdev->dev.kobj, &cx7_hp_attr_group);
+
+	bus_unregister_notifier(&pci_bus_type, &hp_dev->pci_notifier);
 
 	cx7_hp_rp_bus_protect(hp_dev, 0, BUS_PROTECT_CLEANUP);
 
