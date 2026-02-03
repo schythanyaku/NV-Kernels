@@ -215,6 +215,7 @@ struct cx7_hp_dev {
 	struct cx7_hp_mmio_runtime mmio;
 	struct gpio_device *gdev;
 	struct notifier_block pci_notifier;
+	const char *pending_uevent;
 };
 
 /* ACPI _DSD device properties GUID: daffd814-6eba-4d8c-8a91-bc9bbf4aa301 */
@@ -302,14 +303,13 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 		const union acpi_object *prop_value =
 		    &prop->package.elements[1];
 
-		if (!strcmp(prop_name, "pin-nums")) {
-			if (prop_value->type == ACPI_TYPE_INTEGER) {
-				pin_nums = prop_value->integer.value;
-			}
-		} else if (!strcmp(prop_name, "pinctrl-mappings")) {
-			if (prop_value->type == ACPI_TYPE_PACKAGE)
-				mappings_pkg = prop_value;
-		}
+	if (!strcmp(prop_name, "pin-nums")) {
+		if (prop_value->type == ACPI_TYPE_INTEGER)
+			pin_nums = prop_value->integer.value;
+	} else if (!strcmp(prop_name, "pinctrl-mappings")) {
+		if (prop_value->type == ACPI_TYPE_PACKAGE)
+			mappings_pkg = prop_value;
+	}
 	}
 
 	if (pin_nums == 0) {
@@ -346,8 +346,7 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 		if (mapping_entry->type != ACPI_TYPE_PACKAGE ||
 		    mapping_entry->package.count != ARRAY_SIZE(strings)) {
 			dev_err(dev,
-				"Invalid pinctrl mapping entry %d: expected Package(%zu), "
-				"got %s(count=%u)\n",
+				"Invalid pinctrl mapping entry %d: expected Package(%zu), got %s(count=%u)\n",
 				k, ARRAY_SIZE(strings),
 				mapping_entry->type == ACPI_TYPE_PACKAGE ?
 				"Package" : "non-Package",
@@ -930,9 +929,8 @@ static int cx7_hp_parse_mmio_resources_from_acpi(struct cx7_hp_dev *dev,
 	acpi_status status;
 	int ret = 0;
 
-	if (!dev || !dev->pdev) {
+	if (!dev || !dev->pdev)
 		return -EINVAL;
-	}
 
 	config_adev = cx7_hp_find_pcie_config_device();
 	if (!config_adev)
@@ -989,6 +987,7 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 		parsed.count);
 
 	int mapped_count = 0;
+
 	for (i = 0; i < parsed.count; i++) {
 		void __iomem *base = NULL;
 		u32 addr = parsed.mmio_regions[i].address;
@@ -1156,19 +1155,18 @@ static void cx7_hp_rp_bus_protect(struct cx7_hp_dev *dev, int port_idx,
 						       mmio_info->mac.init_ctrl,
 						       mmio_info->mac.ltssm_bit,
 						       false);
-				cx7_hp_reg_update_bits(mac_base,
-						       mmio_info->mac.init_ctrl,
-						       mmio_info->mac.
-						       phy_rst_bit, false);
+			cx7_hp_reg_update_bits(mac_base,
+					       mmio_info->mac.init_ctrl,
+					       mmio_info->mac.phy_rst_bit,
+					       false);
 				return;
 			}
 
-			cx7_hp_toggle_update_bit(dev->mmio.top_base,
-						 mmio_info->top.ctrl,
-						 mmio_info->top.
-						 port_bits[port_idx],
-						 mmio_info->top.update_bit,
-						 false);
+		cx7_hp_toggle_update_bit(dev->mmio.top_base,
+					 mmio_info->top.ctrl,
+					 mmio_info->top.port_bits[port_idx],
+					 mmio_info->top.update_bit,
+					 false);
 			udelay(CX7_HP_DELAY_SHORT_US);
 
 			cx7_hp_bus_protect_enable(dev, port_idx);
@@ -1187,12 +1185,11 @@ static void cx7_hp_rp_bus_protect(struct cx7_hp_dev *dev, int port_idx,
 
 			cx7_hp_bus_protect_disable(dev, port_idx);
 
-			cx7_hp_toggle_update_bit(dev->mmio.top_base,
-						 mmio_info->top.ctrl,
-						 mmio_info->top.
-						 port_bits[port_idx],
-						 mmio_info->top.update_bit,
-						 true);
+		cx7_hp_toggle_update_bit(dev->mmio.top_base,
+					 mmio_info->top.ctrl,
+					 mmio_info->top.port_bits[port_idx],
+					 mmio_info->top.update_bit,
+					 true);
 		}
 		break;
 
@@ -1338,9 +1335,8 @@ static int polling_link_to_l0(struct cx7_hp_dev *dev)
 		}
 	}
 
-	if (count > HP_POLL_CNT_MAX) {
+	if (count > HP_POLL_CNT_MAX)
 		return -ETIMEDOUT;
-	}
 
 	return 0;
 }
@@ -1408,6 +1404,7 @@ static irqreturn_t cx7_hp_work(int irq, void *dev_id)
 	struct cx7_hp_gpio_ctx *app_ctx = dev_id;
 	struct cx7_hp_dev *hp_dev;
 	enum cx7_hp_state state;
+	const char *uevent = NULL;
 	unsigned long flags;
 	int ret;
 
@@ -1417,10 +1414,21 @@ static irqreturn_t cx7_hp_work(int irq, void *dev_id)
 	hp_dev = app_ctx->hp_dev;
 
 	spin_lock_irqsave(&hp_dev->lock, flags);
+
+	/* Get any pending uevent (from hardirq) */
+	if (hp_dev->pending_uevent) {
+		uevent = hp_dev->pending_uevent;
+		hp_dev->pending_uevent = NULL;
+		spin_unlock_irqrestore(&hp_dev->lock, flags);
+		cx7_hp_send_uevent(hp_dev, uevent);
+		return IRQ_HANDLED;
+	}
+
 	if (!hp_dev->hotplug_enabled) {
 		spin_unlock_irqrestore(&hp_dev->lock, flags);
 		return IRQ_HANDLED;
 	}
+
 	state = hp_dev->state;
 	spin_unlock_irqrestore(&hp_dev->lock, flags);
 
@@ -1471,16 +1479,17 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
 
 	value = gpiod_get_value(app_ctx->desc);
 
-	if (gpio_ctx->pin == hp_dev->prsnt_pin) {
-		if (value) {
-			cx7_hp_send_uevent(hp_dev, REMOVAL_EVT);
-		} else {
-			cx7_hp_send_uevent(hp_dev, PLUG_IN_EVT);
-		}
-		return IRQ_HANDLED;
-	}
-
 	spin_lock_irqsave(&hp_dev->lock, flags);
+
+	if (gpio_ctx->pin == hp_dev->prsnt_pin) {
+		/* Defer uevent to threaded handler (cannot sleep in hardirq) */
+		if (value)
+			hp_dev->pending_uevent = REMOVAL_EVT;
+		else
+			hp_dev->pending_uevent = PLUG_IN_EVT;
+		spin_unlock_irqrestore(&hp_dev->lock, flags);
+		return IRQ_WAKE_THREAD;
+	}
 	if (!hp_dev->hotplug_enabled) {
 		spin_unlock_irqrestore(&hp_dev->lock, flags);
 		return IRQ_HANDLED;
@@ -1796,6 +1805,7 @@ static ssize_t hotplug_enabled_store(struct device *dev,
 				     const char *buf, size_t count)
 {
 	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
+	unsigned long flags;
 	unsigned long val;
 	int err;
 
@@ -1806,8 +1816,11 @@ static ssize_t hotplug_enabled_store(struct device *dev,
 	if (err)
 		return err;
 
+	spin_lock_irqsave(&hp_dev->lock, flags);
 	hp_dev->hotplug_enabled = (val != 0);
-	dev_info(dev, "Hotplug %s\n", hp_dev->hotplug_enabled ? "enabled" : "disabled");
+	spin_unlock_irqrestore(&hp_dev->lock, flags);
+
+	dev_info(dev, "Hotplug %s\n", val ? "enabled" : "disabled");
 
 	return count;
 }
@@ -2172,22 +2185,16 @@ static int cx7_hp_probe(struct platform_device *pdev)
 	int ret, i;
 
 	pd = devm_kzalloc(&pdev->dev, sizeof(*pd), GFP_KERNEL);
-	if (!pd) {
-		dev_err(&pdev->dev,
-			"Failed to allocate memory for platform data\n");
+	if (!pd)
 		return -ENOMEM;
-	}
 
 	ret = cx7_hp_init_pcie_data(pdev, pd);
 	if (ret)
 		return ret;
 
 	hp_dev = devm_kzalloc(&pdev->dev, sizeof(*hp_dev), GFP_KERNEL);
-	if (!hp_dev) {
-		dev_err(&pdev->dev,
-			"Failed to allocate memory for hotplug device\n");
+	if (!hp_dev)
 		return -ENOMEM;
-	}
 
 	hp_dev->pdev = pdev;
 	hp_dev->pd = pd;
@@ -2195,6 +2202,7 @@ static int cx7_hp_probe(struct platform_device *pdev)
 	hp_dev->boot_pin = -1;
 	hp_dev->prsnt_pin = -1;
 	hp_dev->hotplug_enabled = false;
+	hp_dev->pending_uevent = NULL;
 	spin_lock_init(&hp_dev->lock);
 
 	for (i = 0; i < HP_PORT_MAX; i++)
