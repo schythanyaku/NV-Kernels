@@ -1434,11 +1434,10 @@ static irqreturn_t cx7_hp_work(int irq, void *dev_id)
 
 	switch (state) {
 	case STATE_PLUG_OUT:
-		remove_device(hp_dev);
+		/* Hardware power-down handled directly by debug_state_store */
 		break;
 	case STATE_PLUG_IN:
-		dev_info(&hp_dev->pdev->dev, "Cable plugin\n");
-		gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+		/* Hardware power-on handled directly by debug_state_store */
 		break;
 	case STATE_DEV_POWER_OFF:
 	case STATE_DEV_POWER_ON:
