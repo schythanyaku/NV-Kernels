@@ -1434,11 +1434,7 @@ static irqreturn_t cx7_hp_work(int irq, void *dev_id)
 
 	switch (state) {
 	case STATE_PLUG_OUT:
-		/* Hardware power-down handled directly by debug_state_store */
-		break;
 	case STATE_PLUG_IN:
-		/* Hardware power-on handled directly by debug_state_store */
-		break;
 	case STATE_DEV_POWER_OFF:
 	case STATE_DEV_POWER_ON:
 	case STATE_DEV_FW_START:
