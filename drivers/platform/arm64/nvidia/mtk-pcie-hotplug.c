@@ -1973,7 +1973,9 @@ static int cx7_hp_discover_pcie_devices(struct platform_device *pdev,
 {
 	int device_count = 0;
 	bool retry = false;
-	struct cx7_hp_discover_pcie_ctx pcie_ctx = { .pd = pd, .count = &device_count, .retry = &retry };
+	struct cx7_hp_discover_pcie_ctx pcie_ctx = {
+		.pd = pd, .count = &device_count, .retry = &retry
+	};
 	struct pci_dev *root_port = NULL;
 	int i;
 
