@@ -146,6 +146,12 @@ struct cx7_hp_plat_data {
 	struct pinctrl_map *parsed_pinmap;
 };
 
+struct cx7_hp_discover_pcie_ctx {
+	struct cx7_hp_plat_data *pd;
+	int *count;
+	bool *retry;
+};
+
 struct cx7_hp_gpio_ctx {
 	struct gpio_desc *desc;
 	struct gpio_acpi_context *ctx;
@@ -1933,6 +1939,29 @@ static void cx7_hp_put_gpio_device(void *data)
 }
 
 /**
+ * cx7_hp_count_dev_on_bus - Callback for pci_walk_bus to count matching devices
+ * @pci_dev: device being visited
+ * @data: pointer to struct cx7_hp_discover_pcie_ctx
+ *
+ * Returns: 1 to stop walk early, 0 otherwise
+ */
+static int cx7_hp_count_dev_on_bus(struct pci_dev *pci_dev, void *data)
+{
+	struct cx7_hp_discover_pcie_ctx *ctx = data;
+
+	if (pci_dev->vendor != ctx->pd->vendor_id || pci_dev->device != ctx->pd->device_id)
+		return 0;
+
+	if (!pci_dev->state_saved) {
+		*ctx->retry = true;
+		return 1;
+	}
+
+	(*ctx->count)++;
+	return 0;
+}
+
+/**
  * cx7_hp_discover_pcie_devices - Discover existing PCI devices on managed ports
  * @pdev: platform device
  * @pd: platform data
@@ -1942,34 +1971,41 @@ static void cx7_hp_put_gpio_device(void *data)
 static int cx7_hp_discover_pcie_devices(struct platform_device *pdev,
 					struct cx7_hp_plat_data *pd)
 {
-	struct pci_dev *pci_dev = NULL;
 	int device_count = 0;
+	bool retry = false;
+	struct cx7_hp_discover_pcie_ctx pcie_ctx = { .pd = pd, .count = &device_count, .retry = &retry };
+	struct pci_dev *root_port = NULL;
 	int i;
 
 	if (!pd->vendor_id || !pd->device_id)
 		return 0;
 
-	while ((pci_dev = pci_get_device(pd->vendor_id,
-					 pd->device_id, pci_dev)) != NULL) {
-		if (!pci_dev->state_saved) {
-			pci_dev_put(pci_dev);
+	for (i = 0; i < pd->port_nums; i++) {
+		struct pcie_port_info *port = &pd->ports[i];
+
+		root_port = pci_get_domain_bus_and_slot(port->domain,
+							port->bus, port->devfn);
+		if (!root_port) {
+			dev_dbg(&pdev->dev,
+				"Root port not yet available for domain %d bus %d\n",
+				port->domain, port->bus);
 			return -EPROBE_DEFER;
 		}
 
-		for (i = 0; i < pd->port_nums; i++) {
-			if (pci_domain_nr(pci_dev->bus) == pd->ports[i].domain)
-				break;
+		if (!root_port->subordinate) {
+			pci_dev_put(root_port);
+			dev_dbg(&pdev->dev,
+				"Subordinate bus not yet enumerated for domain %d bus %d\n",
+				port->domain, port->bus);
+			return -EPROBE_DEFER;
 		}
 
-		if (i == pd->port_nums) {
-			dev_err(&pdev->dev,
-				"Device %s found on unexpected domain %d\n",
-				pci_name(pci_dev), pci_domain_nr(pci_dev->bus));
-			pci_dev_put(pci_dev);
-			return -ENODEV;
-		}
+		pci_walk_bus(root_port->subordinate, cx7_hp_count_dev_on_bus,
+			     &pcie_ctx);
+		pci_dev_put(root_port);
 
-		device_count++;
+		if (retry)
+			return -EPROBE_DEFER;
 	}
 
 	if (pd->num_devices && device_count != pd->num_devices) {
