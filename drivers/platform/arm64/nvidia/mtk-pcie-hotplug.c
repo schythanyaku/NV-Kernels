@@ -1357,6 +1357,7 @@ static int rescan_device(struct cx7_hp_dev *dev)
 {
 	struct pci_dev *pci_dev;
 	int i, err;
+	int put_until = 0;	/* number of ports we took pm_runtime refs on */
 
 	err = cx7_hp_change_pinctrl_state(dev, "clkreqn");
 	if (err)
@@ -1375,7 +1376,10 @@ static int rescan_device(struct cx7_hp_dev *dev)
 			dev_err(&dev->pdev->dev,
 				"Runtime resume failed for %s: %d\n",
 				pci_name(pci_dev), err);
+			put_until = i;
+			goto out;
 		}
+		put_until = i + 1;
 	}
 
 	gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
@@ -1385,7 +1389,7 @@ static int rescan_device(struct cx7_hp_dev *dev)
 
 	err = polling_link_to_l0(dev);
 	if (err)
-		return err;
+		goto out;
 
 	for (i = 0; i < dev->pd->port_nums; i++) {
 		pci_dev = get_port_root_port(dev, i);
@@ -1394,8 +1398,14 @@ static int rescan_device(struct cx7_hp_dev *dev)
 	}
 
 	msleep(CX7_HP_DELAY_LINK_STABLE_MS);
-
-	return 0;
+	err = 0;
+out:
+	for (i = 0; i < put_until; i++) {
+		pci_dev = get_port_root_port(dev, i);
+		if (pci_dev)
+			pm_runtime_put(&pci_dev->dev);
+	}
+	return err;
 }
 
 /**
