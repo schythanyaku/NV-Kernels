@@ -1242,7 +1242,9 @@ static void retrain_pcie_link(struct pci_dev *dev)
 	pcie_capability_write_word(dev, PCI_EXP_LNKSTA, PCI_EXP_LNKSTA_LBMS);
 }
 
-/* Forward declarations for slot ops */
+/* Forward declarations for slot ops and helpers they call */
+static void remove_device(struct cx7_hp_dev *dev);
+static int rescan_device(struct cx7_hp_dev *dev);
 static int cx7_hp_enable_slot(struct hotplug_slot *slot);
 static int cx7_hp_disable_slot(struct hotplug_slot *slot);
 static int cx7_hp_get_adapter_status(struct hotplug_slot *slot, u8 *value);
