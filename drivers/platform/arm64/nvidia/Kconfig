@@ -5,7 +5,6 @@
 
 config MTK_PCIE_HOTPLUG
 	tristate "CX7 PCIe Hotplug Driver"
-	depends on EINT_MTK
 	depends on PCI && ACPI
 	help
 	  Say Y here to support PCIe device plug in/out detection.
