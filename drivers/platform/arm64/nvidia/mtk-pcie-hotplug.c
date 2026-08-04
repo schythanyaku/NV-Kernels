@@ -1317,25 +1317,47 @@ static void cx7_hp_disable_slot_work(struct work_struct *work)
 	struct pci_bus *bus;
 	struct pci_dev *dev, *tmp;
 
+	dev_err(&hp_dev->pdev->dev, "slot API: disable_slot_work start port %d\n",
+		port_idx);
+
 	bus = slot->root_port->subordinate;
 	if (bus) {
-		dev_err(&hp_dev->pdev->dev, "slot API: disable_slot port %d, remove children\n",
-			 port_idx);
+		dev_err(&hp_dev->pdev->dev,
+			"slot API: disable_slot_work port %d release drivers\n",
+			port_idx);
 		list_for_each_entry_safe(dev, tmp, &bus->devices, bus_list)
 			device_release_driver(&dev->dev);
+		dev_err(&hp_dev->pdev->dev,
+			"slot API: disable_slot_work port %d before pci_lock_rescan_remove\n",
+			port_idx);
 		pci_lock_rescan_remove();
+		dev_err(&hp_dev->pdev->dev,
+			"slot API: disable_slot_work port %d remove children\n",
+			port_idx);
 		list_for_each_entry_safe_reverse(dev, tmp, &bus->devices, bus_list)
 			pci_stop_and_remove_bus_device_locked(dev);
 		pci_unlock_rescan_remove();
+		dev_err(&hp_dev->pdev->dev,
+			"slot API: disable_slot_work port %d after pci_unlock_rescan_remove\n",
+			port_idx);
 	}
 
+	dev_err(&hp_dev->pdev->dev,
+		"slot API: disable_slot_work port %d before slot_mutex (enabled_count=%d)\n",
+		port_idx, hp_dev->slots_enabled_count);
 	mutex_lock(&hp_dev->slot_mutex);
 	if (hp_dev->slots_enabled_count > 0) {
 		hp_dev->slots_enabled_count--;
-		if (hp_dev->slots_enabled_count == 0)
+		if (hp_dev->slots_enabled_count == 0) {
+			dev_err(&hp_dev->pdev->dev,
+				"slot API: disable_slot_work port %d calling remove_device\n",
+				port_idx);
 			remove_device(hp_dev);
+		}
 	}
 	mutex_unlock(&hp_dev->slot_mutex);
+	dev_err(&hp_dev->pdev->dev, "slot API: disable_slot_work done port %d\n",
+		port_idx);
 }
 
 static int cx7_hp_disable_slot(struct hotplug_slot *hotplug_slot)
@@ -1344,7 +1366,13 @@ static int cx7_hp_disable_slot(struct hotplug_slot *hotplug_slot)
 	struct cx7_hp_dev *hp_dev = slot->hp_dev;
 
 	/* Defer to worker to avoid self-deadlock: .remove can take pci_rescan_remove_lock */
+	dev_err(&hp_dev->pdev->dev,
+		"slot API: disable_slot port %d schedule disable_slot_work\n",
+		slot->port_idx);
 	schedule_work(&hp_dev->disable_work[slot->port_idx].work);
+	dev_err(&hp_dev->pdev->dev,
+		"slot API: disable_slot port %d returned after schedule_work\n",
+		slot->port_idx);
 	return 0;
 }
 
