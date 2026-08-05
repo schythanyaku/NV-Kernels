@@ -10,6 +10,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/bitops.h>
 #include <linux/delay.h>
 #include <linux/gpio.h>
 #include <linux/gpio/driver.h>
@@ -208,13 +209,6 @@ struct cx7_hp_slot {
 	struct pci_dev *root_port;
 };
 
-/** Per-slot work to avoid self-deadlock: .remove can take pci_rescan_remove_lock */
-struct cx7_hp_disable_work {
-	struct work_struct work;
-	struct cx7_hp_dev *hp_dev;
-	int port_idx;
-};
-
 /**
  * cx7_hp_dev - Hotplug device structure
  *
@@ -239,7 +233,13 @@ struct cx7_hp_dev {
 	bool pending_prsnt;		/* PRSNT pin fired, thread should schedule prsnt_work */
 	/* PCI hotplug slot API */
 	struct cx7_hp_slot slots[HP_PORT_MAX];
-	struct cx7_hp_disable_work disable_work[HP_PORT_MAX];
+	/*
+	 * Single disable worker + port bitmask: defer remove off disable_slot
+	 * (avoids self-deadlock with mlx5 .remove) and serialize multi-port
+	 * disable so two workers do not contend on pci_rescan_remove_lock.
+	 */
+	struct work_struct disable_work;
+	unsigned long pending_disable_ports;
 	struct work_struct prsnt_work;
 	struct work_struct boot_work;
 	bool cable_present;
@@ -1218,38 +1218,6 @@ static void cx7_hp_rp_bus_protect(struct cx7_hp_dev *dev, int port_idx,
 	}
 }
 
-/**
- * retrain_pcie_link - Retrain PCIe link
- * @dev: PCI device
- */
-static void retrain_pcie_link(struct pci_dev *dev)
-{
-	u16 link_control, lnksta;
-	int pos, i = 0;
-
-	dev_err(&dev->dev, "retrain_pcie_link: %s\n", pci_name(dev));
-	pos = pci_find_capability(dev, PCI_CAP_ID_EXP);
-	if (!pos) {
-		dev_err(&dev->dev, "PCIe capability not found\n");
-		return;
-	}
-
-	pci_read_config_word(dev, pos + PCI_EXP_LNKCTL, &link_control);
-	link_control |= PCI_EXP_LNKCTL_RL;
-
-	pci_write_config_word(dev, pos + PCI_EXP_LNKCTL, link_control);
-
-	while (i < HP_POLL_CNT_MAX) {
-		i++;
-		pcie_capability_read_word(dev, PCI_EXP_LNKSTA, &lnksta);
-		if (lnksta & PCI_EXP_LNKSTA_DLLLA)
-			break;
-		usleep_range(CX7_HP_POLL_SLEEP_US, CX7_HP_POLL_SLEEP_US + 1000);
-	}
-
-	pcie_capability_write_word(dev, PCI_EXP_LNKSTA, PCI_EXP_LNKSTA_LBMS);
-}
-
 /* Forward declarations for slot ops and helpers they call */
 static void remove_device(struct cx7_hp_dev *dev);
 static int rescan_device(struct cx7_hp_dev *dev);
@@ -1304,18 +1272,21 @@ static int cx7_hp_enable_slot(struct hotplug_slot *hotplug_slot)
 }
 
 /**
- * cx7_hp_disable_slot_work - Worker to remove slot children and power down (avoids self-deadlock)
- * Driver .remove (e.g. mlx5) can take pci_rescan_remove_lock; running in a worker avoids
- * the same task holding that lock when we call pci_lock_rescan_remove().
+ * cx7_hp_disable_one_port - Release drivers, remove children, maybe power down HW
+ * @hp_dev: hotplug device
+ * @port_idx: port index
+ *
+ * Must run in process context (workqueue). Caller serializes multi-port
+ * disables so only one port is removed at a time.
  */
-static void cx7_hp_disable_slot_work(struct work_struct *work)
+static void cx7_hp_disable_one_port(struct cx7_hp_dev *hp_dev, int port_idx)
 {
-	struct cx7_hp_disable_work *dwork = container_of(work, struct cx7_hp_disable_work, work);
-	struct cx7_hp_dev *hp_dev = dwork->hp_dev;
-	int port_idx = dwork->port_idx;
 	struct cx7_hp_slot *slot = &hp_dev->slots[port_idx];
 	struct pci_bus *bus;
 	struct pci_dev *dev, *tmp;
+
+	if (!slot->root_port)
+		return;
 
 	dev_err(&hp_dev->pdev->dev, "slot API: disable_slot_work start port %d\n",
 		port_idx);
@@ -1360,16 +1331,36 @@ static void cx7_hp_disable_slot_work(struct work_struct *work)
 		port_idx);
 }
 
+/**
+ * cx7_hp_disable_slot_work - Serialized disable for all pending ports
+ *
+ * Defer off disable_slot so we do not self-deadlock with endpoint .remove
+ * taking pci_rescan_remove_lock. Process one port at a time so two ports
+ * do not contend on that lock in parallel.
+ */
+static void cx7_hp_disable_slot_work(struct work_struct *work)
+{
+	struct cx7_hp_dev *hp_dev = container_of(work, struct cx7_hp_dev, disable_work);
+	unsigned long pending;
+	int port_idx;
+
+	while ((pending = xchg(&hp_dev->pending_disable_ports, 0)) != 0) {
+		for_each_set_bit(port_idx, &pending, HP_PORT_MAX)
+			cx7_hp_disable_one_port(hp_dev, port_idx);
+	}
+}
+
 static int cx7_hp_disable_slot(struct hotplug_slot *hotplug_slot)
 {
 	struct cx7_hp_slot *slot = container_of(hotplug_slot, struct cx7_hp_slot, slot);
 	struct cx7_hp_dev *hp_dev = slot->hp_dev;
 
-	/* Defer to worker to avoid self-deadlock: .remove can take pci_rescan_remove_lock */
+	/* Defer to single worker: avoid self-deadlock + serialize multi-port */
 	dev_err(&hp_dev->pdev->dev,
 		"slot API: disable_slot port %d schedule disable_slot_work\n",
 		slot->port_idx);
-	schedule_work(&hp_dev->disable_work[slot->port_idx].work);
+	set_bit(slot->port_idx, &hp_dev->pending_disable_ports);
+	schedule_work(&hp_dev->disable_work);
 	dev_err(&hp_dev->pdev->dev,
 		"slot API: disable_slot port %d returned after schedule_work\n",
 		slot->port_idx);
@@ -1603,8 +1594,15 @@ static int rescan_device(struct cx7_hp_dev *dev)
 
 	for (i = 0; i < dev->pd->port_nums; i++) {
 		pci_dev = get_port_root_port(dev, i);
-		if (pci_dev)
-			retrain_pcie_link(pci_dev);
+		if (!pci_dev)
+			continue;
+
+		/* use_lt=false: wait on DLLLA (same as former local helper) */
+		err = pcie_retrain_link(pci_dev, false);
+		if (err)
+			dev_err(&dev->pdev->dev,
+				"pcie_retrain_link failed for %s: %d\n",
+				pci_name(pci_dev), err);
 	}
 
 	msleep(CX7_HP_DELAY_LINK_STABLE_MS);
@@ -2414,13 +2412,10 @@ static int cx7_hp_probe(struct platform_device *pdev)
 	hp_dev->last_boot_val = 0;
 	spin_lock_init(&hp_dev->lock);
 	mutex_init(&hp_dev->slot_mutex);
+	hp_dev->pending_disable_ports = 0;
 	INIT_WORK(&hp_dev->prsnt_work, cx7_hp_prsnt_work);
 	INIT_WORK(&hp_dev->boot_work, cx7_hp_boot_work);
-	for (i = 0; i < HP_PORT_MAX; i++) {
-		hp_dev->disable_work[i].hp_dev = hp_dev;
-		hp_dev->disable_work[i].port_idx = i;
-		INIT_WORK(&hp_dev->disable_work[i].work, cx7_hp_disable_slot_work);
-	}
+	INIT_WORK(&hp_dev->disable_work, cx7_hp_disable_slot_work);
 
 	ret = cx7_hp_enumerate_gpios(pdev, hp_dev);
 	if (ret < 0) {
@@ -2539,8 +2534,7 @@ static void cx7_hp_remove(struct platform_device *pdev)
 
 	cancel_work_sync(&hp_dev->prsnt_work);
 	cancel_work_sync(&hp_dev->boot_work);
-	for (i = 0; i < HP_PORT_MAX; i++)
-		cancel_work_sync(&hp_dev->disable_work[i].work);
+	cancel_work_sync(&hp_dev->disable_work);
 	for (i = 0; i < hp_dev->pd->port_nums; i++) {
 		if (hp_dev->slots[i].root_port) {
 			pci_hp_deregister(&hp_dev->slots[i].slot);
