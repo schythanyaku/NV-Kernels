@@ -1265,7 +1265,9 @@ static int cx7_hp_enable_slot(struct hotplug_slot *hotplug_slot)
 	if (bus) {
 		dev_err(&hp_dev->pdev->dev, "slot API: enable_slot port %d, pci_rescan_bus\n",
 			 slot->port_idx);
+		pci_lock_rescan_remove();
 		pci_rescan_bus(bus);
+		pci_unlock_rescan_remove();
 	}
 
 	return 0;
@@ -1392,6 +1394,11 @@ static void cx7_hp_prsnt_work(struct work_struct *work)
 		hp_dev->cable_present = false;
 		hp_dev->boot_state = BOOT_IDLE;
 		cx7_hp_send_uevent(hp_dev, REMOVAL_EVT);
+		mutex_unlock(&hp_dev->slot_mutex);
+		/*
+		 * disable_slot only schedules work today, but do not call slot
+		 * ops under slot_mutex — enable_slot takes that mutex.
+		 */
 		for (i = 0; i < hp_dev->pd->port_nums; i++) {
 			if (hp_dev->slots[i].root_port)
 				hp_dev->slots[i].slot.ops->disable_slot(&hp_dev->slots[i].slot);
@@ -1404,8 +1411,8 @@ static void cx7_hp_prsnt_work(struct work_struct *work)
 		hp_dev->last_boot_val = gpiod_get_value(hp_dev->pins[PCIE_PIN_BOOT].desc);
 		cx7_hp_send_uevent(hp_dev, PLUG_IN_EVT);
 		gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+		mutex_unlock(&hp_dev->slot_mutex);
 	}
-	mutex_unlock(&hp_dev->slot_mutex);
 }
 
 /**
@@ -1417,6 +1424,7 @@ static void cx7_hp_boot_work(struct work_struct *work)
 	struct cx7_hp_dev *hp_dev = container_of(work, struct cx7_hp_dev, boot_work);
 	int boot_val;
 	int i;
+	bool do_enable = false;
 
 	mutex_lock(&hp_dev->slot_mutex);
 	boot_val = gpiod_get_value(hp_dev->pins[PCIE_PIN_BOOT].desc);
@@ -1435,10 +1443,7 @@ static void cx7_hp_boot_work(struct work_struct *work)
 		if (hp_dev->last_boot_val == 0 && boot_val) {
 			dev_err(&hp_dev->pdev->dev, "boot_work: BOOT_READY, enable_slot for all ports\n");
 			hp_dev->boot_state = BOOT_READY;
-			for (i = 0; i < hp_dev->pd->port_nums; i++) {
-				if (hp_dev->slots[i].root_port)
-					hp_dev->slots[i].slot.ops->enable_slot(&hp_dev->slots[i].slot);
-			}
+			do_enable = true;
 		}
 		break;
 	case BOOT_READY:
@@ -1446,6 +1451,17 @@ static void cx7_hp_boot_work(struct work_struct *work)
 	}
 	hp_dev->last_boot_val = boot_val;
 	mutex_unlock(&hp_dev->slot_mutex);
+
+	/*
+	 * enable_slot takes slot_mutex — must not call it while holding
+	 * slot_mutex (non-recursive → self-deadlock).
+	 */
+	if (do_enable) {
+		for (i = 0; i < hp_dev->pd->port_nums; i++) {
+			if (hp_dev->slots[i].root_port)
+				hp_dev->slots[i].slot.ops->enable_slot(&hp_dev->slots[i].slot);
+		}
+	}
 }
 
 /**
