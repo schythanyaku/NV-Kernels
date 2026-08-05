@@ -1298,6 +1298,12 @@ static void cx7_hp_disable_one_port(struct cx7_hp_dev *hp_dev, int port_idx)
 			port_idx);
 		list_for_each_entry_safe(dev, tmp, &bus->devices, bus_list)
 			device_release_driver(&dev->dev);
+		/*
+		 * Hold pci_rescan_remove_lock and call the unlocked helper.
+		 * Do NOT call pci_stop_and_remove_bus_device_locked() here:
+		 * that helper takes the same lock again and self-deadlocks.
+		 * (pciehp does the same: lock + pci_stop_and_remove_bus_device.)
+		 */
 		dev_err(&hp_dev->pdev->dev,
 			"slot API: disable_slot_work port %d before pci_lock_rescan_remove\n",
 			port_idx);
@@ -1306,7 +1312,7 @@ static void cx7_hp_disable_one_port(struct cx7_hp_dev *hp_dev, int port_idx)
 			"slot API: disable_slot_work port %d remove children\n",
 			port_idx);
 		list_for_each_entry_safe_reverse(dev, tmp, &bus->devices, bus_list)
-			pci_stop_and_remove_bus_device_locked(dev);
+			pci_stop_and_remove_bus_device(dev);
 		pci_unlock_rescan_remove();
 		dev_err(&hp_dev->pdev->dev,
 			"slot API: disable_slot_work port %d after pci_unlock_rescan_remove\n",
