@@ -242,6 +242,7 @@ struct cx7_hp_dev {
 	struct cx7_hp_disable_work disable_work[HP_PORT_MAX];
 	struct work_struct prsnt_work;
 	struct work_struct boot_work;
+	struct work_struct probe_hp_work;	/* post-probe cable sync → slot HP */
 	bool cable_present;
 	enum cx7_hp_boot_state boot_state;
 	int slots_enabled_count;	/* 0 = hw down, >0 = hw up */
@@ -1225,6 +1226,7 @@ static int cx7_hp_enable_slot(struct hotplug_slot *slot);
 static int cx7_hp_disable_slot(struct hotplug_slot *slot);
 static int cx7_hp_get_adapter_status(struct hotplug_slot *slot, u8 *value);
 static void cx7_hp_disable_slot_work(struct work_struct *work);
+static void cx7_hp_probe_hp_work(struct work_struct *work);
 
 static const struct hotplug_slot_ops cx7_hp_slot_ops = {
 	.enable_slot		= cx7_hp_enable_slot,
@@ -1887,6 +1889,98 @@ static bool pci_devices_present_on_domain(int domain)
 	return has_endpoint_devices;
 }
 
+static bool cx7_hp_any_pci_devices(struct cx7_hp_dev *hp_dev)
+{
+	int i;
+
+	for (i = 0; i < hp_dev->pd->port_nums; i++) {
+		if (pci_devices_present_on_domain(hp_dev->pd->ports[i].domain))
+			return true;
+	}
+	return false;
+}
+
+static int cx7_hp_registered_slot_count(struct cx7_hp_dev *hp_dev)
+{
+	int i, n = 0;
+
+	for (i = 0; i < hp_dev->pd->port_nums; i++) {
+		if (hp_dev->slots[i].root_port)
+			n++;
+	}
+	return n;
+}
+
+/**
+ * cx7_hp_probe_hp_work - After probe: align PCI/HW with cable presence
+ * @work: work struct
+ *
+ * Probe only registers slots and reports cable via uevent. Actual hotplug
+ * (disable when no cable but CX7 still enumerated, or power-on when cable
+ * but empty) must run after the driver is fully initialized — same role as
+ * the product userspace "boot" path, but owned by the kernel slot API.
+ */
+static void cx7_hp_probe_hp_work(struct work_struct *work)
+{
+	struct cx7_hp_dev *hp_dev = container_of(work, struct cx7_hp_dev,
+						 probe_hp_work);
+	bool devices;
+	int i, nslots;
+
+	hp_dev->cable_present =
+		!gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc);
+	devices = cx7_hp_any_pci_devices(hp_dev);
+	nslots = cx7_hp_registered_slot_count(hp_dev);
+
+	dev_err(&hp_dev->pdev->dev,
+		"probe_hp_work: cable_present=%d devices=%d slots=%d\n",
+		hp_dev->cable_present, devices, nslots);
+
+	if (!hp_dev->cable_present) {
+		if (!devices || !nslots)
+			return;
+		/*
+		 * Seed enabled count so the last disable_slot_work calls
+		 * remove_device (power down). Do not hold slot_mutex across
+		 * disable_slot (it only schedules work today).
+		 */
+		mutex_lock(&hp_dev->slot_mutex);
+		hp_dev->slots_enabled_count = nslots;
+		hp_dev->boot_state = BOOT_IDLE;
+		mutex_unlock(&hp_dev->slot_mutex);
+		dev_err(&hp_dev->pdev->dev,
+			"probe_hp_work: no cable, CX7 present — disable_slot\n");
+		for (i = 0; i < hp_dev->pd->port_nums; i++) {
+			if (hp_dev->slots[i].root_port)
+				hp_dev->slots[i].slot.ops->disable_slot(
+					&hp_dev->slots[i].slot);
+		}
+		return;
+	}
+
+	if (devices) {
+		/* FW already enumerated CX7 — sync software so later unplug works */
+		mutex_lock(&hp_dev->slot_mutex);
+		hp_dev->slots_enabled_count = nslots;
+		hp_dev->boot_state = BOOT_READY;
+		mutex_unlock(&hp_dev->slot_mutex);
+		dev_err(&hp_dev->pdev->dev,
+			"probe_hp_work: cable + devices — seeded enabled_count=%d\n",
+			nslots);
+		return;
+	}
+
+	/* Cable present, no endpoints — start the same path as PRSNT insert */
+	mutex_lock(&hp_dev->slot_mutex);
+	hp_dev->boot_state = BOOT_POWERING_ON;
+	hp_dev->last_boot_val =
+		gpiod_get_value(hp_dev->pins[PCIE_PIN_BOOT].desc);
+	gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+	mutex_unlock(&hp_dev->slot_mutex);
+	dev_err(&hp_dev->pdev->dev,
+		"probe_hp_work: cable, no devices — EN=1 BOOT_POWERING_ON\n");
+}
+
 static ssize_t debug_state_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
@@ -2418,6 +2512,7 @@ static int cx7_hp_probe(struct platform_device *pdev)
 	mutex_init(&hp_dev->slot_mutex);
 	INIT_WORK(&hp_dev->prsnt_work, cx7_hp_prsnt_work);
 	INIT_WORK(&hp_dev->boot_work, cx7_hp_boot_work);
+	INIT_WORK(&hp_dev->probe_hp_work, cx7_hp_probe_hp_work);
 	for (i = 0; i < HP_PORT_MAX; i++) {
 		hp_dev->disable_work[i].hp_dev = hp_dev;
 		hp_dev->disable_work[i].port_idx = i;
@@ -2515,33 +2610,9 @@ static int cx7_hp_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "slot API: registered slot %d (%s)\n", i, slot_name);
 	}
 
-	/*
-	 * No cable at boot: firmware may still have enumerated CX7. Tear down
-	 * via the same disable_slot path as unplug (PCI remove + power down).
-	 * Seed slots_enabled_count so the last port's worker calls remove_device().
-	 */
-	if (!hp_dev->cable_present) {
-		int n = 0;
-
-		for (i = 0; i < hp_dev->pd->port_nums; i++) {
-			if (hp_dev->slots[i].root_port)
-				n++;
-		}
-		if (n) {
-			mutex_lock(&hp_dev->slot_mutex);
-			hp_dev->slots_enabled_count = n;
-			mutex_unlock(&hp_dev->slot_mutex);
-			dev_err(&pdev->dev,
-				"slot API: no cable at probe, disable_slot for %d port(s)\n",
-				n);
-			for (i = 0; i < hp_dev->pd->port_nums; i++) {
-				if (hp_dev->slots[i].root_port)
-					cx7_hp_disable_slot(&hp_dev->slots[i].slot);
-			}
-		}
-	}
-
 	dev_err(&pdev->dev, "PCIe hotplug driver initialized successfully\n");
+	/* Defer cable sync until after probe returns (not mid-probe). */
+	schedule_work(&hp_dev->probe_hp_work);
 	return 0;
 
 sysfs_remove:
@@ -2567,6 +2638,7 @@ static void cx7_hp_remove(struct platform_device *pdev)
 
 	cancel_work_sync(&hp_dev->prsnt_work);
 	cancel_work_sync(&hp_dev->boot_work);
+	cancel_work_sync(&hp_dev->probe_hp_work);
 	for (i = 0; i < HP_PORT_MAX; i++)
 		cancel_work_sync(&hp_dev->disable_work[i].work);
 	for (i = 0; i < hp_dev->pd->port_nums; i++) {
