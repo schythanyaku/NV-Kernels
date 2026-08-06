@@ -2515,6 +2515,32 @@ static int cx7_hp_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "slot API: registered slot %d (%s)\n", i, slot_name);
 	}
 
+	/*
+	 * No cable at boot: firmware may still have enumerated CX7. Tear down
+	 * via the same disable_slot path as unplug (PCI remove + power down).
+	 * Seed slots_enabled_count so the last port's worker calls remove_device().
+	 */
+	if (!hp_dev->cable_present) {
+		int n = 0;
+
+		for (i = 0; i < hp_dev->pd->port_nums; i++) {
+			if (hp_dev->slots[i].root_port)
+				n++;
+		}
+		if (n) {
+			mutex_lock(&hp_dev->slot_mutex);
+			hp_dev->slots_enabled_count = n;
+			mutex_unlock(&hp_dev->slot_mutex);
+			dev_err(&pdev->dev,
+				"slot API: no cable at probe, disable_slot for %d port(s)\n",
+				n);
+			for (i = 0; i < hp_dev->pd->port_nums; i++) {
+				if (hp_dev->slots[i].root_port)
+					cx7_hp_disable_slot(&hp_dev->slots[i].slot);
+			}
+		}
+	}
+
 	dev_err(&pdev->dev, "PCIe hotplug driver initialized successfully\n");
 	return 0;
 
