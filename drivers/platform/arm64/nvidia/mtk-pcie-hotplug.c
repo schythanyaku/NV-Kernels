@@ -46,6 +46,8 @@
 #define CX7_HP_DELAY_PHY_RESET_US	3000	/* PHY reset delay */
 #define CX7_HP_DELAY_LINK_STABLE_MS	100	/* Link stabilization delay (ms) */
 #define CX7_HP_POLL_SLEEP_US		10000	/* Polling loop sleep interval */
+/* BOOT FW ready poll: 10ms * 3000 ≈ 30s (CX7 firmware can take seconds) */
+#define CX7_HP_BOOT_POLL_MAX		3000
 
 #define PLUG_IN_EVT "HOTPLUG_STATE=plugin"
 #define REMOVAL_EVT "HOTPLUG_STATE=removal"
@@ -1554,6 +1556,70 @@ static int polling_link_to_l0(struct cx7_hp_dev *dev)
 }
 
 /**
+ * cx7_hp_ensure_powered_and_fw_ready - EN=1 and wait for BOOT ready
+ * @dev: hotplug device
+ *
+ * Cable plug-in path sets EN and waits via boot_work before enable_slot.
+ * Slot-power / first enable_slot after remove_device must do the same or
+ * rescan_device will poll L0 with CX7 still off (ETIMEDOUT).
+ *
+ * Caller must hold slot_mutex.
+ *
+ * Returns: 0 on success, -ETIMEDOUT if BOOT never becomes ready
+ */
+static int cx7_hp_ensure_powered_and_fw_ready(struct cx7_hp_dev *dev)
+{
+	int boot_val, last;
+	int count = 0;
+	enum cx7_hp_boot_state st;
+
+	if (dev->boot_state == BOOT_READY &&
+	    gpiod_get_value(dev->pins[PCIE_PIN_EN].desc))
+		return 0;
+
+	dev_err(&dev->pdev->dev,
+		"rescan_device: EN=1, wait for BOOT ready (was boot_state=%d)\n",
+		dev->boot_state);
+	gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 1);
+	st = BOOT_POWERING_ON;
+	last = gpiod_get_value(dev->pins[PCIE_PIN_BOOT].desc);
+
+	while (st != BOOT_READY) {
+		boot_val = gpiod_get_value(dev->pins[PCIE_PIN_BOOT].desc);
+		switch (st) {
+		case BOOT_POWERING_ON:
+			if (boot_val)
+				st = BOOT_FW_LOADING;
+			break;
+		case BOOT_FW_LOADING:
+			/* BOOT low then high = firmware ready (same as boot_work) */
+			if (last == 0 && boot_val)
+				st = BOOT_READY;
+			break;
+		default:
+			break;
+		}
+		last = boot_val;
+		if (st == BOOT_READY)
+			break;
+
+		usleep_range(CX7_HP_POLL_SLEEP_US, CX7_HP_POLL_SLEEP_US + 1000);
+		if (++count > CX7_HP_BOOT_POLL_MAX) {
+			dev_err(&dev->pdev->dev,
+				"Timeout waiting for CX7 BOOT ready\n");
+			dev->boot_state = BOOT_IDLE;
+			return -ETIMEDOUT;
+		}
+	}
+
+	dev->boot_state = BOOT_READY;
+	dev->last_boot_val = boot_val;
+	dev_err(&dev->pdev->dev, "rescan_device: BOOT ready after %d poll(s)\n",
+		count);
+	return 0;
+}
+
+/**
  * rescan_device - Rescan PCIe bus to discover devices
  * @dev: hotplug device
  *
@@ -1566,6 +1632,10 @@ static int rescan_device(struct cx7_hp_dev *dev)
 	int put_until = 0;
 
 	dev_err(&dev->pdev->dev, "rescan_device: start (pinctrl, CKM, PERST, bus protect, L0, retrain)\n");
+	err = cx7_hp_ensure_powered_and_fw_ready(dev);
+	if (err)
+		return err;
+
 	err = cx7_hp_change_pinctrl_state(dev, "clkreqn");
 	if (err)
 		return err;
