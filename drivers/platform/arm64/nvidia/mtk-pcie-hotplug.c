@@ -10,12 +10,13 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/completion.h>
 #include <linux/delay.h>
-#include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
 #include <linux/gpio/driver.h>
 #include <linux/interrupt.h>
-#include <linux/list.h>
 #include <linux/kernel.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/pci_hotplug.h>
@@ -48,9 +49,6 @@
 #define CX7_HP_POLL_SLEEP_US		10000	/* Polling loop sleep interval */
 /* BOOT FW ready poll: 10ms * 3000 ≈ 30s (CX7 firmware can take seconds) */
 #define CX7_HP_BOOT_POLL_MAX		3000
-
-#define PLUG_IN_EVT "HOTPLUG_STATE=plugin"
-#define REMOVAL_EVT "HOTPLUG_STATE=removal"
 
 /* Bus protection stages to prevent PCIe core reset glitches */
 #define BUS_PROTECT_INIT		0
@@ -117,12 +115,9 @@ struct gpio_acpi_context {
 	unsigned int debounce_timeout_us;
 	int pin;
 	int wake_capable;
-	int triggering;
-	int polarity;
 	unsigned long irq_flags;
 	int valid;
 	unsigned int connection_type;
-	char vendor_data[MAX_VENDOR_DATA_LEN + 1];
 };
 
 struct cx7_hp_dev;
@@ -164,18 +159,12 @@ struct acpi_gpio_parse_context {
 	struct cx7_hp_dev *hp_dev;
 };
 
+/* First-pass _CRS walk: only pin + controller name needed for desc lookup */
 struct acpi_gpio_walk_context {
 	struct device *dev;
 	struct gpio_info {
 		unsigned int pin;
-		unsigned int connection_type;
-		unsigned int triggering;
-		unsigned int polarity;
-		unsigned int debounce_timeout;
-		unsigned int wake_capable;
-		char vendor_data[MAX_VENDOR_DATA_LEN + 1];
 		char resource_source[16];
-		unsigned int resource_source_index;
 	} gpios[PCIE_PIN_MAX];
 	int count;
 };
@@ -185,12 +174,6 @@ struct cx7_hp_acpi_mmio {
 	    mmio_regions[CX7_HP_MMIO_REGION_COUNT];
 	int count;
 	struct device *dev;
-};
-
-enum cx7_hp_debug_val {
-	CX7_HP_DEBUG_PLUG_OUT = 0,
-	CX7_HP_DEBUG_PLUG_IN,
-	CX7_HP_DEBUG_MAX_VAL
 };
 
 struct cx7_hp_mmio_runtime {
@@ -231,7 +214,6 @@ struct cx7_hp_dev {
 	int gpio_count;
 	int boot_pin;
 	int prsnt_pin;
-	enum cx7_hp_debug_val debug_state;
 	bool hotplug_enabled;
 	spinlock_t lock;
 	struct mutex slot_mutex;	/* protects slot ops and BOOT/PRSNT work */
@@ -250,6 +232,8 @@ struct cx7_hp_dev {
 	int slots_enabled_count;	/* 0 = hw down, >0 = hw up */
 	bool pending_boot;		/* boot pin fired, thread should schedule boot_work */
 	int last_boot_val;		/* previous BOOT pin value for state machine */
+	struct completion boot_fw_ready; /* signaled when boot_work reaches BOOT_READY */
+	bool boot_irq_waiter;		/* enable_slot waiting on boot_fw_ready (no nested enable) */
 };
 
 /* ACPI _DSD device properties GUID: daffd814-6eba-4d8c-8a91-bc9bbf4aa301 */
@@ -523,19 +507,6 @@ static int cx7_hp_change_pinctrl_state(struct cx7_hp_dev *hp_dev,
 	}
 
 	return 0;
-}
-
-/**
- * cx7_hp_send_uevent - Send uevent to userspace
- * @hp_dev: hotplug device
- * @msg: uevent message string
- */
-static void cx7_hp_send_uevent(struct cx7_hp_dev *hp_dev, const char *msg)
-{
-	char *envp[2] = { (char *)msg, NULL };
-
-	if (kobject_uevent_env(&hp_dev->pdev->dev.kobj, KOBJ_CHANGE, envp))
-		dev_err(&hp_dev->pdev->dev, "Failed to send uevent\n");
 }
 
 /**
@@ -1230,6 +1201,49 @@ static int cx7_hp_get_adapter_status(struct hotplug_slot *slot, u8 *value);
 static void cx7_hp_disable_slot_work(struct work_struct *work);
 static void cx7_hp_probe_hp_work(struct work_struct *work);
 
+static bool cx7_hp_is_enabled(struct cx7_hp_dev *hp_dev)
+{
+	unsigned long flags;
+	bool enabled;
+
+	spin_lock_irqsave(&hp_dev->lock, flags);
+	enabled = hp_dev->hotplug_enabled;
+	spin_unlock_irqrestore(&hp_dev->lock, flags);
+	return enabled;
+}
+
+/**
+ * cx7_hp_power_on_start - Arm BOOT SM and assert EN
+ * @hp_dev: hotplug device
+ *
+ * Caller must hold slot_mutex. Shared by cable plug, probe sync, and
+ * ensure_powered (slot-power) so there is one power-on sequence.
+ */
+static void cx7_hp_power_on_start(struct cx7_hp_dev *hp_dev)
+{
+	hp_dev->boot_state = BOOT_POWERING_ON;
+	hp_dev->last_boot_val =
+		gpiod_get_value(hp_dev->pins[PCIE_PIN_BOOT].desc);
+	gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+}
+
+/**
+ * cx7_hp_disable_all_slots - disable_slot for every registered port
+ * @hp_dev: hotplug device
+ *
+ * Must not be called while holding slot_mutex (slot ops take it).
+ */
+static void cx7_hp_disable_all_slots(struct cx7_hp_dev *hp_dev)
+{
+	int i;
+
+	for (i = 0; i < hp_dev->pd->port_nums; i++) {
+		if (hp_dev->slots[i].root_port)
+			hp_dev->slots[i].slot.ops->disable_slot(
+				&hp_dev->slots[i].slot);
+	}
+}
+
 static const struct hotplug_slot_ops cx7_hp_slot_ops = {
 	.enable_slot		= cx7_hp_enable_slot,
 	.disable_slot		= cx7_hp_disable_slot,
@@ -1252,6 +1266,9 @@ static int cx7_hp_enable_slot(struct hotplug_slot *hotplug_slot)
 	struct cx7_hp_dev *hp_dev = slot->hp_dev;
 	struct pci_bus *bus;
 	int err = 0;
+
+	if (!cx7_hp_is_enabled(hp_dev))
+		return -EPERM;
 
 	mutex_lock(&hp_dev->slot_mutex);
 	if (hp_dev->slots_enabled_count == 0) {
@@ -1351,6 +1368,9 @@ static int cx7_hp_disable_slot(struct hotplug_slot *hotplug_slot)
 	struct cx7_hp_slot *slot = container_of(hotplug_slot, struct cx7_hp_slot, slot);
 	struct cx7_hp_dev *hp_dev = slot->hp_dev;
 
+	if (!cx7_hp_is_enabled(hp_dev))
+		return -EPERM;
+
 	dev_err(&hp_dev->pdev->dev,
 		"slot API: disable_slot port %d schedule disable_slot_work\n",
 		slot->port_idx);
@@ -1369,7 +1389,9 @@ static void cx7_hp_prsnt_work(struct work_struct *work)
 {
 	struct cx7_hp_dev *hp_dev = container_of(work, struct cx7_hp_dev, prsnt_work);
 	int prsnt_val;
-	int i;
+
+	if (!cx7_hp_is_enabled(hp_dev))
+		return;
 
 	prsnt_val = gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc);
 	/* PRSNT low = cable inserted */
@@ -1379,24 +1401,13 @@ static void cx7_hp_prsnt_work(struct work_struct *work)
 		dev_err(&hp_dev->pdev->dev, "prsnt_work: cable removed, disable_slot for all ports\n");
 		hp_dev->cable_present = false;
 		hp_dev->boot_state = BOOT_IDLE;
-		cx7_hp_send_uevent(hp_dev, REMOVAL_EVT);
 		mutex_unlock(&hp_dev->slot_mutex);
-		/*
-		 * disable_slot only schedules work today, but do not call slot
-		 * ops under slot_mutex — enable_slot takes that mutex.
-		 */
-		for (i = 0; i < hp_dev->pd->port_nums; i++) {
-			if (hp_dev->slots[i].root_port)
-				hp_dev->slots[i].slot.ops->disable_slot(&hp_dev->slots[i].slot);
-		}
+		cx7_hp_disable_all_slots(hp_dev);
 	} else {
 		/* Cable inserted */
 		dev_err(&hp_dev->pdev->dev, "prsnt_work: cable inserted, EN=1 boot_state=BOOT_POWERING_ON\n");
 		hp_dev->cable_present = true;
-		hp_dev->boot_state = BOOT_POWERING_ON;
-		hp_dev->last_boot_val = gpiod_get_value(hp_dev->pins[PCIE_PIN_BOOT].desc);
-		cx7_hp_send_uevent(hp_dev, PLUG_IN_EVT);
-		gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+		cx7_hp_power_on_start(hp_dev);
 		mutex_unlock(&hp_dev->slot_mutex);
 	}
 }
@@ -1411,6 +1422,9 @@ static void cx7_hp_boot_work(struct work_struct *work)
 	int boot_val;
 	int i;
 	bool do_enable = false;
+
+	if (!cx7_hp_is_enabled(hp_dev))
+		return;
 
 	mutex_lock(&hp_dev->slot_mutex);
 	boot_val = gpiod_get_value(hp_dev->pins[PCIE_PIN_BOOT].desc);
@@ -1427,9 +1441,15 @@ static void cx7_hp_boot_work(struct work_struct *work)
 	case BOOT_FW_LOADING:
 		/* BOOT low then high = firmware ready */
 		if (hp_dev->last_boot_val == 0 && boot_val) {
-			dev_err(&hp_dev->pdev->dev, "boot_work: BOOT_READY, enable_slot for all ports\n");
+			dev_err(&hp_dev->pdev->dev, "boot_work: BOOT_READY\n");
 			hp_dev->boot_state = BOOT_READY;
-			do_enable = true;
+			/*
+			 * Physical plug: nobody is blocked in enable_slot yet —
+			 * call enable_slot. Slot-power / ensure path: a waiter
+			 * holds the bring-up; only signal completion.
+			 */
+			do_enable = !hp_dev->boot_irq_waiter;
+			complete_all(&hp_dev->boot_fw_ready);
 		}
 		break;
 	case BOOT_READY:
@@ -1443,6 +1463,7 @@ static void cx7_hp_boot_work(struct work_struct *work)
 	 * slot_mutex (non-recursive → self-deadlock).
 	 */
 	if (do_enable) {
+		dev_err(&hp_dev->pdev->dev, "boot_work: enable_slot for all ports\n");
 		for (i = 0; i < hp_dev->pd->port_nums; i++) {
 			if (hp_dev->slots[i].root_port)
 				hp_dev->slots[i].slot.ops->enable_slot(&hp_dev->slots[i].slot);
@@ -1499,6 +1520,8 @@ static void remove_device(struct cx7_hp_dev *dev)
 	cx7_hp_change_pinctrl_state(dev, "default");
 	cx7_hp_ckm_control(dev, true);
 	gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
+	dev->boot_state = BOOT_IDLE;
+	complete_all(&dev->boot_fw_ready);
 }
 
 /**
@@ -1556,67 +1579,56 @@ static int polling_link_to_l0(struct cx7_hp_dev *dev)
 }
 
 /**
- * cx7_hp_ensure_powered_and_fw_ready - EN=1 and wait for BOOT ready
+ * cx7_hp_ensure_powered_and_fw_ready - EN=1 and wait for BOOT ready via IRQ
  * @dev: hotplug device
  *
- * Cable plug-in path sets EN and waits via boot_work before enable_slot.
- * Slot-power / first enable_slot after remove_device must do the same or
- * rescan_device will poll L0 with CX7 still off (ETIMEDOUT).
+ * Arms the same BOOT state machine as cable plug-in, then waits for
+ * boot_work (BOOT GPIO IRQs) to reach BOOT_READY. Used when enable_slot
+ * runs before FW is ready (e.g. slot power after remove_device).
  *
- * Caller must hold slot_mutex.
+ * Caller must hold slot_mutex on entry; it may be dropped while waiting.
  *
  * Returns: 0 on success, -ETIMEDOUT if BOOT never becomes ready
  */
 static int cx7_hp_ensure_powered_and_fw_ready(struct cx7_hp_dev *dev)
 {
-	int boot_val, last;
-	int count = 0;
-	enum cx7_hp_boot_state st;
+	unsigned long timeout;
+	int ret = 0;
 
 	if (dev->boot_state == BOOT_READY &&
 	    gpiod_get_value(dev->pins[PCIE_PIN_EN].desc))
 		return 0;
 
 	dev_err(&dev->pdev->dev,
-		"rescan_device: EN=1, wait for BOOT ready (was boot_state=%d)\n",
+		"rescan_device: EN=1, wait for BOOT IRQ ready (was boot_state=%d)\n",
 		dev->boot_state);
-	gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 1);
-	st = BOOT_POWERING_ON;
-	last = gpiod_get_value(dev->pins[PCIE_PIN_BOOT].desc);
 
-	while (st != BOOT_READY) {
-		boot_val = gpiod_get_value(dev->pins[PCIE_PIN_BOOT].desc);
-		switch (st) {
-		case BOOT_POWERING_ON:
-			if (boot_val)
-				st = BOOT_FW_LOADING;
-			break;
-		case BOOT_FW_LOADING:
-			/* BOOT low then high = firmware ready (same as boot_work) */
-			if (last == 0 && boot_val)
-				st = BOOT_READY;
-			break;
-		default:
-			break;
-		}
-		last = boot_val;
-		if (st == BOOT_READY)
-			break;
+	reinit_completion(&dev->boot_fw_ready);
+	dev->boot_irq_waiter = true;
+	cx7_hp_power_on_start(dev);
+	mutex_unlock(&dev->slot_mutex);
 
-		usleep_range(CX7_HP_POLL_SLEEP_US, CX7_HP_POLL_SLEEP_US + 1000);
-		if (++count > CX7_HP_BOOT_POLL_MAX) {
-			dev_err(&dev->pdev->dev,
-				"Timeout waiting for CX7 BOOT ready\n");
-			dev->boot_state = BOOT_IDLE;
-			return -ETIMEDOUT;
-		}
+	/* Kick in case BOOT level already matches without a new edge */
+	schedule_work(&dev->boot_work);
+
+	timeout = wait_for_completion_timeout(
+		&dev->boot_fw_ready,
+		msecs_to_jiffies(CX7_HP_BOOT_POLL_MAX *
+				 (CX7_HP_POLL_SLEEP_US / 1000)));
+
+	mutex_lock(&dev->slot_mutex);
+	dev->boot_irq_waiter = false;
+
+	if (!timeout || dev->boot_state != BOOT_READY) {
+		dev_err(&dev->pdev->dev,
+			"Timeout waiting for CX7 BOOT ready (IRQ path)\n");
+		dev->boot_state = BOOT_IDLE;
+		ret = -ETIMEDOUT;
+	} else {
+		dev_err(&dev->pdev->dev, "rescan_device: BOOT ready via boot_work\n");
 	}
 
-	dev->boot_state = BOOT_READY;
-	dev->last_boot_val = boot_val;
-	dev_err(&dev->pdev->dev, "rescan_device: BOOT ready after %d poll(s)\n",
-		count);
-	return 0;
+	return ret;
 }
 
 /**
@@ -1745,9 +1757,6 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
 	struct cx7_hp_dev *hp_dev = app_ctx->hp_dev;
 	struct gpio_acpi_context *gpio_ctx = app_ctx->ctx;
 	unsigned long flags;
-	int value;
-
-	value = gpiod_get_value(app_ctx->desc);
 
 	spin_lock_irqsave(&hp_dev->lock, flags);
 
@@ -1763,10 +1772,10 @@ static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
 		return IRQ_WAKE_THREAD;
 	}
 
+	spin_unlock_irqrestore(&hp_dev->lock, flags);
 	dev_err(gpio_ctx->dev,
 		"Unknown GPIO pin event: pin=%d irq=%d value=%d\n",
-		gpio_ctx->pin, irq, value);
-	spin_unlock_irqrestore(&hp_dev->lock, flags);
+		gpio_ctx->pin, irq, gpiod_get_value(app_ctx->desc));
 	return IRQ_HANDLED;
 }
 
@@ -1802,22 +1811,6 @@ static acpi_status acpi_gpio_collect_handler(struct acpi_resource *ares,
 	}
 
 	walk_ctx->gpios[walk_ctx->count].pin = agpio->pin_table[0];
-	walk_ctx->gpios[walk_ctx->count].connection_type =
-	    agpio->connection_type;
-	walk_ctx->gpios[walk_ctx->count].triggering = agpio->triggering;
-	walk_ctx->gpios[walk_ctx->count].polarity = agpio->polarity;
-	walk_ctx->gpios[walk_ctx->count].debounce_timeout =
-	    agpio->debounce_timeout;
-	walk_ctx->gpios[walk_ctx->count].wake_capable = agpio->wake_capable;
-
-	if (agpio->vendor_length && agpio->vendor_data) {
-		length = min_t(int, agpio->vendor_length, MAX_VENDOR_DATA_LEN);
-		memcpy(walk_ctx->gpios[walk_ctx->count].vendor_data,
-		       agpio->vendor_data, length);
-		walk_ctx->gpios[walk_ctx->count].vendor_data[length] = '\0';
-	} else {
-		walk_ctx->gpios[walk_ctx->count].vendor_data[0] = '\0';
-	}
 
 	if (agpio->resource_source.string_ptr) {
 		length = min_t(int, agpio->resource_source.string_length, 15);
@@ -1827,8 +1820,6 @@ static acpi_status acpi_gpio_collect_handler(struct acpi_resource *ares,
 	} else {
 		walk_ctx->gpios[walk_ctx->count].resource_source[0] = '\0';
 	}
-	walk_ctx->gpios[walk_ctx->count].resource_source_index =
-	    agpio->resource_source.index;
 	walk_ctx->count++;
 	return AE_OK;
 }
@@ -1888,6 +1879,7 @@ static acpi_status acpi_gpio_lookup_handler(struct acpi_resource *ares,
 	struct gpio_acpi_context *ctx = parse_ctx->ctx;
 	struct cx7_hp_dev *hp_dev = parse_ctx->hp_dev;
 	struct acpi_resource_gpio *agpio;
+	char vendor[MAX_VENDOR_DATA_LEN + 1];
 	int length;
 
 	if (ares->type != ACPI_RESOURCE_TYPE_GPIO)
@@ -1901,18 +1893,16 @@ static acpi_status acpi_gpio_lookup_handler(struct acpi_resource *ares,
 	ctx->valid = 1;
 	ctx->debounce_timeout_us = agpio->debounce_timeout * 10;
 	ctx->wake_capable = agpio->wake_capable;
-	ctx->triggering = agpio->triggering;
-	ctx->polarity = agpio->polarity;
 	ctx->connection_type = agpio->connection_type;
 
 	if (agpio->vendor_length && agpio->vendor_data && hp_dev) {
 		length = min_t(int, agpio->vendor_length, MAX_VENDOR_DATA_LEN);
-		memcpy(&ctx->vendor_data[0], agpio->vendor_data, length);
-		ctx->vendor_data[length] = '\0';
+		memcpy(vendor, agpio->vendor_data, length);
+		vendor[length] = '\0';
 
-		if (!strncmp("BOOT", ctx->vendor_data, strlen("BOOT")))
+		if (!strncmp(vendor, "BOOT", 4))
 			hp_dev->boot_pin = ctx->pin;
-		else if (!strncmp("PRSNT", ctx->vendor_data, strlen("PRSNT")))
+		else if (!strncmp(vendor, "PRSNT", 5))
 			hp_dev->prsnt_pin = ctx->pin;
 	}
 
@@ -1982,20 +1972,24 @@ static int cx7_hp_registered_slot_count(struct cx7_hp_dev *hp_dev)
 }
 
 /**
- * cx7_hp_probe_hp_work - After probe: align PCI/HW with cable presence
+ * cx7_hp_probe_hp_work - Align PCI/HW with cable when hotplug is enabled
  * @work: work struct
  *
- * Probe only registers slots and reports cable via uevent. Actual hotplug
- * (disable when no cable but CX7 still enumerated, or power-on when cable
- * but empty) must run after the driver is fully initialized — same role as
- * the product userspace "boot" path, but owned by the kernel slot API.
+ * Runs after userspace enables hotplug (not mid-probe). If hotplug is off,
+ * leave hardware/PCI as-is. Owned by the kernel slot API.
  */
 static void cx7_hp_probe_hp_work(struct work_struct *work)
 {
 	struct cx7_hp_dev *hp_dev = container_of(work, struct cx7_hp_dev,
 						 probe_hp_work);
 	bool devices;
-	int i, nslots;
+	int nslots;
+
+	if (!cx7_hp_is_enabled(hp_dev)) {
+		dev_err(&hp_dev->pdev->dev,
+			"probe_hp_work: hotplug disabled, skip cable sync\n");
+		return;
+	}
 
 	hp_dev->cable_present =
 		!gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc);
@@ -2020,11 +2014,7 @@ static void cx7_hp_probe_hp_work(struct work_struct *work)
 		mutex_unlock(&hp_dev->slot_mutex);
 		dev_err(&hp_dev->pdev->dev,
 			"probe_hp_work: no cable, CX7 present — disable_slot\n");
-		for (i = 0; i < hp_dev->pd->port_nums; i++) {
-			if (hp_dev->slots[i].root_port)
-				hp_dev->slots[i].slot.ops->disable_slot(
-					&hp_dev->slots[i].slot);
-		}
+		cx7_hp_disable_all_slots(hp_dev);
 		return;
 	}
 
@@ -2042,92 +2032,11 @@ static void cx7_hp_probe_hp_work(struct work_struct *work)
 
 	/* Cable present, no endpoints — start the same path as PRSNT insert */
 	mutex_lock(&hp_dev->slot_mutex);
-	hp_dev->boot_state = BOOT_POWERING_ON;
-	hp_dev->last_boot_val =
-		gpiod_get_value(hp_dev->pins[PCIE_PIN_BOOT].desc);
-	gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
+	cx7_hp_power_on_start(hp_dev);
 	mutex_unlock(&hp_dev->slot_mutex);
 	dev_err(&hp_dev->pdev->dev,
 		"probe_hp_work: cable, no devices — EN=1 BOOT_POWERING_ON\n");
 }
-
-static ssize_t debug_state_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
-
-	if (!hp_dev)
-		return -EINVAL;
-
-	return scnprintf(buf, PAGE_SIZE, "%d\n", hp_dev->debug_state);
-}
-
-static ssize_t debug_state_store(struct device *dev,
-				 struct device_attribute *attr,
-				 const char *buf, size_t count)
-{
-	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
-	unsigned long val, flags;
-	int err, i;
-
-	if (!hp_dev || !hp_dev->pd)
-		return -EINVAL;
-
-	err = kstrtoul(buf, 10, &val);
-	if (err)
-		return err;
-
-	spin_lock_irqsave(&hp_dev->lock, flags);
-	if (!hp_dev->hotplug_enabled) {
-		spin_unlock_irqrestore(&hp_dev->lock, flags);
-		dev_err(dev, "Hotplug is disabled.\n");
-		return -EPERM;
-	}
-	spin_unlock_irqrestore(&hp_dev->lock, flags);
-
-	switch (val) {
-	case CX7_HP_DEBUG_PLUG_OUT:
-		/* Safety check: Verify no devices on the bus before hardware shutdown. */
-		for (i = 0; i < hp_dev->pd->port_nums; i++) {
-			if (pci_devices_present_on_domain
-			    (hp_dev->pd->ports[i].domain)) {
-				dev_err(dev,
-					"PCI devices still present, remove them first\n");
-				return -EBUSY;
-			}
-		}
-
-		spin_lock_irqsave(&hp_dev->lock, flags);
-		hp_dev->debug_state = val;
-		spin_unlock_irqrestore(&hp_dev->lock, flags);
-		remove_device(hp_dev);
-		return count;
-
-	case CX7_HP_DEBUG_PLUG_IN:
-		for (i = 0; i < hp_dev->pd->port_nums; i++) {
-			if (pci_devices_present_on_domain
-			    (hp_dev->pd->ports[i].domain)) {
-				dev_err(dev,
-					"PCI devices already present, cannot reinitialize hardware\n");
-				return -EBUSY;
-			}
-		}
-
-		spin_lock_irqsave(&hp_dev->lock, flags);
-		hp_dev->debug_state = val;
-		spin_unlock_irqrestore(&hp_dev->lock, flags);
-		dev_err(dev, "Cable plugin\n");
-		gpiod_set_value(hp_dev->pins[PCIE_PIN_EN].desc, 1);
-		return count;
-
-	default:
-		return -EINVAL;
-	}
-
-	return count;
-}
-
-DEVICE_ATTR_RW(debug_state);
 
 static ssize_t hotplug_enabled_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
@@ -2147,6 +2056,7 @@ static ssize_t hotplug_enabled_store(struct device *dev,
 	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
 	unsigned long flags;
 	unsigned long val;
+	bool was_enabled, now_enabled;
 	int err;
 
 	if (!hp_dev)
@@ -2157,10 +2067,19 @@ static ssize_t hotplug_enabled_store(struct device *dev,
 		return err;
 
 	spin_lock_irqsave(&hp_dev->lock, flags);
+	was_enabled = hp_dev->hotplug_enabled;
 	hp_dev->hotplug_enabled = (val != 0);
+	now_enabled = hp_dev->hotplug_enabled;
 	spin_unlock_irqrestore(&hp_dev->lock, flags);
 
-	dev_err(dev, "Hotplug %s\n", val ? "enabled" : "disabled");
+	dev_err(dev, "Hotplug %s\n", now_enabled ? "enabled" : "disabled");
+
+	/*
+	 * Enabling: run cable sync (boot tear-down / power-on). Disabling:
+	 * stop reacting to new events; do not reverse current PCI/HW state.
+	 */
+	if (now_enabled && !was_enabled)
+		schedule_work(&hp_dev->probe_hp_work);
 
 	return count;
 }
@@ -2168,7 +2087,6 @@ static ssize_t hotplug_enabled_store(struct device *dev,
 DEVICE_ATTR_RW(hotplug_enabled);
 
 static struct attribute *cx7_hp_attrs[] = {
-	&dev_attr_debug_state.attr,
 	&dev_attr_hotplug_enabled.attr,
 	NULL
 };
@@ -2578,6 +2496,8 @@ static int cx7_hp_probe(struct platform_device *pdev)
 	hp_dev->slots_enabled_count = 0;
 	hp_dev->boot_state = BOOT_IDLE;
 	hp_dev->last_boot_val = 0;
+	hp_dev->boot_irq_waiter = false;
+	init_completion(&hp_dev->boot_fw_ready);
 	spin_lock_init(&hp_dev->lock);
 	mutex_init(&hp_dev->slot_mutex);
 	INIT_WORK(&hp_dev->prsnt_work, cx7_hp_prsnt_work);
@@ -2646,14 +2566,6 @@ static int cx7_hp_probe(struct platform_device *pdev)
 		goto sysfs_remove;
 	}
 
-	if (hp_dev->cable_present) {
-		hp_dev->debug_state = CX7_HP_DEBUG_PLUG_IN;
-		cx7_hp_send_uevent(hp_dev, PLUG_IN_EVT);
-	} else {
-		hp_dev->debug_state = CX7_HP_DEBUG_PLUG_OUT;
-		cx7_hp_send_uevent(hp_dev, REMOVAL_EVT);
-	}
-
 	for (i = 0; i < hp_dev->pd->port_nums; i++) {
 		struct pci_dev *rp = get_port_root_port(hp_dev, i);
 		char slot_name[24];
@@ -2681,8 +2593,10 @@ static int cx7_hp_probe(struct platform_device *pdev)
 	}
 
 	dev_err(&pdev->dev, "PCIe hotplug driver initialized successfully\n");
-	/* Defer cable sync until after probe returns (not mid-probe). */
-	schedule_work(&hp_dev->probe_hp_work);
+	/*
+	 * Cable sync runs when userspace enables hotplug_enabled (0→1),
+	 * not at probe — HP stays inert until then.
+	 */
 	return 0;
 
 sysfs_remove:
