@@ -3,10 +3,10 @@
  * Copyright (c) 2014-2025 MediaTek Inc.
  * Copyright (c) 2025-2026 NVIDIA Corporation
  *
- * CX7 PCIe Hotplug Driver
+ * Tegra254 PCIe hotplug driver for NVIDIA DGX Spark
  *
- * Manages PCIe device hotplug using GPIO interrupts and ACPI resources.
- * Supports cable insertion/removal detection and device power management.
+ * Manages PCIe link power / hotplug for the CX7 endpoint using GPIO
+ * interrupts and ACPI resources (cable detect, bring-up, tear-down).
  */
 
 #include <linux/acpi.h>
@@ -30,8 +30,8 @@
 #define HP_PORT_MAX		3
 #define HP_POLL_CNT_MAX		200
 #define MAX_VENDOR_DATA_LEN	16
-#define CX7_HP_MMIO_REGION_COUNT	5	/* TOP, PROTECT, CKM, MAC Port 0, MAC Port 1 */
-#define CX7_HP_MIN_GPIO_COUNT	4	/* Minimum required: BOOT, PRSNT, PERST, EN */
+#define TEGRA254_HP_MMIO_REGION_COUNT	5	/* TOP, PROTECT, CKM, MAC Port 0, MAC Port 1 */
+#define TEGRA254_HP_MIN_GPIO_COUNT	4	/* Minimum required: BOOT, PRSNT, PERST, EN */
 #define PINCTRL_MAPPING_ENTRY_SIZE 5	/* dev_name, state, ctrl_dev, group, function */
 /* Indices for pinctrl mapping entry strings */
 #define PINCTRL_IDX_DEV_NAME	0
@@ -41,14 +41,14 @@
 #define PINCTRL_IDX_FUNCTION	4
 
 /* Hardware timing requirements (in microseconds unless noted) */
-#define CX7_HP_DELAY_SHORT_US		10	/* Short delay for register writes */
-#define CX7_HP_DELAY_STANDARD_US	10000	/* Standard delay (10ms) */
-#define CX7_HP_DELAY_BUS_PROTECT_US	5000	/* Bus protection setup delay */
-#define CX7_HP_DELAY_PHY_RESET_US	3000	/* PHY reset delay */
-#define CX7_HP_DELAY_LINK_STABLE_MS	100	/* Link stabilization delay (ms) */
-#define CX7_HP_POLL_SLEEP_US		10000	/* Polling loop sleep interval */
+#define TEGRA254_HP_DELAY_SHORT_US		10	/* Short delay for register writes */
+#define TEGRA254_HP_DELAY_STANDARD_US	10000	/* Standard delay (10ms) */
+#define TEGRA254_HP_DELAY_BUS_PROTECT_US	5000	/* Bus protection setup delay */
+#define TEGRA254_HP_DELAY_PHY_RESET_US	3000	/* PHY reset delay */
+#define TEGRA254_HP_DELAY_LINK_STABLE_MS	100	/* Link stabilization delay (ms) */
+#define TEGRA254_HP_POLL_SLEEP_US		10000	/* Polling loop sleep interval */
 /* BOOT FW ready poll: 10ms * 3000 ≈ 30s (CX7 firmware can take seconds) */
-#define CX7_HP_BOOT_POLL_MAX		3000
+#define TEGRA254_HP_BOOT_POLL_MAX		3000
 
 /* Bus protection stages to prevent PCIe core reset glitches */
 #define BUS_PROTECT_INIT		0
@@ -67,7 +67,7 @@ enum pcie_pin_index {
 };
 
 /* BOOT pin state machine (drives when to call enable_slot) */
-enum cx7_hp_boot_state {
+enum tegra254_hp_boot_state {
 	BOOT_IDLE = 0,		/* No cable or not tracking */
 	BOOT_POWERING_ON,	/* EN=1, waiting for BOOT high */
 	BOOT_FW_LOADING,	/* BOOT went high, firmware loading (BOOT may go low) */
@@ -120,16 +120,16 @@ struct gpio_acpi_context {
 	unsigned int connection_type;
 };
 
-struct cx7_hp_dev;
+struct tegra254_hp_dev;
 
 /**
- * struct cx7_hp_plat_data - Platform configuration data parsed from ACPI
+ * struct tegra254_hp_plat_data - Platform configuration data parsed from ACPI
  *
  * Platform-specific configuration parsed from ACPI devices:
  * - RES0 device (PNP0C02): PCIe configuration and MMIO register offsets via _DSD
  * - PEDE device (MTKP0001): Pinctrl mappings via _DSD
  */
-struct cx7_hp_plat_data {
+struct tegra254_hp_plat_data {
 	int port_nums;
 	struct pcie_port_info ports[HP_PORT_MAX];
 	u32 vendor_id;
@@ -142,21 +142,21 @@ struct cx7_hp_plat_data {
 	struct pinctrl_map *parsed_pinmap;
 };
 
-struct cx7_hp_discover_pcie_ctx {
-	struct cx7_hp_plat_data *pd;
+struct tegra254_hp_discover_pcie_ctx {
+	struct tegra254_hp_plat_data *pd;
 	int *count;
 	bool *retry;
 };
 
-struct cx7_hp_gpio_ctx {
+struct tegra254_hp_gpio_ctx {
 	struct gpio_desc *desc;
 	struct gpio_acpi_context *ctx;
-	struct cx7_hp_dev *hp_dev;
+	struct tegra254_hp_dev *hp_dev;
 };
 
 struct acpi_gpio_parse_context {
 	struct gpio_acpi_context *ctx;
-	struct cx7_hp_dev *hp_dev;
+	struct tegra254_hp_dev *hp_dev;
 };
 
 /* First-pass _CRS walk: only pin + controller name needed for desc lookup */
@@ -169,14 +169,14 @@ struct acpi_gpio_walk_context {
 	int count;
 };
 
-struct cx7_hp_acpi_mmio {
+struct tegra254_hp_acpi_mmio {
 	struct acpi_resource_fixed_memory32
-	    mmio_regions[CX7_HP_MMIO_REGION_COUNT];
+	    mmio_regions[TEGRA254_HP_MMIO_REGION_COUNT];
 	int count;
 	struct device *dev;
 };
 
-struct cx7_hp_mmio_runtime {
+struct tegra254_hp_mmio_runtime {
 	void __iomem *top_base;
 	void __iomem *protect_base;
 	void __iomem *ckm_base;
@@ -184,32 +184,32 @@ struct cx7_hp_mmio_runtime {
 };
 
 /**
- * cx7_hp_slot - Per-port hotplug slot for PCI core
+ * tegra254_hp_slot - Per-port hotplug slot for PCI core
  */
-struct cx7_hp_slot {
+struct tegra254_hp_slot {
 	struct hotplug_slot slot;
-	struct cx7_hp_dev *hp_dev;
+	struct tegra254_hp_dev *hp_dev;
 	int port_idx;
 	struct pci_dev *root_port;
 };
 
 /** Per-slot work to defer remove off disable_slot (avoids nesting with .remove) */
-struct cx7_hp_disable_work {
+struct tegra254_hp_disable_work {
 	struct work_struct work;
-	struct cx7_hp_dev *hp_dev;
+	struct tegra254_hp_dev *hp_dev;
 	int port_idx;
 };
 
 /**
- * cx7_hp_dev - Hotplug device structure
+ * tegra254_hp_dev - Hotplug device structure
  *
  * ACPI resource sources:
  * - MMIO addresses: RES0 device (PNP0C02) _CRS, stored in mmio field
  * - GPIO resources: PEDE device (MTKP0001) _CRS, stored in pins field
  */
-struct cx7_hp_dev {
-	struct cx7_hp_gpio_ctx *pins;
-	struct cx7_hp_plat_data *pd;
+struct tegra254_hp_dev {
+	struct tegra254_hp_gpio_ctx *pins;
+	struct tegra254_hp_plat_data *pd;
 	struct platform_device *pdev;
 	int gpio_count;
 	int boot_pin;
@@ -217,23 +217,23 @@ struct cx7_hp_dev {
 	bool hotplug_enabled;
 	spinlock_t lock;
 	struct mutex slot_mutex;	/* protects slot ops and BOOT/PRSNT work */
-	struct cx7_hp_mmio_runtime mmio;
+	struct tegra254_hp_mmio_runtime mmio;
 	struct gpio_device *gdev;
 	struct notifier_block pci_notifier;
 	bool pending_prsnt;		/* PRSNT pin fired, thread should schedule prsnt_work */
 	/* PCI hotplug slot API */
-	struct cx7_hp_slot slots[HP_PORT_MAX];
-	struct cx7_hp_disable_work disable_work[HP_PORT_MAX];
+	struct tegra254_hp_slot slots[HP_PORT_MAX];
+	struct tegra254_hp_disable_work disable_work[HP_PORT_MAX];
 	struct work_struct prsnt_work;
 	struct work_struct boot_work;
 	struct work_struct probe_hp_work;	/* post-probe cable sync → slot HP */
 	bool cable_present;
-	enum cx7_hp_boot_state boot_state;
+	enum tegra254_hp_boot_state boot_state;
 	int slots_enabled_count;	/* 0 = hw down, >0 = hw up */
 	bool pending_boot;		/* boot pin fired, thread should schedule boot_work */
 	int last_boot_val;		/* previous BOOT pin value for state machine */
 	struct completion boot_fw_ready; /* signaled when boot_work reaches BOOT_READY */
-	bool boot_irq_waiter;		/* enable_slot waiting on boot_fw_ready (no nested enable) */
+	bool boot_irq_waiter;		/* enable_slot waiting on boot_fw_ready */
 };
 
 /* ACPI _DSD device properties GUID: daffd814-6eba-4d8c-8a91-bc9bbf4aa301 */
@@ -243,33 +243,95 @@ GUID_INIT(0xdaffd814, 0x6eba, 0x4d8c,
 	  0xbf, 0x4a, 0xa3, 0x01);
 
 /**
- * cx7_hp_parse_pinctrl_config_dsd - Parse pinctrl configuration from PEDE device _DSD
+ * tegra254_hp_parse_one_pinctrl_mapping - Fill one pinctrl_map from _DSD entry
+ *
+ * Each ACPI mapping is Package(5) of strings: dev_name, state, ctrl_dev,
+ * group, function (Spark PEDE ASL format).
+ */
+static int tegra254_hp_parse_one_pinctrl_mapping(struct device *dev,
+						 const union acpi_object *entry,
+						 struct pinctrl_map *map,
+						 int index)
+{
+	const char *strings[PINCTRL_MAPPING_ENTRY_SIZE];
+	int l;
+
+	if (entry->type != ACPI_TYPE_PACKAGE ||
+	    entry->package.count != ARRAY_SIZE(strings)) {
+		dev_err(dev,
+			"Invalid pinctrl mapping entry %d: expected Package(%zu), got %s(count=%u)\n",
+			index, ARRAY_SIZE(strings),
+			entry->type == ACPI_TYPE_PACKAGE ? "Package" :
+							   "non-Package",
+			entry->type == ACPI_TYPE_PACKAGE ?
+				entry->package.count : 0);
+		return -EINVAL;
+	}
+
+	for (l = 0; l < ARRAY_SIZE(strings); l++) {
+		if (entry->package.elements[l].type != ACPI_TYPE_STRING) {
+			dev_err(dev,
+				"Mapping entry %d element %d is not a string\n",
+				index, l);
+			return -EINVAL;
+		}
+		strings[l] = entry->package.elements[l].string.pointer;
+	}
+
+	map->dev_name = devm_kstrdup(dev, strings[PINCTRL_IDX_DEV_NAME],
+				     GFP_KERNEL);
+	map->name = devm_kstrdup(dev, strings[PINCTRL_IDX_STATE], GFP_KERNEL);
+	map->type = PIN_MAP_TYPE_MUX_GROUP;
+	map->ctrl_dev_name = devm_kstrdup(dev, strings[PINCTRL_IDX_CTRL_DEV],
+					  GFP_KERNEL);
+	map->data.mux.group = devm_kstrdup(dev, strings[PINCTRL_IDX_GROUP],
+					   GFP_KERNEL);
+	map->data.mux.function =
+		devm_kstrdup(dev, strings[PINCTRL_IDX_FUNCTION], GFP_KERNEL);
+
+	if (!map->dev_name || !map->name || !map->ctrl_dev_name ||
+	    !map->data.mux.group || !map->data.mux.function) {
+		dev_err(dev, "Failed to allocate memory for mapping %d\n",
+			index);
+		return -ENOMEM;
+	}
+
+	/* TEMP v2-test: remove before upstream send */
+	dev_err(dev,
+		"v2-temp: pinctrl mapping[%d] state=%s group=%s func=%s\n",
+		index, map->name, map->data.mux.group, map->data.mux.function);
+
+	return 0;
+}
+
+/**
+ * tegra254_hp_parse_pinctrl_config_dsd - Parse pinctrl configuration from PEDE device _DSD
  * @hp_dev: hotplug device
  *
  * Parses pin-nums and pinctrl-mappings from _DSD.
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
+static int tegra254_hp_parse_pinctrl_config_dsd(struct tegra254_hp_dev *hp_dev)
 {
 	struct acpi_device *adev;
 	struct device *dev = &hp_dev->pdev->dev;
-	const union acpi_object *mappings_pkg, *mapping_entry;
+	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+	const union acpi_object *mappings_pkg = NULL;
+	const union acpi_object *dsd_pkg, *props_pkg = NULL;
+	const union acpi_object *prop, *prop_value;
+	const char *prop_name;
 	struct pinctrl_map *pinmap;
+	acpi_status status;
 	u32 pin_nums = 0;
-	int k;
-	const char *strings[PINCTRL_MAPPING_ENTRY_SIZE];
+	int i, j, k;
+	int ret;
 
 	adev = ACPI_COMPANION(dev);
 	if (!adev) {
 		dev_err(dev, "Failed to get ACPI companion device\n");
 		return -ENODEV;
 	}
-
-	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
-	acpi_status status;
-	const union acpi_object *dsd_pkg, *props_pkg = NULL;
-	int i, j;
 
 	status = acpi_evaluate_object_typed(adev->handle, "_DSD", NULL, &buffer,
 					    ACPI_TYPE_PACKAGE);
@@ -285,17 +347,17 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 		ACPI_FREE(buffer.pointer);
 		return -EINVAL;
 	}
+
 	/* Find Device Properties GUID package */
 	for (i = 0; i + 1 < dsd_pkg->package.count; i += 2) {
 		const union acpi_object *guid = &dsd_pkg->package.elements[i];
 		const union acpi_object *pkg =
 		    &dsd_pkg->package.elements[i + 1];
 
-		/* Verify GUID matches Device Properties GUID */
 		if (guid->type == ACPI_TYPE_BUFFER && guid->buffer.length == 16 &&
 		    pkg->type == ACPI_TYPE_PACKAGE &&
 		    guid_equal((guid_t *)guid->buffer.pointer,
-			      &device_properties_guid)) {
+			       &device_properties_guid)) {
 			props_pkg = pkg;
 			break;
 		}
@@ -309,25 +371,23 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 	}
 
 	for (j = 0; j < props_pkg->package.count; j++) {
-		const union acpi_object *prop = &props_pkg->package.elements[j];
+		prop = &props_pkg->package.elements[j];
 
 		if (prop->type != ACPI_TYPE_PACKAGE ||
 		    prop->package.count != 2 ||
 		    prop->package.elements[0].type != ACPI_TYPE_STRING)
 			continue;
 
-		const char *prop_name =
-		    prop->package.elements[0].string.pointer;
-		const union acpi_object *prop_value =
-		    &prop->package.elements[1];
+		prop_name = prop->package.elements[0].string.pointer;
+		prop_value = &prop->package.elements[1];
 
-	if (!strcmp(prop_name, "pin-nums")) {
-		if (prop_value->type == ACPI_TYPE_INTEGER)
-			pin_nums = prop_value->integer.value;
-	} else if (!strcmp(prop_name, "pinctrl-mappings")) {
-		if (prop_value->type == ACPI_TYPE_PACKAGE)
-			mappings_pkg = prop_value;
-	}
+		if (!strcmp(prop_name, "pin-nums")) {
+			if (prop_value->type == ACPI_TYPE_INTEGER)
+				pin_nums = prop_value->integer.value;
+		} else if (!strcmp(prop_name, "pinctrl-mappings")) {
+			if (prop_value->type == ACPI_TYPE_PACKAGE)
+				mappings_pkg = prop_value;
+		}
 	}
 
 	if (pin_nums == 0) {
@@ -351,67 +411,18 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 		return -EINVAL;
 	}
 
-	/* Allocate pinmap array */
 	pinmap = devm_kcalloc(dev, pin_nums, sizeof(*pinmap), GFP_KERNEL);
 	if (!pinmap) {
 		ACPI_FREE(buffer.pointer);
 		return -ENOMEM;
 	}
 
-	/* Parse each mapping entry */
 	for (k = 0; k < pin_nums; k++) {
-		mapping_entry = &mappings_pkg->package.elements[k];
-		if (mapping_entry->type != ACPI_TYPE_PACKAGE ||
-		    mapping_entry->package.count != ARRAY_SIZE(strings)) {
-			dev_err(dev,
-				"Invalid pinctrl mapping entry %d: expected Package(%zu), got %s(count=%u)\n",
-				k, ARRAY_SIZE(strings),
-				mapping_entry->type == ACPI_TYPE_PACKAGE ?
-				"Package" : "non-Package",
-				mapping_entry->type == ACPI_TYPE_PACKAGE ?
-				mapping_entry->package.count : 0);
+		ret = tegra254_hp_parse_one_pinctrl_mapping(
+			dev, &mappings_pkg->package.elements[k], &pinmap[k], k);
+		if (ret) {
 			ACPI_FREE(buffer.pointer);
-			return -EINVAL;
-		}
-
-		/* Extract strings: dev_name, state, ctrl_dev, group, function */
-		for (int l = 0; l < ARRAY_SIZE(strings); l++) {
-			if (mapping_entry->package.elements[l].type !=
-			    ACPI_TYPE_STRING) {
-				dev_err(dev,
-					"Mapping entry %d element %d is not a string\n",
-					k, l);
-				ACPI_FREE(buffer.pointer);
-				return -EINVAL;
-			}
-			strings[l] =
-			    mapping_entry->package.elements[l].string.pointer;
-		}
-
-		/* Populate pinctrl_map structure */
-		pinmap[k].dev_name =
-		    devm_kstrdup(dev, strings[PINCTRL_IDX_DEV_NAME],
-				 GFP_KERNEL);
-		pinmap[k].name =
-		    devm_kstrdup(dev, strings[PINCTRL_IDX_STATE], GFP_KERNEL);
-		pinmap[k].type = PIN_MAP_TYPE_MUX_GROUP;
-		pinmap[k].ctrl_dev_name =
-		    devm_kstrdup(dev, strings[PINCTRL_IDX_CTRL_DEV],
-				 GFP_KERNEL);
-		pinmap[k].data.mux.group =
-		    devm_kstrdup(dev, strings[PINCTRL_IDX_GROUP], GFP_KERNEL);
-		pinmap[k].data.mux.function =
-		    devm_kstrdup(dev, strings[PINCTRL_IDX_FUNCTION],
-				 GFP_KERNEL);
-
-		if (!pinmap[k].dev_name || !pinmap[k].name ||
-		    !pinmap[k].ctrl_dev_name || !pinmap[k].data.mux.group ||
-		    !pinmap[k].data.mux.function) {
-			dev_err(dev,
-				"Failed to allocate memory for mapping %d\n",
-				k);
-			ACPI_FREE(buffer.pointer);
-			return -ENOMEM;
+			return ret;
 		}
 	}
 
@@ -420,22 +431,25 @@ static int cx7_hp_parse_pinctrl_config_dsd(struct cx7_hp_dev *hp_dev)
 	ACPI_FREE(buffer.pointer);
 	dev_dbg(dev, "Successfully parsed %u pinctrl mappings from ACPI\n",
 		pin_nums);
+	/* TEMP v2-test: remove before upstream send */
+	dev_err(dev, "v2-temp: pinctrl _DSD parsed pin_nums=%u via parse_one\n",
+		pin_nums);
 	return 0;
 }
 
 /**
- * cx7_hp_pinctrl_init - Register pinctrl mappings for the device
+ * tegra254_hp_pinctrl_init - Register pinctrl mappings for the device
  * @hp_dev: hotplug device
  *
  * Parses pinctrl mappings from _DSD and registers them.
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_pinctrl_init(struct cx7_hp_dev *hp_dev)
+static int tegra254_hp_pinctrl_init(struct tegra254_hp_dev *hp_dev)
 {
 	int ret;
 
-	ret = cx7_hp_parse_pinctrl_config_dsd(hp_dev);
+	ret = tegra254_hp_parse_pinctrl_config_dsd(hp_dev);
 	if (ret) {
 		dev_err(&hp_dev->pdev->dev,
 			"Failed to parse pinctrl configuration from ACPI: %d\n",
@@ -446,9 +460,8 @@ static int cx7_hp_pinctrl_init(struct cx7_hp_dev *hp_dev)
 	if (!hp_dev->pd->pin_nums)
 		return 0;
 
-	ret =
-	    pinctrl_register_mappings(hp_dev->pd->parsed_pinmap,
-				      hp_dev->pd->pin_nums);
+	ret = pinctrl_register_mappings(hp_dev->pd->parsed_pinmap,
+					hp_dev->pd->pin_nums);
 	if (ret) {
 		dev_err(&hp_dev->pdev->dev,
 			"Failed to register pinctrl mappings\n");
@@ -461,10 +474,10 @@ static int cx7_hp_pinctrl_init(struct cx7_hp_dev *hp_dev)
 }
 
 /**
- * cx7_hp_pinctrl_remove - Unregister pinctrl mappings
+ * tegra254_hp_pinctrl_remove - Unregister pinctrl mappings
  * @hp_dev: hotplug device
  */
-static void cx7_hp_pinctrl_remove(struct cx7_hp_dev *hp_dev)
+static void tegra254_hp_pinctrl_remove(struct tegra254_hp_dev *hp_dev)
 {
 	if (!hp_dev->pd->pin_nums)
 		return;
@@ -473,13 +486,13 @@ static void cx7_hp_pinctrl_remove(struct cx7_hp_dev *hp_dev)
 }
 
 /**
- * cx7_hp_change_pinctrl_state - Change pinctrl state
+ * tegra254_hp_change_pinctrl_state - Change pinctrl state
  * @hp_dev: hotplug device
  * @new_state: new pinctrl state name
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_change_pinctrl_state(struct cx7_hp_dev *hp_dev,
+static int tegra254_hp_change_pinctrl_state(struct tegra254_hp_dev *hp_dev,
 				       const char *new_state)
 {
 	struct pinctrl *pinctrl;
@@ -510,13 +523,13 @@ static int cx7_hp_change_pinctrl_state(struct cx7_hp_dev *hp_dev,
 }
 
 /**
- * cx7_hp_reg_update_bits - Update specific bits in a register
+ * tegra254_hp_reg_update_bits - Update specific bits in a register
  * @base: MMIO base address
  * @offset: Register offset
  * @mask: Bits to modify
  * @set: true to set bits, false to clear bits
  */
-static inline void cx7_hp_reg_update_bits(void __iomem *base, u32 offset,
+static inline void tegra254_hp_reg_update_bits(void __iomem *base, u32 offset,
 					  u32 mask, bool set)
 {
 	u32 val = readl(base + offset);
@@ -530,7 +543,7 @@ static inline void cx7_hp_reg_update_bits(void __iomem *base, u32 offset,
 }
 
 /**
- * cx7_hp_toggle_update_bit - Toggle control register update bit
+ * tegra254_hp_toggle_update_bit - Toggle control register update bit
  * @base: MMIO base address
  * @ctrl_offset: Control register offset
  * @bits: Bits to set/clear before toggling update
@@ -539,80 +552,80 @@ static inline void cx7_hp_reg_update_bits(void __iomem *base, u32 offset,
  *
  * Performs the sequence: modify bits, clear update bit, set update bit
  */
-static void cx7_hp_toggle_update_bit(void __iomem *base, u32 ctrl_offset,
+static void tegra254_hp_toggle_update_bit(void __iomem *base, u32 ctrl_offset,
 				     u32 bits, u32 update_bit, bool set)
 {
-	cx7_hp_reg_update_bits(base, ctrl_offset, bits, set);
-	cx7_hp_reg_update_bits(base, ctrl_offset, update_bit, false);
-	cx7_hp_reg_update_bits(base, ctrl_offset, update_bit, true);
+	tegra254_hp_reg_update_bits(base, ctrl_offset, bits, set);
+	tegra254_hp_reg_update_bits(base, ctrl_offset, update_bit, false);
+	tegra254_hp_reg_update_bits(base, ctrl_offset, update_bit, true);
 }
 
 /**
- * cx7_hp_bus_protect_enable - Enable bus protection for a port
+ * tegra254_hp_bus_protect_enable - Enable bus protection for a port
  * @dev: hotplug device
  * @port_idx: Port index
  */
-static void cx7_hp_bus_protect_enable(struct cx7_hp_dev *dev, int port_idx)
+static void tegra254_hp_bus_protect_enable(struct tegra254_hp_dev *dev, int port_idx)
 {
 	struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
 	u32 port_bit = mmio_info->protect.port_bits[port_idx];
 
-	cx7_hp_reg_update_bits(dev->mmio.protect_base,
+	tegra254_hp_reg_update_bits(dev->mmio.protect_base,
 			       mmio_info->protect.mode, port_bit, true);
-	cx7_hp_reg_update_bits(dev->mmio.protect_base,
+	tegra254_hp_reg_update_bits(dev->mmio.protect_base,
 			       mmio_info->protect.enable, port_bit, true);
 }
 
 /**
- * cx7_hp_bus_protect_disable - Disable bus protection for a port
+ * tegra254_hp_bus_protect_disable - Disable bus protection for a port
  * @dev: hotplug device
  * @port_idx: Port index
  */
-static void cx7_hp_bus_protect_disable(struct cx7_hp_dev *dev, int port_idx)
+static void tegra254_hp_bus_protect_disable(struct tegra254_hp_dev *dev, int port_idx)
 {
 	struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
 	u32 port_bit = mmio_info->protect.port_bits[port_idx];
 
-	cx7_hp_reg_update_bits(dev->mmio.protect_base,
+	tegra254_hp_reg_update_bits(dev->mmio.protect_base,
 			       mmio_info->protect.enable, port_bit, false);
-	cx7_hp_reg_update_bits(dev->mmio.protect_base,
+	tegra254_hp_reg_update_bits(dev->mmio.protect_base,
 			       mmio_info->protect.mode, port_bit, false);
 }
 
 /**
- * cx7_hp_ckm_control - Control clock module
+ * tegra254_hp_ckm_control - Control clock module
  * @dev: hotplug device
  * @disable: true to disable clock, false to enable
  */
-static void cx7_hp_ckm_control(struct cx7_hp_dev *dev, bool disable)
+static void tegra254_hp_ckm_control(struct tegra254_hp_dev *dev, bool disable)
 {
 	struct rp_bus_mmio_info *mmio_info = &dev->pd->rp_bus_mmio;
 
 	if (!dev->mmio.ckm_base)
 		return;
 
-	cx7_hp_reg_update_bits(dev->mmio.ckm_base, mmio_info->ckm.ctrl,
+	tegra254_hp_reg_update_bits(dev->mmio.ckm_base, mmio_info->ckm.ctrl,
 			       mmio_info->ckm.disable_bit, disable);
 }
 
 /**
- * cx7_hp_parse_mmio_resources - ACPI resource callback for parsing MMIO from _CRS
+ * tegra254_hp_parse_mmio_resources - ACPI resource callback for parsing MMIO from _CRS
  * @ares: ACPI resource being processed
- * @data: pointer to cx7_hp_acpi_mmio structure
+ * @data: pointer to tegra254_hp_acpi_mmio structure
  *
  * Returns: AE_OK to continue iteration, AE_ERROR on error
  */
-static acpi_status cx7_hp_parse_mmio_resources(struct acpi_resource *ares,
+static acpi_status tegra254_hp_parse_mmio_resources(struct acpi_resource *ares,
 					       void *data)
 {
-	struct cx7_hp_acpi_mmio *parsed = data;
+	struct tegra254_hp_acpi_mmio *parsed = data;
 
 	switch (ares->type) {
 	case ACPI_RESOURCE_TYPE_FIXED_MEMORY32:
-		if (parsed->count >= CX7_HP_MMIO_REGION_COUNT) {
+		if (parsed->count >= TEGRA254_HP_MMIO_REGION_COUNT) {
 			dev_warn(parsed->dev,
 				 "More than %d MMIO regions found in platform configuration device, ignoring extras\n",
-				 CX7_HP_MMIO_REGION_COUNT);
+				 TEGRA254_HP_MMIO_REGION_COUNT);
 			break;
 		}
 		parsed->mmio_regions[parsed->count] = ares->data.fixed_memory32;
@@ -626,20 +639,20 @@ static acpi_status cx7_hp_parse_mmio_resources(struct acpi_resource *ares,
 }
 
 /**
- * cx7_hp_find_pcie_config_device - Find PCIe configuration device by HID
+ * tegra254_hp_find_pcie_config_device - Find PCIe configuration device by HID
  *
  * Finds the ACPI device that provides PCIe configuration via _DSD properties
  * and MMIO resources via _CRS.
  *
  * Returns: acpi_device pointer on success (with reference), NULL on failure
  */
-static struct acpi_device *cx7_hp_find_pcie_config_device(void)
+static struct acpi_device *tegra254_hp_find_pcie_config_device(void)
 {
 	return acpi_dev_get_first_match_dev("PNP0C02", NULL, -1);
 }
 
 /**
- * cx7_hp_parse_pcie_config_dsd - Parse PCIe configuration from _DSD
+ * tegra254_hp_parse_pcie_config_dsd - Parse PCIe configuration from _DSD
  * @pdev: platform device
  * @pd: platform data to populate
  *
@@ -648,14 +661,14 @@ static struct acpi_device *cx7_hp_find_pcie_config_device(void)
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_parse_pcie_config_dsd(struct platform_device *pdev,
-					struct cx7_hp_plat_data *pd)
+static int tegra254_hp_parse_pcie_config_dsd(struct platform_device *pdev,
+					struct tegra254_hp_plat_data *pd)
 {
 	struct acpi_device *config_adev;
 	struct device *dev = &pdev->dev;
 	u32 val, bit1;
 
-	config_adev = cx7_hp_find_pcie_config_device();
+	config_adev = tegra254_hp_find_pcie_config_device();
 	if (!config_adev) {
 		dev_err(dev,
 			"Platform configuration device (PNP0C02) not found - _DSD is required\n");
@@ -907,14 +920,14 @@ static int cx7_hp_parse_pcie_config_dsd(struct platform_device *pdev,
 }
 
 /**
- * cx7_hp_parse_mmio_resources_from_acpi - Parse MMIO regions from _CRS
+ * tegra254_hp_parse_mmio_resources_from_acpi - Parse MMIO regions from _CRS
  * @dev: hotplug device
  * @parsed: pointer to parsed MMIO structure
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_parse_mmio_resources_from_acpi(struct cx7_hp_dev *dev,
-						 struct cx7_hp_acpi_mmio
+static int tegra254_hp_parse_mmio_resources_from_acpi(struct tegra254_hp_dev *dev,
+						 struct tegra254_hp_acpi_mmio
 						 *parsed)
 {
 	struct acpi_device *config_adev;
@@ -924,16 +937,15 @@ static int cx7_hp_parse_mmio_resources_from_acpi(struct cx7_hp_dev *dev,
 	if (!dev || !dev->pdev)
 		return -EINVAL;
 
-	config_adev = cx7_hp_find_pcie_config_device();
+	config_adev = tegra254_hp_find_pcie_config_device();
 	if (!config_adev)
 		return -ENODEV;
 
 	parsed->count = 0;
 	memset(parsed->mmio_regions, 0, sizeof(parsed->mmio_regions));
 
-	status =
-	    acpi_walk_resources(config_adev->handle, METHOD_NAME__CRS,
-				cx7_hp_parse_mmio_resources, parsed);
+	status = acpi_walk_resources(config_adev->handle, METHOD_NAME__CRS,
+				     tegra254_hp_parse_mmio_resources, parsed);
 	if (ACPI_FAILURE(status)) {
 		dev_err(&dev->pdev->dev,
 			"Failed to walk platform configuration resources: %s\n",
@@ -942,10 +954,10 @@ static int cx7_hp_parse_mmio_resources_from_acpi(struct cx7_hp_dev *dev,
 		goto out;
 	}
 
-	if (parsed->count < CX7_HP_MMIO_REGION_COUNT) {
+	if (parsed->count < TEGRA254_HP_MMIO_REGION_COUNT) {
 		dev_warn(&dev->pdev->dev,
 			 "Expected %d MMIO regions from platform configuration device, found %d\n",
-			 CX7_HP_MMIO_REGION_COUNT, parsed->count);
+			 TEGRA254_HP_MMIO_REGION_COUNT, parsed->count);
 		ret = -ENODEV;
 		goto out;
 	}
@@ -956,123 +968,116 @@ out:
 }
 
 /**
- * cx7_hp_map_mmio_resources - Map all MMIO regions from ACPI _CRS
+ * tegra254_hp_ioremap_named - Map one FIXED_MEMORY32 region
+ */
+static int tegra254_hp_ioremap_named(struct device *dev, u32 addr, u32 size,
+				     void __iomem **out, const char *name)
+{
+	void __iomem *base;
+
+	base = devm_ioremap(dev, addr, size);
+	if (!base) {
+		dev_err(dev, "Failed to map %s region (0x%08x)\n", name, addr);
+		return -ENOMEM;
+	}
+	*out = base;
+	/* TEMP v2-test: remove before upstream send */
+	dev_err(dev, "v2-temp: MMIO mapped %s @ 0x%08x size 0x%x\n",
+		name, addr, size);
+	return 0;
+}
+
+/**
+ * tegra254_hp_map_mmio_resources - Map all MMIO regions from ACPI _CRS
  * @dev: hotplug device
+ *
+ * Firmware _CRS FIXED_MEMORY32 order is fixed: MAC Port 0, MAC Port 1,
+ * TOP, PROTECT, CKM. Map MAC slots for configured ports, then the three
+ * fixed regions.
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
+static int tegra254_hp_map_mmio_resources(struct tegra254_hp_dev *dev)
 {
 	struct platform_device *pdev = dev->pdev;
-	struct cx7_hp_acpi_mmio parsed = {.count = 0, .dev = &pdev->dev };
+	struct device *d = &pdev->dev;
+	struct tegra254_hp_acpi_mmio parsed = {.count = 0, .dev = d };
+	void __iomem **fixed_bases[] = {
+		&dev->mmio.top_base,
+		&dev->mmio.protect_base,
+		&dev->mmio.ckm_base,
+	};
+	static const char * const fixed_names[] = {
+		"TOP", "PROTECT", "CKM",
+	};
+	/* MAC0/MAC1 always occupy CRS[0..1]; fixed regions start at CRS[2] */
+	const unsigned int fixed_crs_base = 2;
+	int mapped_count = 0;
 	int ret;
 	int i;
+	u32 addr, size;
 
-	ret = cx7_hp_parse_mmio_resources_from_acpi(dev, &parsed);
+	ret = tegra254_hp_parse_mmio_resources_from_acpi(dev, &parsed);
 	if (ret) {
-		dev_err(&pdev->dev,
+		dev_err(d,
 			"Failed to get MMIO regions from platform configuration device\n");
 		return ret;
 	}
 
-	dev_dbg(&pdev->dev, "Found %d MMIO regions in _CRS, mapping...\n",
-		parsed.count);
+	dev_dbg(d, "Found %d MMIO regions in _CRS, mapping...\n", parsed.count);
+	/* TEMP v2-test: remove before upstream send */
+	dev_err(d,
+		"v2-temp: MMIO map start (crs_count=%d port_nums=%d, loop+fixed)\n",
+		parsed.count, dev->pd->port_nums);
 
-	int mapped_count = 0;
+	for (i = 0; i < 2 && i < parsed.count; i++) {
+		if (i >= dev->pd->port_nums)
+			continue;
 
-	for (i = 0; i < parsed.count; i++) {
-		void __iomem *base = NULL;
-		u32 addr = parsed.mmio_regions[i].address;
-		u32 size = parsed.mmio_regions[i].address_length;
-
-		switch (i) {
-		case 0:
-			if (dev->pd->port_nums >= 1) {
-				base = devm_ioremap(&pdev->dev, addr, size);
-				if (!base) {
-					dev_err(&pdev->dev,
-						"Failed to map MAC Port 0 region (0x%08x)\n",
-						addr);
-					return -ENOMEM;
-				}
-				dev->mmio.mac_port_base[0] = base;
-				mapped_count++;
-			}
-			break;
-		case 1:
-			if (dev->pd->port_nums >= 2) {
-				base = devm_ioremap(&pdev->dev, addr, size);
-				if (!base) {
-					dev_err(&pdev->dev,
-						"Failed to map MAC Port 1 region (0x%08x)\n",
-						addr);
-					return -ENOMEM;
-				}
-				dev->mmio.mac_port_base[1] = base;
-				mapped_count++;
-			}
-			break;
-		case 2:
-			base = devm_ioremap(&pdev->dev, addr, size);
-			if (!base) {
-				dev_err(&pdev->dev,
-					"Failed to map TOP region (0x%08x)\n",
-					addr);
-				return -ENOMEM;
-			}
-			dev->mmio.top_base = base;
-			mapped_count++;
-			break;
-		case 3:
-			base = devm_ioremap(&pdev->dev, addr, size);
-			if (!base) {
-				dev_err(&pdev->dev,
-					"Failed to map PROTECT region (0x%08x)\n",
-					addr);
-				return -ENOMEM;
-			}
-			dev->mmio.protect_base = base;
-			mapped_count++;
-			break;
-		case 4:
-			base = devm_ioremap(&pdev->dev, addr, size);
-			if (!base) {
-				dev_err(&pdev->dev,
-					"Failed to map CKM region (0x%08x)\n",
-					addr);
-				return -ENOMEM;
-			}
-			dev->mmio.ckm_base = base;
-			mapped_count++;
-			break;
-		default:
-			dev_warn(&pdev->dev,
-				 "Unexpected MMIO region at 0x%08x (size 0x%x), skipping\n",
-				 addr, size);
-			break;
-		}
+		addr = parsed.mmio_regions[i].address;
+		size = parsed.mmio_regions[i].address_length;
+		ret = tegra254_hp_ioremap_named(d, addr, size,
+						&dev->mmio.mac_port_base[i],
+						i == 0 ? "MAC Port 0" :
+							 "MAC Port 1");
+		if (ret)
+			return ret;
+		mapped_count++;
 	}
 
-	if (!dev->mmio.top_base || !dev->mmio.protect_base
-	    || !dev->mmio.ckm_base || (dev->pd->port_nums >= 1
-				       && !dev->mmio.mac_port_base[0])
-	    || (dev->pd->port_nums >= 2 && !dev->mmio.mac_port_base[1])) {
-		dev_err(&pdev->dev,
+	for (i = 0; i < ARRAY_SIZE(fixed_bases); i++) {
+		unsigned int idx = fixed_crs_base + i;
+
+		if (idx >= parsed.count)
+			break;
+
+		addr = parsed.mmio_regions[idx].address;
+		size = parsed.mmio_regions[idx].address_length;
+		ret = tegra254_hp_ioremap_named(d, addr, size, fixed_bases[i],
+						fixed_names[i]);
+		if (ret)
+			return ret;
+		mapped_count++;
+	}
+
+	if (!dev->mmio.top_base || !dev->mmio.protect_base ||
+	    !dev->mmio.ckm_base ||
+	    (dev->pd->port_nums >= 1 && !dev->mmio.mac_port_base[0]) ||
+	    (dev->pd->port_nums >= 2 && !dev->mmio.mac_port_base[1])) {
+		dev_err(d,
 			"Required MMIO regions not mapped from ACPI _CRS (mapped %d)\n",
 			mapped_count);
 		if (!dev->mmio.top_base)
-			dev_err(&pdev->dev, "  Missing: TOP\n");
+			dev_err(d, "  Missing: TOP\n");
 		if (!dev->mmio.protect_base)
-			dev_err(&pdev->dev, "  Missing: PROTECT\n");
+			dev_err(d, "  Missing: PROTECT\n");
 		if (!dev->mmio.ckm_base)
-			dev_err(&pdev->dev, "  Missing: CKM\n");
+			dev_err(d, "  Missing: CKM\n");
 		if (dev->pd->port_nums >= 1 && !dev->mmio.mac_port_base[0])
-			dev_err(&pdev->dev,
-				"  Missing: MAC Port 0 (port_nums=%d)\n",
+			dev_err(d, "  Missing: MAC Port 0 (port_nums=%d)\n",
 				dev->pd->port_nums);
 		if (dev->pd->port_nums >= 2 && !dev->mmio.mac_port_base[1])
-			dev_err(&pdev->dev,
-				"  Missing: MAC Port 1 (port_nums=%d)\n",
+			dev_err(d, "  Missing: MAC Port 1 (port_nums=%d)\n",
 				dev->pd->port_nums);
 		dev->mmio.top_base = NULL;
 		dev->mmio.protect_base = NULL;
@@ -1082,18 +1087,19 @@ static int cx7_hp_map_mmio_resources(struct cx7_hp_dev *dev)
 		return -ENODEV;
 	}
 
-	dev_dbg(&pdev->dev,
-		"Successfully mapped all MMIO regions from ACPI _CRS\n");
+	dev_dbg(d, "Successfully mapped all MMIO regions from ACPI _CRS\n");
+	/* TEMP v2-test: remove before upstream send */
+	dev_err(d, "v2-temp: MMIO map done (mapped_count=%d)\n", mapped_count);
 	return 0;
 }
 
 /**
- * cx7_hp_rp_bus_protect - Bus protection handler
+ * tegra254_hp_rp_bus_protect - Bus protection handler
  * @dev: hotplug device
  * @port_idx: port index (0-based)
  * @stage: protection stage (BUS_PROTECT_INIT, BUS_PROTECT_CLEANUP, etc.)
  */
-static void cx7_hp_rp_bus_protect(struct cx7_hp_dev *dev, int port_idx,
+static void tegra254_hp_rp_bus_protect(struct tegra254_hp_dev *dev, int port_idx,
 				  int stage)
 {
 	switch (stage) {
@@ -1101,7 +1107,7 @@ static void cx7_hp_rp_bus_protect(struct cx7_hp_dev *dev, int port_idx,
 		{
 			int ret;
 
-			ret = cx7_hp_map_mmio_resources(dev);
+			ret = tegra254_hp_map_mmio_resources(dev);
 			if (ret) {
 				dev_err(&dev->pdev->dev,
 					"Failed to map MMIO resources during bus init: %d\n",
@@ -1143,41 +1149,41 @@ static void cx7_hp_rp_bus_protect(struct cx7_hp_dev *dev, int port_idx,
 				return;
 
 			if (stage == BUS_PROTECT_CABLE_REMOVAL) {
-				cx7_hp_reg_update_bits(mac_base,
+				tegra254_hp_reg_update_bits(mac_base,
 						       mmio_info->mac.init_ctrl,
 						       mmio_info->mac.ltssm_bit,
 						       false);
-			cx7_hp_reg_update_bits(mac_base,
+			tegra254_hp_reg_update_bits(mac_base,
 					       mmio_info->mac.init_ctrl,
 					       mmio_info->mac.phy_rst_bit,
 					       false);
 				return;
 			}
 
-		cx7_hp_toggle_update_bit(dev->mmio.top_base,
+		tegra254_hp_toggle_update_bit(dev->mmio.top_base,
 					 mmio_info->top.ctrl,
 					 mmio_info->top.port_bits[port_idx],
 					 mmio_info->top.update_bit,
 					 false);
-			udelay(CX7_HP_DELAY_SHORT_US);
+			udelay(TEGRA254_HP_DELAY_SHORT_US);
 
-			cx7_hp_bus_protect_enable(dev, port_idx);
-			usleep_range(CX7_HP_DELAY_BUS_PROTECT_US,
-				     CX7_HP_DELAY_BUS_PROTECT_US + 1000);
+			tegra254_hp_bus_protect_enable(dev, port_idx);
+			usleep_range(TEGRA254_HP_DELAY_BUS_PROTECT_US,
+				     TEGRA254_HP_DELAY_BUS_PROTECT_US + 1000);
 
-			cx7_hp_reg_update_bits(mac_base,
+			tegra254_hp_reg_update_bits(mac_base,
 					       mmio_info->mac.init_ctrl,
 					       mmio_info->mac.phy_rst_bit,
 					       true);
-			cx7_hp_reg_update_bits(mac_base,
+			tegra254_hp_reg_update_bits(mac_base,
 					       mmio_info->mac.init_ctrl,
 					       mmio_info->mac.ltssm_bit, true);
-			usleep_range(CX7_HP_DELAY_PHY_RESET_US,
-				     CX7_HP_DELAY_PHY_RESET_US + 1000);
+			usleep_range(TEGRA254_HP_DELAY_PHY_RESET_US,
+				     TEGRA254_HP_DELAY_PHY_RESET_US + 1000);
 
-			cx7_hp_bus_protect_disable(dev, port_idx);
+			tegra254_hp_bus_protect_disable(dev, port_idx);
 
-		cx7_hp_toggle_update_bit(dev->mmio.top_base,
+		tegra254_hp_toggle_update_bit(dev->mmio.top_base,
 					 mmio_info->top.ctrl,
 					 mmio_info->top.port_bits[port_idx],
 					 mmio_info->top.update_bit,
@@ -1193,15 +1199,15 @@ static void cx7_hp_rp_bus_protect(struct cx7_hp_dev *dev, int port_idx,
 }
 
 /* Forward declarations for slot ops and helpers they call */
-static void remove_device(struct cx7_hp_dev *dev);
-static int rescan_device(struct cx7_hp_dev *dev);
-static int cx7_hp_enable_slot(struct hotplug_slot *slot);
-static int cx7_hp_disable_slot(struct hotplug_slot *slot);
-static int cx7_hp_get_adapter_status(struct hotplug_slot *slot, u8 *value);
-static void cx7_hp_disable_slot_work(struct work_struct *work);
-static void cx7_hp_probe_hp_work(struct work_struct *work);
+static void remove_device(struct tegra254_hp_dev *dev);
+static int rescan_device(struct tegra254_hp_dev *dev);
+static int tegra254_hp_enable_slot(struct hotplug_slot *slot);
+static int tegra254_hp_disable_slot(struct hotplug_slot *slot);
+static int tegra254_hp_get_adapter_status(struct hotplug_slot *slot, u8 *value);
+static void tegra254_hp_disable_slot_work(struct work_struct *work);
+static void tegra254_hp_probe_hp_work(struct work_struct *work);
 
-static bool cx7_hp_is_enabled(struct cx7_hp_dev *hp_dev)
+static bool tegra254_hp_is_enabled(struct tegra254_hp_dev *hp_dev)
 {
 	unsigned long flags;
 	bool enabled;
@@ -1213,13 +1219,13 @@ static bool cx7_hp_is_enabled(struct cx7_hp_dev *hp_dev)
 }
 
 /**
- * cx7_hp_power_on_start - Arm BOOT SM and assert EN
+ * tegra254_hp_power_on_start - Arm BOOT SM and assert EN
  * @hp_dev: hotplug device
  *
  * Caller must hold slot_mutex. Shared by cable plug, probe sync, and
  * ensure_powered (slot-power) so there is one power-on sequence.
  */
-static void cx7_hp_power_on_start(struct cx7_hp_dev *hp_dev)
+static void tegra254_hp_power_on_start(struct tegra254_hp_dev *hp_dev)
 {
 	hp_dev->boot_state = BOOT_POWERING_ON;
 	hp_dev->last_boot_val =
@@ -1228,12 +1234,12 @@ static void cx7_hp_power_on_start(struct cx7_hp_dev *hp_dev)
 }
 
 /**
- * cx7_hp_disable_all_slots - disable_slot for every registered port
+ * tegra254_hp_disable_all_slots - disable_slot for every registered port
  * @hp_dev: hotplug device
  *
  * Must not be called while holding slot_mutex (slot ops take it).
  */
-static void cx7_hp_disable_all_slots(struct cx7_hp_dev *hp_dev)
+static void tegra254_hp_disable_all_slots(struct tegra254_hp_dev *hp_dev)
 {
 	int i;
 
@@ -1244,30 +1250,30 @@ static void cx7_hp_disable_all_slots(struct cx7_hp_dev *hp_dev)
 	}
 }
 
-static const struct hotplug_slot_ops cx7_hp_slot_ops = {
-	.enable_slot		= cx7_hp_enable_slot,
-	.disable_slot		= cx7_hp_disable_slot,
-	.get_adapter_status	= cx7_hp_get_adapter_status,
+static const struct hotplug_slot_ops tegra254_hp_slot_ops = {
+	.enable_slot		= tegra254_hp_enable_slot,
+	.disable_slot		= tegra254_hp_disable_slot,
+	.get_adapter_status	= tegra254_hp_get_adapter_status,
 };
 
-static int cx7_hp_get_adapter_status(struct hotplug_slot *hotplug_slot, u8 *value)
+static int tegra254_hp_get_adapter_status(struct hotplug_slot *hotplug_slot, u8 *value)
 {
-	struct cx7_hp_slot *slot = container_of(hotplug_slot, struct cx7_hp_slot, slot);
-	struct cx7_hp_dev *hp_dev = slot->hp_dev;
+	struct tegra254_hp_slot *slot = container_of(hotplug_slot, struct tegra254_hp_slot, slot);
+	struct tegra254_hp_dev *hp_dev = slot->hp_dev;
 
 	/* PRSNT low = cable inserted = adapter present */
 	*value = gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc) ? 0 : 1;
 	return 0;
 }
 
-static int cx7_hp_enable_slot(struct hotplug_slot *hotplug_slot)
+static int tegra254_hp_enable_slot(struct hotplug_slot *hotplug_slot)
 {
-	struct cx7_hp_slot *slot = container_of(hotplug_slot, struct cx7_hp_slot, slot);
-	struct cx7_hp_dev *hp_dev = slot->hp_dev;
+	struct tegra254_hp_slot *slot = container_of(hotplug_slot, struct tegra254_hp_slot, slot);
+	struct tegra254_hp_dev *hp_dev = slot->hp_dev;
 	struct pci_bus *bus;
 	int err = 0;
 
-	if (!cx7_hp_is_enabled(hp_dev))
+	if (!tegra254_hp_is_enabled(hp_dev))
 		return -EPERM;
 
 	mutex_lock(&hp_dev->slot_mutex);
@@ -1295,19 +1301,19 @@ static int cx7_hp_enable_slot(struct hotplug_slot *hotplug_slot)
 }
 
 /**
- * cx7_hp_disable_slot_work - Per-port remove + maybe power down
+ * tegra254_hp_disable_slot_work - Per-port remove + maybe power down
  *
  * Runs in process context. Defer off disable_slot so we do not nest with
  * endpoint .remove. Use pci_stop_and_remove_bus_device() under
  * pci_rescan_remove_lock (not the _locked helper, which takes that lock).
  */
-static void cx7_hp_disable_slot_work(struct work_struct *work)
+static void tegra254_hp_disable_slot_work(struct work_struct *work)
 {
-	struct cx7_hp_disable_work *dwork =
-		container_of(work, struct cx7_hp_disable_work, work);
-	struct cx7_hp_dev *hp_dev = dwork->hp_dev;
+	struct tegra254_hp_disable_work *dwork =
+		container_of(work, struct tegra254_hp_disable_work, work);
+	struct tegra254_hp_dev *hp_dev = dwork->hp_dev;
 	int port_idx = dwork->port_idx;
-	struct cx7_hp_slot *slot = &hp_dev->slots[port_idx];
+	struct tegra254_hp_slot *slot = &hp_dev->slots[port_idx];
 	struct pci_bus *bus;
 	struct pci_dev *dev, *tmp;
 
@@ -1363,12 +1369,12 @@ static void cx7_hp_disable_slot_work(struct work_struct *work)
 		port_idx);
 }
 
-static int cx7_hp_disable_slot(struct hotplug_slot *hotplug_slot)
+static int tegra254_hp_disable_slot(struct hotplug_slot *hotplug_slot)
 {
-	struct cx7_hp_slot *slot = container_of(hotplug_slot, struct cx7_hp_slot, slot);
-	struct cx7_hp_dev *hp_dev = slot->hp_dev;
+	struct tegra254_hp_slot *slot = container_of(hotplug_slot, struct tegra254_hp_slot, slot);
+	struct tegra254_hp_dev *hp_dev = slot->hp_dev;
 
-	if (!cx7_hp_is_enabled(hp_dev))
+	if (!tegra254_hp_is_enabled(hp_dev))
 		return -EPERM;
 
 	dev_err(&hp_dev->pdev->dev,
@@ -1382,15 +1388,15 @@ static int cx7_hp_disable_slot(struct hotplug_slot *hotplug_slot)
 }
 
 /**
- * cx7_hp_prsnt_work - Work for PRSNT pin: cable in/out and slot enable/disable
+ * tegra254_hp_prsnt_work - Work for PRSNT pin: cable in/out and slot enable/disable
  * @work: work struct
  */
-static void cx7_hp_prsnt_work(struct work_struct *work)
+static void tegra254_hp_prsnt_work(struct work_struct *work)
 {
-	struct cx7_hp_dev *hp_dev = container_of(work, struct cx7_hp_dev, prsnt_work);
+	struct tegra254_hp_dev *hp_dev = container_of(work, struct tegra254_hp_dev, prsnt_work);
 	int prsnt_val;
 
-	if (!cx7_hp_is_enabled(hp_dev))
+	if (!tegra254_hp_is_enabled(hp_dev))
 		return;
 
 	prsnt_val = gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc);
@@ -1402,28 +1408,28 @@ static void cx7_hp_prsnt_work(struct work_struct *work)
 		hp_dev->cable_present = false;
 		hp_dev->boot_state = BOOT_IDLE;
 		mutex_unlock(&hp_dev->slot_mutex);
-		cx7_hp_disable_all_slots(hp_dev);
+		tegra254_hp_disable_all_slots(hp_dev);
 	} else {
 		/* Cable inserted */
 		dev_err(&hp_dev->pdev->dev, "prsnt_work: cable inserted, EN=1 boot_state=BOOT_POWERING_ON\n");
 		hp_dev->cable_present = true;
-		cx7_hp_power_on_start(hp_dev);
+		tegra254_hp_power_on_start(hp_dev);
 		mutex_unlock(&hp_dev->slot_mutex);
 	}
 }
 
 /**
- * cx7_hp_boot_work - Work for BOOT pin: state machine, enable_slot when ready
+ * tegra254_hp_boot_work - Work for BOOT pin: state machine, enable_slot when ready
  * @work: work struct
  */
-static void cx7_hp_boot_work(struct work_struct *work)
+static void tegra254_hp_boot_work(struct work_struct *work)
 {
-	struct cx7_hp_dev *hp_dev = container_of(work, struct cx7_hp_dev, boot_work);
+	struct tegra254_hp_dev *hp_dev = container_of(work, struct tegra254_hp_dev, boot_work);
 	int boot_val;
 	int i;
 	bool do_enable = false;
 
-	if (!cx7_hp_is_enabled(hp_dev))
+	if (!tegra254_hp_is_enabled(hp_dev))
 		return;
 
 	mutex_lock(&hp_dev->slot_mutex);
@@ -1478,7 +1484,7 @@ static void cx7_hp_boot_work(struct work_struct *work)
  *
  * Returns cached or newly found root port, or NULL if not found.
  */
-static struct pci_dev *get_port_root_port(struct cx7_hp_dev *hp_dev,
+static struct pci_dev *get_port_root_port(struct tegra254_hp_dev *hp_dev,
 					  int port_idx)
 {
 	struct pcie_port_info *port;
@@ -1507,18 +1513,18 @@ static struct pci_dev *get_port_root_port(struct cx7_hp_dev *hp_dev,
  * remove_device - Remove PCIe devices and power down hardware
  * @dev: hotplug device
  */
-static void remove_device(struct cx7_hp_dev *dev)
+static void remove_device(struct tegra254_hp_dev *dev)
 {
 	int i;
 
 	dev_err(&dev->pdev->dev, "Cable removal\n");
 
 	for (i = 0; i < dev->pd->port_nums; i++)
-		cx7_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_REMOVAL);
+		tegra254_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_REMOVAL);
 
 	gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 0);
-	cx7_hp_change_pinctrl_state(dev, "default");
-	cx7_hp_ckm_control(dev, true);
+	tegra254_hp_change_pinctrl_state(dev, "default");
+	tegra254_hp_ckm_control(dev, true);
 	gpiod_set_value(dev->pins[PCIE_PIN_EN].desc, 0);
 	dev->boot_state = BOOT_IDLE;
 	complete_all(&dev->boot_fw_ready);
@@ -1530,7 +1536,7 @@ static void remove_device(struct cx7_hp_dev *dev)
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int polling_link_to_l0(struct cx7_hp_dev *dev)
+static int polling_link_to_l0(struct tegra254_hp_dev *dev)
 {
 	struct pci_dev *pci_dev;
 	u32 ltssm_vals[HP_PORT_MAX] = { 0 };
@@ -1562,7 +1568,7 @@ static int polling_link_to_l0(struct cx7_hp_dev *dev)
 		if (all_l0)
 			break;
 
-		usleep_range(CX7_HP_POLL_SLEEP_US, CX7_HP_POLL_SLEEP_US + 1000);
+		usleep_range(TEGRA254_HP_POLL_SLEEP_US, TEGRA254_HP_POLL_SLEEP_US + 1000);
 		count++;
 
 		if (count > HP_POLL_CNT_MAX) {
@@ -1579,7 +1585,7 @@ static int polling_link_to_l0(struct cx7_hp_dev *dev)
 }
 
 /**
- * cx7_hp_ensure_powered_and_fw_ready - EN=1 and wait for BOOT ready via IRQ
+ * tegra254_hp_ensure_powered_and_fw_ready - EN=1 and wait for BOOT ready via IRQ
  * @dev: hotplug device
  *
  * Arms the same BOOT state machine as cable plug-in, then waits for
@@ -1590,7 +1596,7 @@ static int polling_link_to_l0(struct cx7_hp_dev *dev)
  *
  * Returns: 0 on success, -ETIMEDOUT if BOOT never becomes ready
  */
-static int cx7_hp_ensure_powered_and_fw_ready(struct cx7_hp_dev *dev)
+static int tegra254_hp_ensure_powered_and_fw_ready(struct tegra254_hp_dev *dev)
 {
 	unsigned long timeout;
 	int ret = 0;
@@ -1605,7 +1611,7 @@ static int cx7_hp_ensure_powered_and_fw_ready(struct cx7_hp_dev *dev)
 
 	reinit_completion(&dev->boot_fw_ready);
 	dev->boot_irq_waiter = true;
-	cx7_hp_power_on_start(dev);
+	tegra254_hp_power_on_start(dev);
 	mutex_unlock(&dev->slot_mutex);
 
 	/* Kick in case BOOT level already matches without a new edge */
@@ -1613,8 +1619,8 @@ static int cx7_hp_ensure_powered_and_fw_ready(struct cx7_hp_dev *dev)
 
 	timeout = wait_for_completion_timeout(
 		&dev->boot_fw_ready,
-		msecs_to_jiffies(CX7_HP_BOOT_POLL_MAX *
-				 (CX7_HP_POLL_SLEEP_US / 1000)));
+		msecs_to_jiffies(TEGRA254_HP_BOOT_POLL_MAX *
+				 (TEGRA254_HP_POLL_SLEEP_US / 1000)));
 
 	mutex_lock(&dev->slot_mutex);
 	dev->boot_irq_waiter = false;
@@ -1637,23 +1643,23 @@ static int cx7_hp_ensure_powered_and_fw_ready(struct cx7_hp_dev *dev)
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int rescan_device(struct cx7_hp_dev *dev)
+static int rescan_device(struct tegra254_hp_dev *dev)
 {
 	struct pci_dev *pci_dev;
 	int i, err;
 	int put_until = 0;
 
 	dev_err(&dev->pdev->dev, "rescan_device: start (pinctrl, CKM, PERST, bus protect, L0, retrain)\n");
-	err = cx7_hp_ensure_powered_and_fw_ready(dev);
+	err = tegra254_hp_ensure_powered_and_fw_ready(dev);
 	if (err)
 		return err;
 
-	err = cx7_hp_change_pinctrl_state(dev, "clkreqn");
+	err = tegra254_hp_change_pinctrl_state(dev, "clkreqn");
 	if (err)
 		return err;
 
-	cx7_hp_ckm_control(dev, false);
-	usleep_range(CX7_HP_DELAY_STANDARD_US, CX7_HP_DELAY_STANDARD_US + 1000);
+	tegra254_hp_ckm_control(dev, false);
+	usleep_range(TEGRA254_HP_DELAY_STANDARD_US, TEGRA254_HP_DELAY_STANDARD_US + 1000);
 
 	for (i = 0; i < dev->pd->port_nums; i++) {
 		pci_dev = get_port_root_port(dev, i);
@@ -1674,7 +1680,7 @@ static int rescan_device(struct cx7_hp_dev *dev)
 	gpiod_set_value(dev->pins[PCIE_PIN_PERST].desc, 1);
 
 	for (i = 0; i < dev->pd->port_nums; i++)
-		cx7_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
+		tegra254_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_PLUGIN);
 
 	err = polling_link_to_l0(dev);
 	if (err)
@@ -1693,7 +1699,7 @@ static int rescan_device(struct cx7_hp_dev *dev)
 				pci_name(pci_dev), err);
 	}
 
-	msleep(CX7_HP_DELAY_LINK_STABLE_MS);
+	msleep(TEGRA254_HP_DELAY_LINK_STABLE_MS);
 	err = 0;
 out:
 	for (i = 0; i < put_until; i++) {
@@ -1705,17 +1711,17 @@ out:
 }
 
 /**
- * cx7_hp_work - Threaded IRQ handler: schedule PRSNT or BOOT work
+ * tegra254_hp_work - Threaded IRQ handler: schedule PRSNT or BOOT work
  * @irq: interrupt number
  * @dev_id: GPIO context pointer
  *
  * PRSNT and BOOT pins set pending_prsnt or pending_boot in the hardirq;
  * this thread schedules the corresponding work and returns.
  */
-static irqreturn_t cx7_hp_work(int irq, void *dev_id)
+static irqreturn_t tegra254_hp_work(int irq, void *dev_id)
 {
-	struct cx7_hp_gpio_ctx *app_ctx = dev_id;
-	struct cx7_hp_dev *hp_dev;
+	struct tegra254_hp_gpio_ctx *app_ctx = dev_id;
+	struct tegra254_hp_dev *hp_dev;
 	unsigned long flags;
 
 	if (!app_ctx || !app_ctx->hp_dev)
@@ -1753,8 +1759,8 @@ static irqreturn_t cx7_hp_work(int irq, void *dev_id)
  */
 static irqreturn_t hotplug_irq_handler(int irq, void *dev_id)
 {
-	struct cx7_hp_gpio_ctx *app_ctx = dev_id;
-	struct cx7_hp_dev *hp_dev = app_ctx->hp_dev;
+	struct tegra254_hp_gpio_ctx *app_ctx = dev_id;
+	struct tegra254_hp_dev *hp_dev = app_ctx->hp_dev;
 	struct gpio_acpi_context *gpio_ctx = app_ctx->ctx;
 	unsigned long flags;
 
@@ -1825,13 +1831,13 @@ static acpi_status acpi_gpio_collect_handler(struct acpi_resource *ares,
 }
 
 /**
- * cx7_hp_walk_acpi_gpios - Walk ACPI _CRS to collect all GPIO resources
+ * tegra254_hp_walk_acpi_gpios - Walk ACPI _CRS to collect all GPIO resources
  * @pdev: Platform device
  * @walk_ctx: Context structure to fill with GPIO information
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_walk_acpi_gpios(struct platform_device *pdev,
+static int tegra254_hp_walk_acpi_gpios(struct platform_device *pdev,
 				  struct acpi_gpio_walk_context *walk_ctx)
 {
 	struct acpi_device *adev;
@@ -1877,7 +1883,7 @@ static acpi_status acpi_gpio_lookup_handler(struct acpi_resource *ares,
 {
 	struct acpi_gpio_parse_context *parse_ctx = context;
 	struct gpio_acpi_context *ctx = parse_ctx->ctx;
-	struct cx7_hp_dev *hp_dev = parse_ctx->hp_dev;
+	struct tegra254_hp_dev *hp_dev = parse_ctx->hp_dev;
 	struct acpi_resource_gpio *agpio;
 	char vendor[MAX_VENDOR_DATA_LEN + 1];
 	int length;
@@ -1949,7 +1955,7 @@ static bool pci_devices_present_on_domain(int domain)
 	return has_endpoint_devices;
 }
 
-static bool cx7_hp_any_pci_devices(struct cx7_hp_dev *hp_dev)
+static bool tegra254_hp_any_pci_devices(struct tegra254_hp_dev *hp_dev)
 {
 	int i;
 
@@ -1960,7 +1966,7 @@ static bool cx7_hp_any_pci_devices(struct cx7_hp_dev *hp_dev)
 	return false;
 }
 
-static int cx7_hp_registered_slot_count(struct cx7_hp_dev *hp_dev)
+static int tegra254_hp_registered_slot_count(struct tegra254_hp_dev *hp_dev)
 {
 	int i, n = 0;
 
@@ -1972,20 +1978,20 @@ static int cx7_hp_registered_slot_count(struct cx7_hp_dev *hp_dev)
 }
 
 /**
- * cx7_hp_probe_hp_work - Align PCI/HW with cable when hotplug is enabled
+ * tegra254_hp_probe_hp_work - Align PCI/HW with cable when hotplug is enabled
  * @work: work struct
  *
  * Runs after userspace enables hotplug (not mid-probe). If hotplug is off,
  * leave hardware/PCI as-is. Owned by the kernel slot API.
  */
-static void cx7_hp_probe_hp_work(struct work_struct *work)
+static void tegra254_hp_probe_hp_work(struct work_struct *work)
 {
-	struct cx7_hp_dev *hp_dev = container_of(work, struct cx7_hp_dev,
+	struct tegra254_hp_dev *hp_dev = container_of(work, struct tegra254_hp_dev,
 						 probe_hp_work);
 	bool devices;
 	int nslots;
 
-	if (!cx7_hp_is_enabled(hp_dev)) {
+	if (!tegra254_hp_is_enabled(hp_dev)) {
 		dev_err(&hp_dev->pdev->dev,
 			"probe_hp_work: hotplug disabled, skip cable sync\n");
 		return;
@@ -1993,8 +1999,8 @@ static void cx7_hp_probe_hp_work(struct work_struct *work)
 
 	hp_dev->cable_present =
 		!gpiod_get_value(hp_dev->pins[PCIE_PIN_PRSNT].desc);
-	devices = cx7_hp_any_pci_devices(hp_dev);
-	nslots = cx7_hp_registered_slot_count(hp_dev);
+	devices = tegra254_hp_any_pci_devices(hp_dev);
+	nslots = tegra254_hp_registered_slot_count(hp_dev);
 
 	dev_err(&hp_dev->pdev->dev,
 		"probe_hp_work: cable_present=%d devices=%d slots=%d\n",
@@ -2014,7 +2020,7 @@ static void cx7_hp_probe_hp_work(struct work_struct *work)
 		mutex_unlock(&hp_dev->slot_mutex);
 		dev_err(&hp_dev->pdev->dev,
 			"probe_hp_work: no cable, CX7 present — disable_slot\n");
-		cx7_hp_disable_all_slots(hp_dev);
+		tegra254_hp_disable_all_slots(hp_dev);
 		return;
 	}
 
@@ -2032,7 +2038,7 @@ static void cx7_hp_probe_hp_work(struct work_struct *work)
 
 	/* Cable present, no endpoints — start the same path as PRSNT insert */
 	mutex_lock(&hp_dev->slot_mutex);
-	cx7_hp_power_on_start(hp_dev);
+	tegra254_hp_power_on_start(hp_dev);
 	mutex_unlock(&hp_dev->slot_mutex);
 	dev_err(&hp_dev->pdev->dev,
 		"probe_hp_work: cable, no devices — EN=1 BOOT_POWERING_ON\n");
@@ -2041,7 +2047,7 @@ static void cx7_hp_probe_hp_work(struct work_struct *work)
 static ssize_t hotplug_enabled_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
 {
-	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
+	struct tegra254_hp_dev *hp_dev = dev_get_drvdata(dev);
 
 	if (!hp_dev)
 		return -EINVAL;
@@ -2053,7 +2059,7 @@ static ssize_t hotplug_enabled_store(struct device *dev,
 				     struct device_attribute *attr,
 				     const char *buf, size_t count)
 {
-	struct cx7_hp_dev *hp_dev = dev_get_drvdata(dev);
+	struct tegra254_hp_dev *hp_dev = dev_get_drvdata(dev);
 	unsigned long flags;
 	unsigned long val;
 	bool was_enabled, now_enabled;
@@ -2086,14 +2092,14 @@ static ssize_t hotplug_enabled_store(struct device *dev,
 
 DEVICE_ATTR_RW(hotplug_enabled);
 
-static struct attribute *cx7_hp_attrs[] = {
+static struct attribute *tegra254_hp_attrs[] = {
 	&dev_attr_hotplug_enabled.attr,
 	NULL
 };
 
-static const struct attribute_group cx7_hp_attr_group = {
+static const struct attribute_group tegra254_hp_attr_group = {
 	.name = "pcie_hotplug",
-	.attrs = cx7_hp_attrs
+	.attrs = tegra254_hp_attrs
 };
 
 /**
@@ -2107,7 +2113,7 @@ static const struct attribute_group cx7_hp_attr_group = {
  */
 static struct gpio_acpi_context *gpio_acpi_setup(struct platform_device *pdev,
 						 struct gpio_desc *desc,
-						 struct cx7_hp_dev *hp_dev,
+						 struct tegra254_hp_dev *hp_dev,
 						 int gpio_index)
 {
 	struct acpi_gpio_parse_context parse_ctx;
@@ -2155,12 +2161,12 @@ static struct gpio_acpi_context *gpio_acpi_setup(struct platform_device *pdev,
 }
 
 /**
- * cx7_hp_setup_irq - Setup IRQ for GPIO
+ * tegra254_hp_setup_irq - Setup IRQ for GPIO
  * @app_ctx: GPIO context
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_setup_irq(struct cx7_hp_gpio_ctx *app_ctx)
+static int tegra254_hp_setup_irq(struct tegra254_hp_gpio_ctx *app_ctx)
 {
 	struct gpio_acpi_context *ctx = app_ctx->ctx;
 	int irq, ret;
@@ -2175,7 +2181,7 @@ static int cx7_hp_setup_irq(struct cx7_hp_gpio_ctx *app_ctx)
 		enable_irq_wake(irq);
 
 	ret = devm_request_threaded_irq(ctx->dev, irq,
-					hotplug_irq_handler, cx7_hp_work,
+					hotplug_irq_handler, tegra254_hp_work,
 					ctx->irq_flags | IRQF_ONESHOT,
 					"pcie_hotplug", app_ctx);
 	if (ret)
@@ -2185,10 +2191,10 @@ static int cx7_hp_setup_irq(struct cx7_hp_gpio_ctx *app_ctx)
 }
 
 /**
- * cx7_hp_put_gpio_device - Release GPIO device reference
+ * tegra254_hp_put_gpio_device - Release GPIO device reference
  * @data: GPIO device pointer
  */
-static void cx7_hp_put_gpio_device(void *data)
+static void tegra254_hp_put_gpio_device(void *data)
 {
 	struct gpio_device *gdev = data;
 
@@ -2196,15 +2202,15 @@ static void cx7_hp_put_gpio_device(void *data)
 }
 
 /**
- * cx7_hp_count_dev_on_bus - Callback for pci_walk_bus to count matching devices
+ * tegra254_hp_count_dev_on_bus - Callback for pci_walk_bus to count matching devices
  * @pci_dev: device being visited
- * @data: pointer to struct cx7_hp_discover_pcie_ctx
+ * @data: pointer to struct tegra254_hp_discover_pcie_ctx
  *
  * Returns: 1 to stop walk early, 0 otherwise
  */
-static int cx7_hp_count_dev_on_bus(struct pci_dev *pci_dev, void *data)
+static int tegra254_hp_count_dev_on_bus(struct pci_dev *pci_dev, void *data)
 {
-	struct cx7_hp_discover_pcie_ctx *ctx = data;
+	struct tegra254_hp_discover_pcie_ctx *ctx = data;
 
 	if (pci_dev->vendor != ctx->pd->vendor_id || pci_dev->device != ctx->pd->device_id)
 		return 0;
@@ -2219,18 +2225,18 @@ static int cx7_hp_count_dev_on_bus(struct pci_dev *pci_dev, void *data)
 }
 
 /**
- * cx7_hp_discover_pcie_devices - Discover existing PCI devices on managed ports
+ * tegra254_hp_discover_pcie_devices - Discover existing PCI devices on managed ports
  * @pdev: platform device
  * @pd: platform data
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_discover_pcie_devices(struct platform_device *pdev,
-					struct cx7_hp_plat_data *pd)
+static int tegra254_hp_discover_pcie_devices(struct platform_device *pdev,
+					struct tegra254_hp_plat_data *pd)
 {
 	int device_count = 0;
 	bool retry = false;
-	struct cx7_hp_discover_pcie_ctx pcie_ctx = {
+	struct tegra254_hp_discover_pcie_ctx pcie_ctx = {
 		.pd = pd, .count = &device_count, .retry = &retry
 	};
 	struct pci_dev *root_port = NULL;
@@ -2259,7 +2265,7 @@ static int cx7_hp_discover_pcie_devices(struct platform_device *pdev,
 			return -EPROBE_DEFER;
 		}
 
-		pci_walk_bus(root_port->subordinate, cx7_hp_count_dev_on_bus,
+		pci_walk_bus(root_port->subordinate, tegra254_hp_count_dev_on_bus,
 			     &pcie_ctx);
 		pci_dev_put(root_port);
 
@@ -2278,18 +2284,18 @@ static int cx7_hp_discover_pcie_devices(struct platform_device *pdev,
 }
 
 /**
- * cx7_hp_init_pcie_data - Initialize PCIe data from _DSD and discover devices
+ * tegra254_hp_init_pcie_data - Initialize PCIe data from _DSD and discover devices
  * @pdev: platform device
  * @pd: platform data to populate
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_init_pcie_data(struct platform_device *pdev,
-				 struct cx7_hp_plat_data *pd)
+static int tegra254_hp_init_pcie_data(struct platform_device *pdev,
+				 struct tegra254_hp_plat_data *pd)
 {
 	int ret;
 
-	ret = cx7_hp_parse_pcie_config_dsd(pdev, pd);
+	ret = tegra254_hp_parse_pcie_config_dsd(pdev, pd);
 	if (ret) {
 		dev_err(&pdev->dev,
 			"Failed to parse PCIe configuration _DSD properties: %d\n",
@@ -2304,7 +2310,7 @@ static int cx7_hp_init_pcie_data(struct platform_device *pdev,
 		return -EINVAL;
 	}
 
-	ret = cx7_hp_discover_pcie_devices(pdev, pd);
+	ret = tegra254_hp_discover_pcie_devices(pdev, pd);
 	if (ret) {
 		dev_dbg(&pdev->dev, "Device discovery failed: %d\n", ret);
 		return ret;
@@ -2314,14 +2320,14 @@ static int cx7_hp_init_pcie_data(struct platform_device *pdev,
 }
 
 /**
- * cx7_hp_enumerate_gpios - Enumerate GPIOs from ACPI
+ * tegra254_hp_enumerate_gpios - Enumerate GPIOs from ACPI
  * @pdev: Platform device
  * @hp_dev: Hotplug device structure
  *
  * Returns: Number of GPIOs found, or negative error code
  */
-static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
-				  struct cx7_hp_dev *hp_dev)
+static int tegra254_hp_enumerate_gpios(struct platform_device *pdev,
+				  struct tegra254_hp_dev *hp_dev)
 {
 	struct acpi_gpio_walk_context walk_ctx;
 	struct fwnode_handle *gpio_fwnode = NULL;
@@ -2330,17 +2336,17 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 	acpi_status status;
 	int ret, i;
 
-	ret = cx7_hp_walk_acpi_gpios(pdev, &walk_ctx);
+	ret = tegra254_hp_walk_acpi_gpios(pdev, &walk_ctx);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to walk ACPI GPIO resources: %d\n",
 			ret);
 		return ret;
 	}
 
-	if (walk_ctx.count < CX7_HP_MIN_GPIO_COUNT) {
+	if (walk_ctx.count < TEGRA254_HP_MIN_GPIO_COUNT) {
 		dev_err(&pdev->dev,
 			"Insufficient GPIOs from ACPI: required at least %d, got %d\n",
-			CX7_HP_MIN_GPIO_COUNT, walk_ctx.count);
+			TEGRA254_HP_MIN_GPIO_COUNT, walk_ctx.count);
 		return -ENODEV;
 	}
 
@@ -2351,9 +2357,8 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 		return -ENODEV;
 	}
 
-	status =
-	    acpi_get_handle(NULL, walk_ctx.gpios[0].resource_source,
-			    &gpio_handle);
+	status = acpi_get_handle(NULL, walk_ctx.gpios[0].resource_source,
+				 &gpio_handle);
 	if (ACPI_FAILURE(status)) {
 		dev_err(&pdev->dev,
 			"Failed to get ACPI handle for GPIO controller %s\n",
@@ -2377,7 +2382,7 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 	}
 
 	/* Successfully found GPIO device - manage reference */
-	ret = devm_add_action_or_reset(&pdev->dev, cx7_hp_put_gpio_device,
+	ret = devm_add_action_or_reset(&pdev->dev, tegra254_hp_put_gpio_device,
 				       hp_dev->gdev);
 	if (ret) {
 		gpio_device_put(hp_dev->gdev);
@@ -2389,7 +2394,7 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 	hp_dev->gpio_count = walk_ctx.count;
 
 	hp_dev->pins = devm_kzalloc(&pdev->dev,
-				    sizeof(struct cx7_hp_gpio_ctx) *
+				    sizeof(struct tegra254_hp_gpio_ctx) *
 				    hp_dev->gpio_count, GFP_KERNEL);
 	if (!hp_dev->pins) {
 		dev_err(&pdev->dev, "Failed to allocate memory for GPIOs\n");
@@ -2397,7 +2402,7 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 	}
 
 	for (i = 0; i < hp_dev->gpio_count; i++) {
-		struct cx7_hp_gpio_ctx *app_ctx = &hp_dev->pins[i];
+		struct tegra254_hp_gpio_ctx *app_ctx = &hp_dev->pins[i];
 
 		app_ctx->desc =
 		    gpio_device_get_desc(hp_dev->gdev, walk_ctx.gpios[i].pin);
@@ -2416,25 +2421,25 @@ static int cx7_hp_enumerate_gpios(struct platform_device *pdev,
 }
 
 /**
- * cx7_hp_pci_notifier - PCI bus notifier to configure MPS for CX7 devices
+ * tegra254_hp_pci_notifier - PCI bus notifier to configure MPS for CX7 devices
  * @nb: notifier block
  * @action: bus notification action
  * @data: pointer to device being added/removed
  *
  * Returns: NOTIFY_OK on success, NOTIFY_DONE if not a CX7 device
  */
-static int cx7_hp_pci_notifier(struct notifier_block *nb, unsigned long action,
+static int tegra254_hp_pci_notifier(struct notifier_block *nb, unsigned long action,
 				void *data)
 {
 	struct device *dev = data;
 	struct pci_dev *pdev = to_pci_dev(dev);
-	struct cx7_hp_dev *hp_dev;
+	struct tegra254_hp_dev *hp_dev;
 	unsigned long flags;
 
 	if (action != BUS_NOTIFY_ADD_DEVICE)
 		return NOTIFY_DONE;
 
-	hp_dev = container_of(nb, struct cx7_hp_dev, pci_notifier);
+	hp_dev = container_of(nb, struct tegra254_hp_dev, pci_notifier);
 	if (!hp_dev || !hp_dev->pd)
 		return NOTIFY_DONE;
 
@@ -2459,7 +2464,7 @@ static int cx7_hp_pci_notifier(struct notifier_block *nb, unsigned long action,
 }
 
 /**
- * cx7_hp_probe - Platform device probe function
+ * tegra254_hp_probe - Platform device probe function
  * @pdev: platform device
  *
  * Initializes the PCIe hotplug driver, parses ACPI resources, and sets up
@@ -2467,18 +2472,18 @@ static int cx7_hp_pci_notifier(struct notifier_block *nb, unsigned long action,
  *
  * Returns: 0 on success, negative error code on failure
  */
-static int cx7_hp_probe(struct platform_device *pdev)
+static int tegra254_hp_probe(struct platform_device *pdev)
 {
-	struct cx7_hp_plat_data *pd;
-	struct cx7_hp_gpio_ctx *app_ctx;
-	struct cx7_hp_dev *hp_dev;
+	struct tegra254_hp_plat_data *pd;
+	struct tegra254_hp_gpio_ctx *app_ctx;
+	struct tegra254_hp_dev *hp_dev;
 	int ret, i;
 
 	pd = devm_kzalloc(&pdev->dev, sizeof(*pd), GFP_KERNEL);
 	if (!pd)
 		return -ENOMEM;
 
-	ret = cx7_hp_init_pcie_data(pdev, pd);
+	ret = tegra254_hp_init_pcie_data(pdev, pd);
 	if (ret)
 		return ret;
 
@@ -2500,16 +2505,16 @@ static int cx7_hp_probe(struct platform_device *pdev)
 	init_completion(&hp_dev->boot_fw_ready);
 	spin_lock_init(&hp_dev->lock);
 	mutex_init(&hp_dev->slot_mutex);
-	INIT_WORK(&hp_dev->prsnt_work, cx7_hp_prsnt_work);
-	INIT_WORK(&hp_dev->boot_work, cx7_hp_boot_work);
-	INIT_WORK(&hp_dev->probe_hp_work, cx7_hp_probe_hp_work);
+	INIT_WORK(&hp_dev->prsnt_work, tegra254_hp_prsnt_work);
+	INIT_WORK(&hp_dev->boot_work, tegra254_hp_boot_work);
+	INIT_WORK(&hp_dev->probe_hp_work, tegra254_hp_probe_hp_work);
 	for (i = 0; i < HP_PORT_MAX; i++) {
 		hp_dev->disable_work[i].hp_dev = hp_dev;
 		hp_dev->disable_work[i].port_idx = i;
-		INIT_WORK(&hp_dev->disable_work[i].work, cx7_hp_disable_slot_work);
+		INIT_WORK(&hp_dev->disable_work[i].work, tegra254_hp_disable_slot_work);
 	}
 
-	ret = cx7_hp_enumerate_gpios(pdev, hp_dev);
+	ret = tegra254_hp_enumerate_gpios(pdev, hp_dev);
 	if (ret < 0) {
 		dev_err(&pdev->dev, "Failed to enumerate GPIOs from ACPI: %d\n",
 			ret);
@@ -2530,7 +2535,7 @@ static int cx7_hp_probe(struct platform_device *pdev)
 
 		if (app_ctx->ctx->connection_type ==
 		    ACPI_RESOURCE_GPIO_TYPE_INT) {
-			ret = cx7_hp_setup_irq(app_ctx);
+			ret = tegra254_hp_setup_irq(app_ctx);
 			if (ret) {
 				dev_err(&pdev->dev,
 					"Failed to setup IRQ for GPIO %d\n", i);
@@ -2544,21 +2549,21 @@ static int cx7_hp_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, hp_dev);
 
-	ret = cx7_hp_pinctrl_init(hp_dev);
+	ret = tegra254_hp_pinctrl_init(hp_dev);
 	if (ret) {
 		dev_err(&pdev->dev, "Pinmux init failed, ret: %d\n", ret);
 		return ret;
 	}
 
-	ret = sysfs_create_group(&pdev->dev.kobj, &cx7_hp_attr_group);
+	ret = sysfs_create_group(&pdev->dev.kobj, &tegra254_hp_attr_group);
 	if (ret) {
 		dev_err(&pdev->dev, "Sysfs creation failed: %d\n", ret);
 		goto pinctrl_remove;
 	}
 
-	cx7_hp_rp_bus_protect(hp_dev, 0, BUS_PROTECT_INIT);
+	tegra254_hp_rp_bus_protect(hp_dev, 0, BUS_PROTECT_INIT);
 
-	hp_dev->pci_notifier.notifier_call = cx7_hp_pci_notifier;
+	hp_dev->pci_notifier.notifier_call = tegra254_hp_pci_notifier;
 	ret = bus_register_notifier(&pci_bus_type, &hp_dev->pci_notifier);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to register PCI bus notifier: %d\n",
@@ -2572,11 +2577,11 @@ static int cx7_hp_probe(struct platform_device *pdev)
 
 		if (!rp || !rp->subordinate)
 			continue;
-		hp_dev->slots[i].slot.ops = &cx7_hp_slot_ops;
+		hp_dev->slots[i].slot.ops = &tegra254_hp_slot_ops;
 		hp_dev->slots[i].hp_dev = hp_dev;
 		hp_dev->slots[i].port_idx = i;
 		/* root_port already set by get_port_root_port() */
-		snprintf(slot_name, sizeof(slot_name), "cx7-slot-%d", i);
+		snprintf(slot_name, sizeof(slot_name), "tegra254-slot-%d", i);
 		ret = pci_hp_register(&hp_dev->slots[i].slot, rp->subordinate,
 				      0, slot_name);
 		if (ret) {
@@ -2592,6 +2597,9 @@ static int cx7_hp_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "slot API: registered slot %d (%s)\n", i, slot_name);
 	}
 
+	/* TEMP v2-test: remove before upstream send */
+	dev_err(&pdev->dev,
+		"v2-temp: tegra254-pcie-hotplug probe OK (CONFIG_TEGRA254_HOTPLUG)\n");
 	dev_err(&pdev->dev, "PCIe hotplug driver initialized successfully\n");
 	/*
 	 * Cable sync runs when userspace enables hotplug_enabled (0→1),
@@ -2600,21 +2608,21 @@ static int cx7_hp_probe(struct platform_device *pdev)
 	return 0;
 
 sysfs_remove:
-	sysfs_remove_group(&pdev->dev.kobj, &cx7_hp_attr_group);
+	sysfs_remove_group(&pdev->dev.kobj, &tegra254_hp_attr_group);
 pinctrl_remove:
-	cx7_hp_pinctrl_remove(hp_dev);
+	tegra254_hp_pinctrl_remove(hp_dev);
 	return ret;
 }
 
 /**
- * cx7_hp_remove - Platform device remove function
+ * tegra254_hp_remove - Platform device remove function
  * @pdev: platform device
  *
  * Cleans up GPIO pins, pinctrl, sysfs interface, and bus protection.
  */
-static void cx7_hp_remove(struct platform_device *pdev)
+static void tegra254_hp_remove(struct platform_device *pdev)
 {
-	struct cx7_hp_dev *hp_dev = platform_get_drvdata(pdev);
+	struct tegra254_hp_dev *hp_dev = platform_get_drvdata(pdev);
 	int i;
 
 	if (!hp_dev)
@@ -2633,34 +2641,34 @@ static void cx7_hp_remove(struct platform_device *pdev)
 		}
 	}
 
-	sysfs_remove_group(&pdev->dev.kobj, &cx7_hp_attr_group);
+	sysfs_remove_group(&pdev->dev.kobj, &tegra254_hp_attr_group);
 
 	bus_unregister_notifier(&pci_bus_type, &hp_dev->pci_notifier);
 
-	cx7_hp_rp_bus_protect(hp_dev, 0, BUS_PROTECT_CLEANUP);
+	tegra254_hp_rp_bus_protect(hp_dev, 0, BUS_PROTECT_CLEANUP);
 
-	cx7_hp_pinctrl_remove(hp_dev);
+	tegra254_hp_pinctrl_remove(hp_dev);
 
 	platform_set_drvdata(pdev, NULL);
 }
 
-static const struct acpi_device_id cx7_hp_acpi_match[] = {
+static const struct acpi_device_id tegra254_hp_acpi_match[] = {
 	{"MTKP0001", 0},
 	{}
 };
 
-MODULE_DEVICE_TABLE(acpi, cx7_hp_acpi_match);
+MODULE_DEVICE_TABLE(acpi, tegra254_hp_acpi_match);
 
-static struct platform_driver cx7_hp_driver = {
-	.probe = cx7_hp_probe,
-	.remove = cx7_hp_remove,
+static struct platform_driver tegra254_hp_driver = {
+	.probe = tegra254_hp_probe,
+	.remove = tegra254_hp_remove,
 	.driver = {
-		.name = "cx7-pcie-hotplug",
-		.acpi_match_table = ACPI_PTR(cx7_hp_acpi_match),
+		.name = "tegra254-pcie-hotplug",
+		.acpi_match_table = ACPI_PTR(tegra254_hp_acpi_match),
 	},
 };
 
-module_platform_driver(cx7_hp_driver);
+module_platform_driver(tegra254_hp_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("CX7 PCIe Hotplug Driver for NVIDIA DGX Systems");
+MODULE_DESCRIPTION("Tegra254 PCIe power management for NVIDIA DGX Spark");

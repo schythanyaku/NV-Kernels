@@ -2,8 +2,7 @@
 #
 # Makefile for NVIDIA ARM64 platform-specific drivers
 #
-# CX7 PCIe Hotplug Driver
-# Provides hotplug support for CX7 PCIe devices on GB10 SoC-based systems
+# Tegra254 PCIe hotplug for NVIDIA DGX Spark
 #
 
-obj-$(CONFIG_MTK_PCIE_HOTPLUG) += mtk-pcie-hotplug.o
+obj-$(CONFIG_TEGRA254_HOTPLUG) += tegra254-hotplug.o
