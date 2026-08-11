@@ -296,10 +296,6 @@ static int tegra254_hp_parse_one_pinctrl_mapping(struct device *dev,
 		return -ENOMEM;
 	}
 
-	/* TEMP v2-test: remove before upstream send */
-	dev_err(dev,
-		"v2-temp: pinctrl mapping[%d] state=%s group=%s func=%s\n",
-		index, map->name, map->data.mux.group, map->data.mux.function);
 
 	return 0;
 }
@@ -430,9 +426,6 @@ static int tegra254_hp_parse_pinctrl_config_dsd(struct tegra254_hp_dev *hp_dev)
 	hp_dev->pd->parsed_pinmap = pinmap;
 	ACPI_FREE(buffer.pointer);
 	dev_dbg(dev, "Successfully parsed %u pinctrl mappings from ACPI\n",
-		pin_nums);
-	/* TEMP v2-test: remove before upstream send */
-	dev_err(dev, "v2-temp: pinctrl _DSD parsed pin_nums=%u via parse_one\n",
 		pin_nums);
 	return 0;
 }
@@ -981,9 +974,6 @@ static int tegra254_hp_ioremap_named(struct device *dev, u32 addr, u32 size,
 		return -ENOMEM;
 	}
 	*out = base;
-	/* TEMP v2-test: remove before upstream send */
-	dev_err(dev, "v2-temp: MMIO mapped %s @ 0x%08x size 0x%x\n",
-		name, addr, size);
 	return 0;
 }
 
@@ -1025,10 +1015,6 @@ static int tegra254_hp_map_mmio_resources(struct tegra254_hp_dev *dev)
 	}
 
 	dev_dbg(d, "Found %d MMIO regions in _CRS, mapping...\n", parsed.count);
-	/* TEMP v2-test: remove before upstream send */
-	dev_err(d,
-		"v2-temp: MMIO map start (crs_count=%d port_nums=%d, loop+fixed)\n",
-		parsed.count, dev->pd->port_nums);
 
 	for (i = 0; i < 2 && i < parsed.count; i++) {
 		if (i >= dev->pd->port_nums)
@@ -1088,8 +1074,6 @@ static int tegra254_hp_map_mmio_resources(struct tegra254_hp_dev *dev)
 	}
 
 	dev_dbg(d, "Successfully mapped all MMIO regions from ACPI _CRS\n");
-	/* TEMP v2-test: remove before upstream send */
-	dev_err(d, "v2-temp: MMIO map done (mapped_count=%d)\n", mapped_count);
 	return 0;
 }
 
@@ -1278,7 +1262,7 @@ static int tegra254_hp_enable_slot(struct hotplug_slot *hotplug_slot)
 
 	mutex_lock(&hp_dev->slot_mutex);
 	if (hp_dev->slots_enabled_count == 0) {
-		dev_err(&hp_dev->pdev->dev, "slot API: first enable_slot, rescan_device\n");
+		dev_dbg(&hp_dev->pdev->dev, "slot API: first enable_slot, rescan_device\n");
 		err = rescan_device(hp_dev);
 		if (err) {
 			mutex_unlock(&hp_dev->slot_mutex);
@@ -1290,7 +1274,7 @@ static int tegra254_hp_enable_slot(struct hotplug_slot *hotplug_slot)
 
 	bus = slot->root_port->subordinate;
 	if (bus) {
-		dev_err(&hp_dev->pdev->dev, "slot API: enable_slot port %d, pci_rescan_bus\n",
+		dev_dbg(&hp_dev->pdev->dev, "slot API: enable_slot port %d, pci_rescan_bus\n",
 			 slot->port_idx);
 		pci_lock_rescan_remove();
 		pci_rescan_bus(bus);
@@ -1320,12 +1304,12 @@ static void tegra254_hp_disable_slot_work(struct work_struct *work)
 	if (!slot->root_port)
 		return;
 
-	dev_err(&hp_dev->pdev->dev, "slot API: disable_slot_work start port %d\n",
+	dev_dbg(&hp_dev->pdev->dev, "slot API: disable_slot_work start port %d\n",
 		port_idx);
 
 	bus = slot->root_port->subordinate;
 	if (bus) {
-		dev_err(&hp_dev->pdev->dev,
+		dev_dbg(&hp_dev->pdev->dev,
 			"slot API: disable_slot_work port %d release drivers\n",
 			port_idx);
 		list_for_each_entry_safe(dev, tmp, &bus->devices, bus_list)
@@ -1336,36 +1320,36 @@ static void tegra254_hp_disable_slot_work(struct work_struct *work)
 		 * that helper takes the same lock again and self-deadlocks.
 		 * (pciehp does the same: lock + pci_stop_and_remove_bus_device.)
 		 */
-		dev_err(&hp_dev->pdev->dev,
+		dev_dbg(&hp_dev->pdev->dev,
 			"slot API: disable_slot_work port %d before pci_lock_rescan_remove\n",
 			port_idx);
 		pci_lock_rescan_remove();
-		dev_err(&hp_dev->pdev->dev,
+		dev_dbg(&hp_dev->pdev->dev,
 			"slot API: disable_slot_work port %d remove children\n",
 			port_idx);
 		list_for_each_entry_safe_reverse(dev, tmp, &bus->devices, bus_list)
 			pci_stop_and_remove_bus_device(dev);
 		pci_unlock_rescan_remove();
-		dev_err(&hp_dev->pdev->dev,
+		dev_dbg(&hp_dev->pdev->dev,
 			"slot API: disable_slot_work port %d after pci_unlock_rescan_remove\n",
 			port_idx);
 	}
 
-	dev_err(&hp_dev->pdev->dev,
+	dev_dbg(&hp_dev->pdev->dev,
 		"slot API: disable_slot_work port %d before slot_mutex (enabled_count=%d)\n",
 		port_idx, hp_dev->slots_enabled_count);
 	mutex_lock(&hp_dev->slot_mutex);
 	if (hp_dev->slots_enabled_count > 0) {
 		hp_dev->slots_enabled_count--;
 		if (hp_dev->slots_enabled_count == 0) {
-			dev_err(&hp_dev->pdev->dev,
+			dev_dbg(&hp_dev->pdev->dev,
 				"slot API: disable_slot_work port %d calling remove_device\n",
 				port_idx);
 			remove_device(hp_dev);
 		}
 	}
 	mutex_unlock(&hp_dev->slot_mutex);
-	dev_err(&hp_dev->pdev->dev, "slot API: disable_slot_work done port %d\n",
+	dev_dbg(&hp_dev->pdev->dev, "slot API: disable_slot_work done port %d\n",
 		port_idx);
 }
 
@@ -1377,11 +1361,11 @@ static int tegra254_hp_disable_slot(struct hotplug_slot *hotplug_slot)
 	if (!tegra254_hp_is_enabled(hp_dev))
 		return -EPERM;
 
-	dev_err(&hp_dev->pdev->dev,
+	dev_dbg(&hp_dev->pdev->dev,
 		"slot API: disable_slot port %d schedule disable_slot_work\n",
 		slot->port_idx);
 	schedule_work(&hp_dev->disable_work[slot->port_idx].work);
-	dev_err(&hp_dev->pdev->dev,
+	dev_dbg(&hp_dev->pdev->dev,
 		"slot API: disable_slot port %d returned after schedule_work\n",
 		slot->port_idx);
 	return 0;
@@ -1404,14 +1388,14 @@ static void tegra254_hp_prsnt_work(struct work_struct *work)
 	mutex_lock(&hp_dev->slot_mutex);
 	if (prsnt_val) {
 		/* Cable removed */
-		dev_err(&hp_dev->pdev->dev, "prsnt_work: cable removed, disable_slot for all ports\n");
+		dev_dbg(&hp_dev->pdev->dev, "prsnt_work: cable removed, disable_slot for all ports\n");
 		hp_dev->cable_present = false;
 		hp_dev->boot_state = BOOT_IDLE;
 		mutex_unlock(&hp_dev->slot_mutex);
 		tegra254_hp_disable_all_slots(hp_dev);
 	} else {
 		/* Cable inserted */
-		dev_err(&hp_dev->pdev->dev, "prsnt_work: cable inserted, EN=1 boot_state=BOOT_POWERING_ON\n");
+		dev_dbg(&hp_dev->pdev->dev, "prsnt_work: cable inserted, EN=1 boot_state=BOOT_POWERING_ON\n");
 		hp_dev->cable_present = true;
 		tegra254_hp_power_on_start(hp_dev);
 		mutex_unlock(&hp_dev->slot_mutex);
@@ -1440,14 +1424,14 @@ static void tegra254_hp_boot_work(struct work_struct *work)
 		break;
 	case BOOT_POWERING_ON:
 		if (boot_val) {
-			dev_err(&hp_dev->pdev->dev, "boot_work: BOOT_POWERING_ON -> BOOT_FW_LOADING\n");
+			dev_dbg(&hp_dev->pdev->dev, "boot_work: BOOT_POWERING_ON -> BOOT_FW_LOADING\n");
 			hp_dev->boot_state = BOOT_FW_LOADING;
 		}
 		break;
 	case BOOT_FW_LOADING:
 		/* BOOT low then high = firmware ready */
 		if (hp_dev->last_boot_val == 0 && boot_val) {
-			dev_err(&hp_dev->pdev->dev, "boot_work: BOOT_READY\n");
+			dev_dbg(&hp_dev->pdev->dev, "boot_work: BOOT_READY\n");
 			hp_dev->boot_state = BOOT_READY;
 			/*
 			 * Physical plug: nobody is blocked in enable_slot yet —
@@ -1469,7 +1453,7 @@ static void tegra254_hp_boot_work(struct work_struct *work)
 	 * slot_mutex (non-recursive → self-deadlock).
 	 */
 	if (do_enable) {
-		dev_err(&hp_dev->pdev->dev, "boot_work: enable_slot for all ports\n");
+		dev_dbg(&hp_dev->pdev->dev, "boot_work: enable_slot for all ports\n");
 		for (i = 0; i < hp_dev->pd->port_nums; i++) {
 			if (hp_dev->slots[i].root_port)
 				hp_dev->slots[i].slot.ops->enable_slot(&hp_dev->slots[i].slot);
@@ -1517,7 +1501,7 @@ static void remove_device(struct tegra254_hp_dev *dev)
 {
 	int i;
 
-	dev_err(&dev->pdev->dev, "Cable removal\n");
+	dev_dbg(&dev->pdev->dev, "Cable removal\n");
 
 	for (i = 0; i < dev->pd->port_nums; i++)
 		tegra254_hp_rp_bus_protect(dev, i, BUS_PROTECT_CABLE_REMOVAL);
@@ -1605,9 +1589,9 @@ static int tegra254_hp_ensure_powered_and_fw_ready(struct tegra254_hp_dev *dev)
 	    gpiod_get_value(dev->pins[PCIE_PIN_EN].desc))
 		return 0;
 
-	dev_err(&dev->pdev->dev,
-		"rescan_device: EN=1, wait for BOOT IRQ ready (was boot_state=%d)\n",
-		dev->boot_state);
+	dev_dbg(&dev->pdev->dev,
+		"%s: EN=1, wait for BOOT IRQ ready (was boot_state=%d)\n",
+		__func__, dev->boot_state);
 
 	reinit_completion(&dev->boot_fw_ready);
 	dev->boot_irq_waiter = true;
@@ -1631,7 +1615,7 @@ static int tegra254_hp_ensure_powered_and_fw_ready(struct tegra254_hp_dev *dev)
 		dev->boot_state = BOOT_IDLE;
 		ret = -ETIMEDOUT;
 	} else {
-		dev_err(&dev->pdev->dev, "rescan_device: BOOT ready via boot_work\n");
+		dev_dbg(&dev->pdev->dev, "%s: BOOT ready via boot_work\n", __func__);
 	}
 
 	return ret;
@@ -1649,7 +1633,9 @@ static int rescan_device(struct tegra254_hp_dev *dev)
 	int i, err;
 	int put_until = 0;
 
-	dev_err(&dev->pdev->dev, "rescan_device: start (pinctrl, CKM, PERST, bus protect, L0, retrain)\n");
+	dev_dbg(&dev->pdev->dev,
+		"%s: start (pinctrl, CKM, PERST, bus protect, L0, retrain)\n",
+		__func__);
 	err = tegra254_hp_ensure_powered_and_fw_ready(dev);
 	if (err)
 		return err;
@@ -1734,14 +1720,14 @@ static irqreturn_t tegra254_hp_work(int irq, void *dev_id)
 	if (hp_dev->pending_prsnt) {
 		hp_dev->pending_prsnt = false;
 		spin_unlock_irqrestore(&hp_dev->lock, flags);
-		dev_err(&hp_dev->pdev->dev, "IRQ thread: schedule prsnt_work\n");
+		dev_dbg(&hp_dev->pdev->dev, "IRQ thread: schedule prsnt_work\n");
 		schedule_work(&hp_dev->prsnt_work);
 		return IRQ_HANDLED;
 	}
 	if (hp_dev->pending_boot) {
 		hp_dev->pending_boot = false;
 		spin_unlock_irqrestore(&hp_dev->lock, flags);
-		dev_err(&hp_dev->pdev->dev, "IRQ thread: schedule boot_work\n");
+		dev_dbg(&hp_dev->pdev->dev, "IRQ thread: schedule boot_work\n");
 		schedule_work(&hp_dev->boot_work);
 		return IRQ_HANDLED;
 	}
@@ -1992,7 +1978,7 @@ static void tegra254_hp_probe_hp_work(struct work_struct *work)
 	int nslots;
 
 	if (!tegra254_hp_is_enabled(hp_dev)) {
-		dev_err(&hp_dev->pdev->dev,
+		dev_dbg(&hp_dev->pdev->dev,
 			"probe_hp_work: hotplug disabled, skip cable sync\n");
 		return;
 	}
@@ -2002,7 +1988,7 @@ static void tegra254_hp_probe_hp_work(struct work_struct *work)
 	devices = tegra254_hp_any_pci_devices(hp_dev);
 	nslots = tegra254_hp_registered_slot_count(hp_dev);
 
-	dev_err(&hp_dev->pdev->dev,
+	dev_dbg(&hp_dev->pdev->dev,
 		"probe_hp_work: cable_present=%d devices=%d slots=%d\n",
 		hp_dev->cable_present, devices, nslots);
 
@@ -2018,7 +2004,7 @@ static void tegra254_hp_probe_hp_work(struct work_struct *work)
 		hp_dev->slots_enabled_count = nslots;
 		hp_dev->boot_state = BOOT_IDLE;
 		mutex_unlock(&hp_dev->slot_mutex);
-		dev_err(&hp_dev->pdev->dev,
+		dev_dbg(&hp_dev->pdev->dev,
 			"probe_hp_work: no cable, CX7 present — disable_slot\n");
 		tegra254_hp_disable_all_slots(hp_dev);
 		return;
@@ -2030,7 +2016,7 @@ static void tegra254_hp_probe_hp_work(struct work_struct *work)
 		hp_dev->slots_enabled_count = nslots;
 		hp_dev->boot_state = BOOT_READY;
 		mutex_unlock(&hp_dev->slot_mutex);
-		dev_err(&hp_dev->pdev->dev,
+		dev_dbg(&hp_dev->pdev->dev,
 			"probe_hp_work: cable + devices — seeded enabled_count=%d\n",
 			nslots);
 		return;
@@ -2040,7 +2026,7 @@ static void tegra254_hp_probe_hp_work(struct work_struct *work)
 	mutex_lock(&hp_dev->slot_mutex);
 	tegra254_hp_power_on_start(hp_dev);
 	mutex_unlock(&hp_dev->slot_mutex);
-	dev_err(&hp_dev->pdev->dev,
+	dev_dbg(&hp_dev->pdev->dev,
 		"probe_hp_work: cable, no devices — EN=1 BOOT_POWERING_ON\n");
 }
 
@@ -2078,7 +2064,7 @@ static ssize_t hotplug_enabled_store(struct device *dev,
 	now_enabled = hp_dev->hotplug_enabled;
 	spin_unlock_irqrestore(&hp_dev->lock, flags);
 
-	dev_err(dev, "Hotplug %s\n", now_enabled ? "enabled" : "disabled");
+	dev_dbg(dev, "Hotplug %s\n", now_enabled ? "enabled" : "disabled");
 
 	/*
 	 * Enabling: run cable sync (boot tear-down / power-on). Disabling:
@@ -2594,13 +2580,10 @@ static int tegra254_hp_probe(struct platform_device *pdev)
 			}
 			goto sysfs_remove;
 		}
-		dev_err(&pdev->dev, "slot API: registered slot %d (%s)\n", i, slot_name);
+		dev_dbg(&pdev->dev, "slot API: registered slot %d (%s)\n", i, slot_name);
 	}
 
-	/* TEMP v2-test: remove before upstream send */
-	dev_err(&pdev->dev,
-		"v2-temp: tegra254-pcie-hotplug probe OK (CONFIG_TEGRA254_HOTPLUG)\n");
-	dev_err(&pdev->dev, "PCIe hotplug driver initialized successfully\n");
+	dev_dbg(&pdev->dev, "PCIe hotplug driver initialized successfully\n");
 	/*
 	 * Cable sync runs when userspace enables hotplug_enabled (0→1),
 	 * not at probe — HP stays inert until then.
