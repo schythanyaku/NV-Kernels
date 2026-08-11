@@ -221,7 +221,6 @@ struct tegra254_hp_dev {
 	struct gpio_device *gdev;
 	struct notifier_block pci_notifier;
 	bool pending_prsnt;		/* PRSNT pin fired, thread should schedule prsnt_work */
-	/* PCI hotplug slot API */
 	struct tegra254_hp_slot slots[HP_PORT_MAX];
 	struct tegra254_hp_disable_work disable_work[HP_PORT_MAX];
 	struct work_struct prsnt_work;
@@ -344,7 +343,6 @@ static int tegra254_hp_parse_pinctrl_config_dsd(struct tegra254_hp_dev *hp_dev)
 		return -EINVAL;
 	}
 
-	/* Find Device Properties GUID package */
 	for (i = 0; i + 1 < dsd_pkg->package.count; i += 2) {
 		const union acpi_object *guid = &dsd_pkg->package.elements[i];
 		const union acpi_object *pkg =
@@ -1182,7 +1180,6 @@ static void tegra254_hp_rp_bus_protect(struct tegra254_hp_dev *dev, int port_idx
 	}
 }
 
-/* Forward declarations for slot ops and helpers they call */
 static void remove_device(struct tegra254_hp_dev *dev);
 static int rescan_device(struct tegra254_hp_dev *dev);
 static int tegra254_hp_enable_slot(struct hotplug_slot *slot);
@@ -1285,11 +1282,11 @@ static int tegra254_hp_enable_slot(struct hotplug_slot *hotplug_slot)
 }
 
 /**
- * tegra254_hp_disable_slot_work - Per-port remove + maybe power down
+ * tegra254_hp_disable_slot_work - Remove devices on one port, power down if last
+ * @work: work struct
  *
- * Runs in process context. Defer off disable_slot so we do not nest with
- * endpoint .remove. Use pci_stop_and_remove_bus_device() under
- * pci_rescan_remove_lock (not the _locked helper, which takes that lock).
+ * Deferred from disable_slot so endpoint .remove is not nested in the
+ * hotplug callback.
  */
 static void tegra254_hp_disable_slot_work(struct work_struct *work)
 {
@@ -1387,14 +1384,12 @@ static void tegra254_hp_prsnt_work(struct work_struct *work)
 	/* PRSNT low = cable inserted */
 	mutex_lock(&hp_dev->slot_mutex);
 	if (prsnt_val) {
-		/* Cable removed */
 		dev_dbg(&hp_dev->pdev->dev, "prsnt_work: cable removed, disable_slot for all ports\n");
 		hp_dev->cable_present = false;
 		hp_dev->boot_state = BOOT_IDLE;
 		mutex_unlock(&hp_dev->slot_mutex);
 		tegra254_hp_disable_all_slots(hp_dev);
 	} else {
-		/* Cable inserted */
 		dev_dbg(&hp_dev->pdev->dev, "prsnt_work: cable inserted, EN=1 boot_state=BOOT_POWERING_ON\n");
 		hp_dev->cable_present = true;
 		tegra254_hp_power_on_start(hp_dev);
@@ -1572,9 +1567,8 @@ static int polling_link_to_l0(struct tegra254_hp_dev *dev)
  * tegra254_hp_ensure_powered_and_fw_ready - EN=1 and wait for BOOT ready via IRQ
  * @dev: hotplug device
  *
- * Arms the same BOOT state machine as cable plug-in, then waits for
- * boot_work (BOOT GPIO IRQs) to reach BOOT_READY. Used when enable_slot
- * runs before FW is ready (e.g. slot power after remove_device).
+ * Waits for boot_work (BOOT GPIO IRQs) to reach BOOT_READY. Used when
+ * enable_slot runs before FW is ready (e.g. slot power after remove_device).
  *
  * Caller must hold slot_mutex on entry; it may be dropped while waiting.
  *
@@ -1964,11 +1958,12 @@ static int tegra254_hp_registered_slot_count(struct tegra254_hp_dev *hp_dev)
 }
 
 /**
- * tegra254_hp_probe_hp_work - Align PCI/HW with cable when hotplug is enabled
+ * tegra254_hp_probe_hp_work - Sync PCI/HW to cable after hotplug is enabled
  * @work: work struct
  *
- * Runs after userspace enables hotplug (not mid-probe). If hotplug is off,
- * leave hardware/PCI as-is. Owned by the kernel slot API.
+ * Scheduled on hotplug_enabled 0→1 (not at probe). Tears down if no cable
+ * but CX7 is present, seeds slot state if cable+devices, or powers on if
+ * cable and empty.
  */
 static void tegra254_hp_probe_hp_work(struct work_struct *work)
 {
@@ -2336,7 +2331,6 @@ static int tegra254_hp_enumerate_gpios(struct platform_device *pdev,
 		return -ENODEV;
 	}
 
-	/* Find GPIO device using resource_source from first GPIO */
 	if (walk_ctx.count == 0 || walk_ctx.gpios[0].resource_source[0] == '\0') {
 		dev_err(&pdev->dev,
 			"No resource_source in ACPI GPIO resources\n");
@@ -2367,7 +2361,6 @@ static int tegra254_hp_enumerate_gpios(struct platform_device *pdev,
 				     "GPIO controller not available\n");
 	}
 
-	/* Successfully found GPIO device - manage reference */
 	ret = devm_add_action_or_reset(&pdev->dev, tegra254_hp_put_gpio_device,
 				       hp_dev->gdev);
 	if (ret) {
@@ -2566,7 +2559,6 @@ static int tegra254_hp_probe(struct platform_device *pdev)
 		hp_dev->slots[i].slot.ops = &tegra254_hp_slot_ops;
 		hp_dev->slots[i].hp_dev = hp_dev;
 		hp_dev->slots[i].port_idx = i;
-		/* root_port already set by get_port_root_port() */
 		snprintf(slot_name, sizeof(slot_name), "tegra254-slot-%d", i);
 		ret = pci_hp_register(&hp_dev->slots[i].slot, rp->subordinate,
 				      0, slot_name);
