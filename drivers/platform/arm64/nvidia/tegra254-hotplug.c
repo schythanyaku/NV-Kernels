@@ -1671,7 +1671,7 @@ static int rescan_device(struct tegra254_hp_dev *dev)
 		if (!pci_dev)
 			continue;
 
-		/* use_lt=false: wait on DLLLA (same as former local helper) */
+		/* After cable reinsertion the link can stay at Gen1; retrain to max speed. */
 		err = pcie_retrain_link(pci_dev, false);
 		if (err)
 			dev_err(&dev->pdev->dev,
