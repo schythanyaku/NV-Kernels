@@ -215,7 +215,7 @@ struct tegra254_hp_dev {
 	int boot_pin;
 	int prsnt_pin;
 	bool hotplug_enabled;
-	spinlock_t lock;
+	spinlock_t lock;		/* protects hotplug_enabled and pending_* flags */
 	struct mutex slot_mutex;	/* protects slot ops and BOOT/PRSNT work */
 	struct tegra254_hp_mmio_runtime mmio;
 	struct gpio_device *gdev;
@@ -294,7 +294,6 @@ static int tegra254_hp_parse_one_pinctrl_mapping(struct device *dev,
 			index);
 		return -ENOMEM;
 	}
-
 
 	return 0;
 }
@@ -412,8 +411,9 @@ static int tegra254_hp_parse_pinctrl_config_dsd(struct tegra254_hp_dev *hp_dev)
 	}
 
 	for (k = 0; k < pin_nums; k++) {
-		ret = tegra254_hp_parse_one_pinctrl_mapping(
-			dev, &mappings_pkg->package.elements[k], &pinmap[k], k);
+		ret = tegra254_hp_parse_one_pinctrl_mapping(dev,
+							    &mappings_pkg->package.elements[k],
+							    &pinmap[k], k);
 		if (ret) {
 			ACPI_FREE(buffer.pointer);
 			return ret;
@@ -484,7 +484,7 @@ static void tegra254_hp_pinctrl_remove(struct tegra254_hp_dev *hp_dev)
  * Returns: 0 on success, negative error code on failure
  */
 static int tegra254_hp_change_pinctrl_state(struct tegra254_hp_dev *hp_dev,
-				       const char *new_state)
+					    const char *new_state)
 {
 	struct pinctrl *pinctrl;
 	struct pinctrl_state *state;
@@ -521,7 +521,7 @@ static int tegra254_hp_change_pinctrl_state(struct tegra254_hp_dev *hp_dev,
  * @set: true to set bits, false to clear bits
  */
 static inline void tegra254_hp_reg_update_bits(void __iomem *base, u32 offset,
-					  u32 mask, bool set)
+					       u32 mask, bool set)
 {
 	u32 val = readl(base + offset);
 
@@ -544,7 +544,7 @@ static inline void tegra254_hp_reg_update_bits(void __iomem *base, u32 offset,
  * Performs the sequence: modify bits, clear update bit, set update bit
  */
 static void tegra254_hp_toggle_update_bit(void __iomem *base, u32 ctrl_offset,
-				     u32 bits, u32 update_bit, bool set)
+					  u32 bits, u32 update_bit, bool set)
 {
 	tegra254_hp_reg_update_bits(base, ctrl_offset, bits, set);
 	tegra254_hp_reg_update_bits(base, ctrl_offset, update_bit, false);
@@ -562,9 +562,9 @@ static void tegra254_hp_bus_protect_enable(struct tegra254_hp_dev *dev, int port
 	u32 port_bit = mmio_info->protect.port_bits[port_idx];
 
 	tegra254_hp_reg_update_bits(dev->mmio.protect_base,
-			       mmio_info->protect.mode, port_bit, true);
+				    mmio_info->protect.mode, port_bit, true);
 	tegra254_hp_reg_update_bits(dev->mmio.protect_base,
-			       mmio_info->protect.enable, port_bit, true);
+				    mmio_info->protect.enable, port_bit, true);
 }
 
 /**
@@ -578,9 +578,9 @@ static void tegra254_hp_bus_protect_disable(struct tegra254_hp_dev *dev, int por
 	u32 port_bit = mmio_info->protect.port_bits[port_idx];
 
 	tegra254_hp_reg_update_bits(dev->mmio.protect_base,
-			       mmio_info->protect.enable, port_bit, false);
+				    mmio_info->protect.enable, port_bit, false);
 	tegra254_hp_reg_update_bits(dev->mmio.protect_base,
-			       mmio_info->protect.mode, port_bit, false);
+				    mmio_info->protect.mode, port_bit, false);
 }
 
 /**
@@ -596,7 +596,7 @@ static void tegra254_hp_ckm_control(struct tegra254_hp_dev *dev, bool disable)
 		return;
 
 	tegra254_hp_reg_update_bits(dev->mmio.ckm_base, mmio_info->ckm.ctrl,
-			       mmio_info->ckm.disable_bit, disable);
+				    mmio_info->ckm.disable_bit, disable);
 }
 
 /**
@@ -607,7 +607,7 @@ static void tegra254_hp_ckm_control(struct tegra254_hp_dev *dev, bool disable)
  * Returns: AE_OK to continue iteration, AE_ERROR on error
  */
 static acpi_status tegra254_hp_parse_mmio_resources(struct acpi_resource *ares,
-					       void *data)
+						    void *data)
 {
 	struct tegra254_hp_acpi_mmio *parsed = data;
 
@@ -653,7 +653,7 @@ static struct acpi_device *tegra254_hp_find_pcie_config_device(void)
  * Returns: 0 on success, negative error code on failure
  */
 static int tegra254_hp_parse_pcie_config_dsd(struct platform_device *pdev,
-					struct tegra254_hp_plat_data *pd)
+					     struct tegra254_hp_plat_data *pd)
 {
 	struct acpi_device *config_adev;
 	struct device *dev = &pdev->dev;
@@ -918,8 +918,7 @@ static int tegra254_hp_parse_pcie_config_dsd(struct platform_device *pdev,
  * Returns: 0 on success, negative error code on failure
  */
 static int tegra254_hp_parse_mmio_resources_from_acpi(struct tegra254_hp_dev *dev,
-						 struct tegra254_hp_acpi_mmio
-						 *parsed)
+						      struct tegra254_hp_acpi_mmio *parsed)
 {
 	struct acpi_device *config_adev;
 	acpi_status status;
@@ -1082,7 +1081,7 @@ static int tegra254_hp_map_mmio_resources(struct tegra254_hp_dev *dev)
  * @stage: protection stage (BUS_PROTECT_INIT, BUS_PROTECT_CLEANUP, etc.)
  */
 static void tegra254_hp_rp_bus_protect(struct tegra254_hp_dev *dev, int port_idx,
-				  int stage)
+				       int stage)
 {
 	switch (stage) {
 	case BUS_PROTECT_INIT:
@@ -1132,21 +1131,21 @@ static void tegra254_hp_rp_bus_protect(struct tegra254_hp_dev *dev, int port_idx
 
 			if (stage == BUS_PROTECT_CABLE_REMOVAL) {
 				tegra254_hp_reg_update_bits(mac_base,
-						       mmio_info->mac.init_ctrl,
-						       mmio_info->mac.ltssm_bit,
-						       false);
-			tegra254_hp_reg_update_bits(mac_base,
-					       mmio_info->mac.init_ctrl,
-					       mmio_info->mac.phy_rst_bit,
-					       false);
+							    mmio_info->mac.init_ctrl,
+							    mmio_info->mac.ltssm_bit,
+							    false);
+				tegra254_hp_reg_update_bits(mac_base,
+							    mmio_info->mac.init_ctrl,
+							    mmio_info->mac.phy_rst_bit,
+							    false);
 				return;
 			}
 
-		tegra254_hp_toggle_update_bit(dev->mmio.top_base,
-					 mmio_info->top.ctrl,
-					 mmio_info->top.port_bits[port_idx],
-					 mmio_info->top.update_bit,
-					 false);
+			tegra254_hp_toggle_update_bit(dev->mmio.top_base,
+						      mmio_info->top.ctrl,
+						      mmio_info->top.port_bits[port_idx],
+						      mmio_info->top.update_bit,
+						      false);
 			udelay(TEGRA254_HP_DELAY_SHORT_US);
 
 			tegra254_hp_bus_protect_enable(dev, port_idx);
@@ -1154,22 +1153,22 @@ static void tegra254_hp_rp_bus_protect(struct tegra254_hp_dev *dev, int port_idx
 				     TEGRA254_HP_DELAY_BUS_PROTECT_US + 1000);
 
 			tegra254_hp_reg_update_bits(mac_base,
-					       mmio_info->mac.init_ctrl,
-					       mmio_info->mac.phy_rst_bit,
-					       true);
+						    mmio_info->mac.init_ctrl,
+						    mmio_info->mac.phy_rst_bit,
+						    true);
 			tegra254_hp_reg_update_bits(mac_base,
-					       mmio_info->mac.init_ctrl,
-					       mmio_info->mac.ltssm_bit, true);
+						    mmio_info->mac.init_ctrl,
+						    mmio_info->mac.ltssm_bit, true);
 			usleep_range(TEGRA254_HP_DELAY_PHY_RESET_US,
 				     TEGRA254_HP_DELAY_PHY_RESET_US + 1000);
 
 			tegra254_hp_bus_protect_disable(dev, port_idx);
 
-		tegra254_hp_toggle_update_bit(dev->mmio.top_base,
-					 mmio_info->top.ctrl,
-					 mmio_info->top.port_bits[port_idx],
-					 mmio_info->top.update_bit,
-					 true);
+			tegra254_hp_toggle_update_bit(dev->mmio.top_base,
+						      mmio_info->top.ctrl,
+						      mmio_info->top.port_bits[port_idx],
+						      mmio_info->top.update_bit,
+						      true);
 		}
 		break;
 
@@ -1226,8 +1225,7 @@ static void tegra254_hp_disable_all_slots(struct tegra254_hp_dev *hp_dev)
 
 	for (i = 0; i < hp_dev->pd->port_nums; i++) {
 		if (hp_dev->slots[i].root_port)
-			hp_dev->slots[i].slot.ops->disable_slot(
-				&hp_dev->slots[i].slot);
+			hp_dev->slots[i].slot.ops->disable_slot(&hp_dev->slots[i].slot);
 	}
 }
 
@@ -1272,7 +1270,7 @@ static int tegra254_hp_enable_slot(struct hotplug_slot *hotplug_slot)
 	bus = slot->root_port->subordinate;
 	if (bus) {
 		dev_dbg(&hp_dev->pdev->dev, "slot API: enable_slot port %d, pci_rescan_bus\n",
-			 slot->port_idx);
+			slot->port_idx);
 		pci_lock_rescan_remove();
 		pci_rescan_bus(bus);
 		pci_unlock_rescan_remove();
@@ -1595,10 +1593,9 @@ static int tegra254_hp_ensure_powered_and_fw_ready(struct tegra254_hp_dev *dev)
 	/* Kick in case BOOT level already matches without a new edge */
 	schedule_work(&dev->boot_work);
 
-	timeout = wait_for_completion_timeout(
-		&dev->boot_fw_ready,
-		msecs_to_jiffies(TEGRA254_HP_BOOT_POLL_MAX *
-				 (TEGRA254_HP_POLL_SLEEP_US / 1000)));
+	timeout = wait_for_completion_timeout(&dev->boot_fw_ready,
+					      msecs_to_jiffies(TEGRA254_HP_BOOT_POLL_MAX *
+							       (TEGRA254_HP_POLL_SLEEP_US / 1000)));
 
 	mutex_lock(&dev->slot_mutex);
 	dev->boot_irq_waiter = false;
@@ -1818,7 +1815,7 @@ static acpi_status acpi_gpio_collect_handler(struct acpi_resource *ares,
  * Returns: 0 on success, negative error code on failure
  */
 static int tegra254_hp_walk_acpi_gpios(struct platform_device *pdev,
-				  struct acpi_gpio_walk_context *walk_ctx)
+				       struct acpi_gpio_walk_context *walk_ctx)
 {
 	struct acpi_device *adev;
 	acpi_status status;
@@ -2130,8 +2127,8 @@ static struct gpio_acpi_context *gpio_acpi_setup(struct platform_device *pdev,
 	if (ctx->valid) {
 		if (gpio_index == PCIE_PIN_BOOT && hp_dev->boot_pin == -1) {
 			hp_dev->boot_pin = ctx->pin;
-		} else if (gpio_index == PCIE_PIN_PRSNT
-			   && hp_dev->prsnt_pin == -1) {
+		} else if (gpio_index == PCIE_PIN_PRSNT &&
+			   hp_dev->prsnt_pin == -1) {
 			hp_dev->prsnt_pin = ctx->pin;
 		}
 		return ctx;
@@ -2213,7 +2210,7 @@ static int tegra254_hp_count_dev_on_bus(struct pci_dev *pci_dev, void *data)
  * Returns: 0 on success, negative error code on failure
  */
 static int tegra254_hp_discover_pcie_devices(struct platform_device *pdev,
-					struct tegra254_hp_plat_data *pd)
+					     struct tegra254_hp_plat_data *pd)
 {
 	int device_count = 0;
 	bool retry = false;
@@ -2272,7 +2269,7 @@ static int tegra254_hp_discover_pcie_devices(struct platform_device *pdev,
  * Returns: 0 on success, negative error code on failure
  */
 static int tegra254_hp_init_pcie_data(struct platform_device *pdev,
-				 struct tegra254_hp_plat_data *pd)
+				      struct tegra254_hp_plat_data *pd)
 {
 	int ret;
 
@@ -2308,7 +2305,7 @@ static int tegra254_hp_init_pcie_data(struct platform_device *pdev,
  * Returns: Number of GPIOs found, or negative error code
  */
 static int tegra254_hp_enumerate_gpios(struct platform_device *pdev,
-				  struct tegra254_hp_dev *hp_dev)
+				       struct tegra254_hp_dev *hp_dev)
 {
 	struct acpi_gpio_walk_context walk_ctx;
 	struct fwnode_handle *gpio_fwnode = NULL;
@@ -2408,7 +2405,7 @@ static int tegra254_hp_enumerate_gpios(struct platform_device *pdev,
  * Returns: NOTIFY_OK on success, NOTIFY_DONE if not a CX7 device
  */
 static int tegra254_hp_pci_notifier(struct notifier_block *nb, unsigned long action,
-				void *data)
+				    void *data)
 {
 	struct device *dev = data;
 	struct pci_dev *pdev = to_pci_dev(dev);
