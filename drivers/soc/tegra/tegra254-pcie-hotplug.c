@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (c) 2014-2025 MediaTek Inc.
+ * Copyright (c) 2025 MediaTek Inc.
  * Copyright (c) 2025-2026 NVIDIA Corporation
  *
  * Tegra254 PCIe hotplug driver for NVIDIA DGX Spark
@@ -21,16 +21,18 @@
 #include <linux/pci.h>
 #include <linux/pci_hotplug.h>
 #include <linux/pinctrl/consumer.h>
+#include <linux/pinctrl/machine.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/string.h>
+#include <linux/sysfs.h>
 #include <linux/uuid.h>
 
 #define HP_PORT_MAX		3
 #define HP_POLL_CNT_MAX		200
 #define MAX_VENDOR_DATA_LEN	16
-#define TEGRA254_HP_MMIO_REGION_COUNT	5	/* TOP, PROTECT, CKM, MAC Port 0, MAC Port 1 */
+#define TEGRA254_HP_MMIO_REGION_COUNT	5	/* MAC Port 0, MAC Port 1, TOP, PROTECT, CKM */
 #define TEGRA254_HP_MIN_GPIO_COUNT	4	/* Minimum required: BOOT, PRSNT, PERST, EN */
 #define PINCTRL_MAPPING_ENTRY_SIZE 5	/* dev_name, state, ctrl_dev, group, function */
 /* Indices for pinctrl mapping entry strings */
@@ -2030,7 +2032,7 @@ static ssize_t hotplug_enabled_show(struct device *dev,
 	if (!hp_dev)
 		return -EINVAL;
 
-	return scnprintf(buf, PAGE_SIZE, "%d\n", hp_dev->hotplug_enabled ? 1 : 0);
+	return sysfs_emit(buf, "%d\n", hp_dev->hotplug_enabled ? 1 : 0);
 }
 
 static ssize_t hotplug_enabled_store(struct device *dev,
@@ -2161,7 +2163,7 @@ static int tegra254_hp_setup_irq(struct tegra254_hp_gpio_ctx *app_ctx)
 	ret = devm_request_threaded_irq(ctx->dev, irq,
 					hotplug_irq_handler, tegra254_hp_work,
 					ctx->irq_flags | IRQF_ONESHOT,
-					"pcie_hotplug", app_ctx);
+					"tegra254-pcie-hotplug", app_ctx);
 	if (ret)
 		dev_err(ctx->dev, "Failed to request IRQ %d: %d\n", irq, ret);
 
@@ -2643,4 +2645,4 @@ static struct platform_driver tegra254_hp_driver = {
 module_platform_driver(tegra254_hp_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Tegra254 PCIe power management for NVIDIA DGX Spark");
+MODULE_DESCRIPTION("Tegra254 PCIe hotplug for NVIDIA DGX Spark");

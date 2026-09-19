@@ -175,10 +175,11 @@ config SOC_TEGRA_CBB
 	  This driver handles the errors from CBB and prints debug
 	  information about the failed transactions.
 
-config TEGRA254_HOTPLUG
+config SOC_TEGRA254_PCIE_HOTPLUG
 	tristate "Tegra254 PCIe hotplug for NVIDIA DGX Spark"
 	depends on ARCH_TEGRA || COMPILE_TEST
 	depends on PCI && ACPI
+	depends on GPIOLIB && PINCTRL
 	help
 	  Say Y here to support PCIe cable hotplug and link power
 	  management for the ConnectX-7 endpoint on Tegra254-based
